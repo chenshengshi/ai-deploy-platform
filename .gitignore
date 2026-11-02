@@ -1,0 +1,15 @@
+.env
+data/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tar.gz
+*.tar.gz
+*.log
+*.bin
+.tmp-*
+.codex-*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/

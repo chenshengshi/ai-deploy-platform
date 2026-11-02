@@ -1,0 +1,88 @@
+services:
+  registry:
+    image: registry:2
+    restart: always
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - ./data/registry:/var/lib/registry
+    ports:
+      - "5000:5000"
+
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: aideploy
+      POSTGRES_USER: aideploy
+      POSTGRES_PASSWORD: aideploy
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aideploy -d aideploy"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    image: yunzhou-control-backend:latest
+    build:
+      context: ./backend
+    restart: always
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      registry:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./data/backups:/data/backups
+      - /data/yunzhou:/data/yunzhou
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    image: yunzhou-control-backend:latest
+    restart: always
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      registry:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/uploads:/data/uploads
+      - /data/yunzhou:/data/yunzhou
+
+  web:
+    build:
+      context: ./frontend
+    restart: always
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${PUBLIC_PORT:-7080}:80"
+
+  gateway:
+    image: nginx:1.30.6-alpine
+    container_name: yunzhou-platform-gateway
+    restart: always
+    network_mode: host
+    volumes:
+      - ./data/gateway/conf.d:/etc/nginx/conf.d:ro
+      - ./data/gateway/certs:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
