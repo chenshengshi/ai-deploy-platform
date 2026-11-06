@@ -12,6 +12,7 @@ import hashlib
 import os
 import threading
 import time
+import traceback
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -484,6 +485,18 @@ def discover_source_root(repo_root: Path, requested_path: str = "") -> tuple[Pat
     if len(candidates) == 1:
         relative = candidates[0].relative_to(repo_root).as_posix()
         return candidates[0], relative
+    # Tutorial repositories commonly keep an intentionally incomplete sample
+    # beside the runnable result (for example ``initial`` and ``complete``).
+    # Selecting the uniquely named completed application is deterministic and
+    # avoids treating teaching scaffolding as a multi-service topology.
+    completed = [
+        path for path in candidates
+        if path.name.lower() in {"complete", "completed", "final", "solution"}
+    ]
+    frontend_roots, backend_roots = _fullstack_roots(repo_root)
+    if len(completed) == 1 and not (frontend_roots and backend_roots):
+        relative = completed[0].relative_to(repo_root).as_posix()
+        return completed[0], relative
     if len(candidates) > 1:
         return repo_root, ""
     return repo_root, ""
@@ -3526,7 +3539,25 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
                     for value in raw_env if isinstance(value, str) and "=" in value
                 }
                 service["environment"] = raw_env
-            if isinstance(raw_env, dict) and any(token in name.lower() for token in ("backend", "server", "api", "app")):
+            service_uses_redis = "redis" in yaml.safe_dump(service, allow_unicode=True).lower()
+            if isinstance(raw_env, dict) and service_uses_redis:
+                # Generated/source plans use several Spring generations and
+                # aliases (SPRING_REDIS_*, SPRING_DATA_REDIS_*, CRM_*). Bind
+                # every Redis connection credential to the one stable
+                # project-level managed secret. This is required when the data
+                # volume/container is reused by a later application release.
+                for env_key in list(raw_env):
+                    normalized_key = str(env_key).upper()
+                    if "REDIS" not in normalized_key:
+                        continue
+                    if normalized_key.endswith("PASSWORD"):
+                        raw_env[env_key] = "${YUNZHOU_REDIS_PASSWORD}"
+                    elif normalized_key.endswith("HOST"):
+                        raw_env[env_key] = "${YUNZHOU_REDIS_HOST}"
+                    elif normalized_key.endswith("PORT"):
+                        raw_env[env_key] = "${YUNZHOU_REDIS_PORT}"
+                    elif normalized_key.endswith("DATABASE"):
+                        raw_env[env_key] = "${YUNZHOU_REDIS_DATABASE}"
                 raw_env.update({
                     "REDIS_HOST": "${YUNZHOU_REDIS_HOST}",
                     "REDIS_PORT": "${YUNZHOU_REDIS_PORT}",
@@ -3535,6 +3566,10 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
                     "SPRING_REDIS_PORT": "${YUNZHOU_REDIS_PORT}",
                     "SPRING_REDIS_DATABASE": "${YUNZHOU_REDIS_DATABASE}",
                     "SPRING_REDIS_PASSWORD": "${YUNZHOU_REDIS_PASSWORD}",
+                    "SPRING_DATA_REDIS_HOST": "${YUNZHOU_REDIS_HOST}",
+                    "SPRING_DATA_REDIS_PORT": "${YUNZHOU_REDIS_PORT}",
+                    "SPRING_DATA_REDIS_DATABASE": "${YUNZHOU_REDIS_DATABASE}",
+                    "SPRING_DATA_REDIS_PASSWORD": "${YUNZHOU_REDIS_PASSWORD}",
                 })
         changes.append("Redis")
 
@@ -6275,9 +6310,11 @@ def central_build_and_distribute(
                     deployment.id,
                     f"[即时封装] {service_name} 构建产物已就绪，不等待其他服务，立即生成运行镜像。\n",
                 )
-                image_lock = hashlib.sha256(spec["image"].encode("utf-8")).hexdigest()[:16]
                 locked_command = (
-                    f"flock -w 1200 /tmp/yunzhou-image-{image_lock}.lock sh -lc "
+                    # The node has one shared classic-Docker/containerd image
+                    # store. Different image names can still race while layers
+                    # are committed, so use the same node-wide commit lock.
+                    "flock -w 1200 /tmp/yunzhou-image-commit.lock sh -lc "
                     + shlex.quote(package_command)
                 )
                 with SSHNode(builder) as package_ssh:
@@ -7848,10 +7885,7 @@ def central_build_and_distribute(
             # classic-Docker image write is serialized per builder node;
             # concurrent commits against this node's shared containerd store
             # have repeatedly lost ingest/snapshot files.
-            service_lock = hashlib.sha256(
-                f"{project.slug}:{service_name}".encode("utf-8")
-            ).hexdigest()[:16]
-            lock_path = f"/tmp/yunzhou-image-{service_lock}.lock"
+            lock_path = "/tmp/yunzhou-image-commit.lock"
             lock_probe, _ = build_ssh.run(
                 f"flock -n {shlex.quote(lock_path)} true",
                 timeout=10,
@@ -7890,6 +7924,9 @@ def central_build_and_distribute(
                 "io.containerd.content.v1.content/ingest",
                 "failed to export image",
                 "failed to unpack image",
+                "mount callback failed",
+                "failed to write compressed diff",
+                "failed to create diff tar stream",
                 "failed to get reader from content store",
                 "content store: content digest",
                 "snapshot ",
@@ -9427,6 +9464,10 @@ def execute(deployment_id: str) -> None:
                     log(dep.id, f"[网关回滚失败] {gateway_exc}\n")
             if dep.status != DeployStatus.stopped:
                 log_stage(dep.id, "失败", current_stage, str(exc)[:500])
+                # Keep the server-side traceback in the deployment log.  The
+                # UI still shows the concise error, while diagnostics retain
+                # the exact failing function/line for automatic repair.
+                log(dep.id, "[平台诊断堆栈]\n" + traceback.format_exc()[-12000:] + "\n")
                 dep.status = DeployStatus.failed
                 dep.error = str(exc)
                 dep.finished_at = datetime.now(timezone.utc)

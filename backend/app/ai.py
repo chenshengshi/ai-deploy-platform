@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import yaml
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from .config import decrypt
@@ -375,10 +376,21 @@ def analyze_project_deployment(
         limit=12,
     )
     now = datetime.now(timezone.utc)
-    for row in learned_rows:
-        row.use_count = (row.use_count or 0) + 1
-        row.last_used_at = now
-    db.flush()
+    # Usage telemetry is advisory and may be updated by many simultaneous
+    # analyses.  Use one atomic SQL expression instead of dirtying versioned
+    # ORM rows; a stale telemetry counter must never abort source analysis or
+    # a deployment.
+    learned_ids = [row.id for row in learned_rows]
+    if learned_ids:
+        db.execute(
+            update(DeploymentExperience)
+            .where(DeploymentExperience.id.in_(learned_ids))
+            .values(
+                use_count=DeploymentExperience.use_count + 1,
+                last_used_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
     learned_experience = [{
         "category": row.category,
         "stage": row.stage,
