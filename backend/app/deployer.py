@@ -45,6 +45,7 @@ DOCKER_HUB_MIRROR_HOSTS = {
 PLATFORM_NGINX_IMAGE = "nginx:1.30.3-alpine"
 PLATFORM_REDIS_IMAGE = "redis:7.4-alpine"
 PLATFORM_MYSQL_IMAGE = "mysql:8.4"
+PLATFORM_POSTGRES_IMAGE = "postgres:16"
 
 
 def enforce_nginx_pid_compatibility(dockerfile_text: str) -> str:
@@ -6957,6 +6958,59 @@ def central_build_and_distribute(
                         runtime_text, artifacts = result
 
                 pom = context / "pom.xml"
+                # Some repositories ship a runtime-only Dockerfile that copies
+                # target/*.jar and assumes CI has already run Maven.  The
+                # platform owns the build, so materialize that prerequisite
+                # before Docker packaging instead of failing on a missing JAR.
+                runtime_jar_copy = re.search(
+                    r"(?im)^\s*COPY(?:\s+--\S+)*\s+[^\n]*?target/[^\s]+\.jar\s+",
+                    docker_text,
+                )
+                existing_context_jars = [
+                    path for path in context.rglob("target/*.jar")
+                    if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
+                ]
+                if pom.is_file() and runtime_jar_copy and not existing_context_jars:
+                    java_version = detect_java_version(str(context))
+                    maven_image = f"maven:3.9-eclipse-temurin-{java_version}"
+                    settings_arg = "-s /workspace/.yunzhou.maven-settings.xml " \
+                        if (context / ".yunzhou.maven-settings.xml").is_file() else ""
+                    command = (
+                        f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                        f"-v {shlex.quote(context_key)}:/workspace "
+                        f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                        f"-w /workspace {shlex.quote(maven_image)} "
+                        f"mvn {settings_arg}-B package -DskipTests"
+                    )
+                    log(
+                        deployment.id,
+                        f"[平台构建] 检测到运行 Dockerfile 依赖尚未生成的 JAR；"
+                        f"先使用 {maven_image} 生成构建产物，再执行镜像封装。\n",
+                    )
+                    # Repository-wide style plugins may scan every text file,
+                    # including platform-owned runtime env snapshots. Keep
+                    # those files outside the source tree during compilation
+                    # and restore them before Docker/Compose packaging.
+                    hidden_platform_files: list[tuple[Path, Path]] = []
+                    for platform_file in context.glob(".yunzhou*.env"):
+                        backup = context.parent / (
+                            f".{context.name}.{deployment.id[:8]}.{platform_file.name}.runtime"
+                        )
+                        platform_file.replace(backup)
+                        hidden_platform_files.append((platform_file, backup))
+                    try:
+                        code, output = tracked_run(
+                            build_ssh, deployment.id, command, stream=stream, timeout=1800,
+                            pid_prefix="yunzhou-maven-build", stream_channel="api", stream_label="后端 API",
+                        )
+                    finally:
+                        for platform_file, backup in hidden_platform_files:
+                            if backup.exists():
+                                backup.replace(platform_file)
+                    if code:
+                        raise RuntimeError("Maven 前置产物构建失败：" + output[-2000:])
+                    maven_built_contexts.add(context_key)
+
                 maven_match = re.search(r"(?im)^FROM\s+(maven:[^\s]+)", docker_text)
                 if runtime_text is None and pom.is_file() and maven_match and "--from=" in docker_text:
                     if context_key not in maven_built_contexts:
@@ -8308,21 +8362,23 @@ def execute(deployment_id: str) -> None:
                             timeout_seconds=90 if repair_analysis else 360,
                         )
                     except Exception as analysis_exc:
+                        refreshed_plan = None
                         if repair_analysis and isinstance(saved_plan, dict) and saved_plan:
-                            refreshed_plan = None
-                            log(
-                                dep.id,
-                                "[方案] AI 修复分析在 90 秒内未完成或暂不可用，"
-                                f"已复用上一版完整方案并继续执行平台确定性修复：{analysis_exc}\n",
-                            )
+                            detail = "已复用上一版完整方案并继续执行平台确定性修复"
                         else:
-                            raise
+                            detail = "已切换平台本地识别器继续发布"
+                        log(
+                            dep.id,
+                            "[方案] AI 上游未在限定时间内返回可用方案，"
+                            f"{detail}；本次发布不会被 AI 服务阻塞：{analysis_exc}\n",
+                        )
                     if not isinstance(refreshed_plan, dict) or not refreshed_plan:
                         if isinstance(saved_plan, dict) and saved_plan:
                             ai_plan, integration_changes = adapt_plan_to_current_integrations(saved_plan, project)
                             log(dep.id, "[方案] AI 暂未返回新方案，先复用上一版已验证架构处理本次业务代码更新。\n")
                         else:
-                            raise RuntimeError("平台未能根据最新源码生成部署方案，请稍后重试")
+                            ai_plan = None
+                            log(dep.id, "[方案] 未发现可复用 AI 方案，平台将依据源码、锁文件和构建描述生成确定性部署方案。\n")
                     else:
                         if repair_analysis and isinstance(saved_plan, dict):
                             repair_plan_changed = (
