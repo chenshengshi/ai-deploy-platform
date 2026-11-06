@@ -439,6 +439,7 @@ def startup():
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS image_retention_count INTEGER NOT NULL DEFAULT 5"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS data_exposure_json TEXT NOT NULL DEFAULT '{}'"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS runtime_image_overrides_json TEXT NOT NULL DEFAULT '{}'"))
+        connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_repositories_json TEXT NOT NULL DEFAULT '[]'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_retention_count INTEGER NOT NULL DEFAULT 5"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_auto_cleanup BOOLEAN NOT NULL DEFAULT TRUE"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_endpoint VARCHAR(255) NOT NULL DEFAULT 'yunzhou.hub:5000'"))
@@ -1300,8 +1301,14 @@ def list_projects(db: Session = Depends(get_db), user: User = Depends(current_us
 def create_project(body: ProjectCreate, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     if db.scalar(select(Project).where(Project.slug == body.slug)):
         raise HTTPException(409, "项目标识已存在")
-    data = body.model_dump(exclude={"env_text"})
-    item = Project(**data, env_text_encrypted=encrypt(body.env_text), owner_id=user.id)
+    data = body.model_dump(exclude={"env_text", "git_repositories"})
+    repositories = [row.model_dump() for row in body.git_repositories]
+    item = Project(
+        **data,
+        git_repositories_json=json.dumps(repositories, ensure_ascii=False),
+        env_text_encrypted=encrypt(body.env_text),
+        owner_id=user.id,
+    )
     db.add(item)
     db.flush()
     if item.source_type == SourceType.git:
@@ -3147,6 +3154,10 @@ def update_project(item_id: str, body: ProjectUpdate, db: Session = Depends(get_
         item.git_url = body.git_url.strip() if body.git_url else None
     if "git_branch" in fields_set and body.git_branch:
         item.git_branch = body.git_branch.strip()
+    if "git_repositories" in fields_set and body.git_repositories is not None:
+        item.git_repositories_json = json.dumps(
+            [row.model_dump() for row in body.git_repositories], ensure_ascii=False,
+        )
     db.flush()
     if body.domain is not None and item.domain != old_domain:
         deployment = db.scalar(select(Deployment).where(Deployment.project_id == item.id, Deployment.status == DeployStatus.success, Deployment.host_port.is_not(None)).order_by(desc(Deployment.created_at)).limit(1))

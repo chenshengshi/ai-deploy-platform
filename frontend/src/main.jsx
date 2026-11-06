@@ -1894,6 +1894,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
       source_type: "upload",
       git_url: "",
       git_branch: "main",
+      git_repositories: [],
       build_type: "auto",
       container_port: "",
       host_port: "",
@@ -1932,6 +1933,22 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "") || `project-${Date.now().toString().slice(-8)}`;
   const set = (k, v) => setForm((x) => ({ ...x, [k]: v }));
+  const addGitRepository = () => setForm((value) => ({
+    ...value,
+    git_repositories: [...value.git_repositories, {
+      git_url: "", git_branch: "main", credential_id: value.git_credential_id || "",
+      role: value.git_repositories.some((row) => row.role === "frontend") ? "backend" : "frontend",
+      target_dir: "",
+    }],
+  }));
+  const updateGitRepository = (index, key, value) => setForm((current) => ({
+    ...current,
+    git_repositories: current.git_repositories.map((row, rowIndex) => rowIndex === index ? { ...row, [key]: value } : row),
+  }));
+  const removeGitRepository = (index) => setForm((current) => ({
+    ...current,
+    git_repositories: current.git_repositories.filter((_, rowIndex) => rowIndex !== index),
+  }));
   const readEntry = (entry) =>
     new Promise((resolve, reject) => entry.file(resolve, reject));
   const readDir = (entry) =>
@@ -2070,6 +2087,22 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
           : null,
         host_port: form.host_port ? Number(form.host_port) : null,
       };
+      if (form.source_type === "git" && form.git_repositories.length) {
+        body.git_repositories = [
+          {
+            git_url: form.git_url,
+            git_branch: form.git_branch || "main",
+            credential_id: form.git_credential_id || null,
+            role: "other",
+            target_dir: "source",
+          },
+          ...form.git_repositories.map((row) => ({
+            ...row,
+            credential_id: row.credential_id || null,
+            target_dir: row.target_dir || row.role,
+          })),
+        ];
+      }
       const p = await api("/projects", {
         method: "POST",
         body: JSON.stringify(body),
@@ -2206,6 +2239,28 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
                 onChange={(e) => set("git_branch", e.target.value)}
               />
             </Field>
+            <div className="multi-git-panel">
+              <div className="multi-git-head">
+                <div><b>多个源码仓库</b><span>前后端分开时添加；平台会分别拉取后统一分析和发布</span></div>
+                <button className="ghost" type="button" onClick={addGitRepository}><Plus />添加仓库</button>
+              </div>
+              {form.git_repositories.map((repository, index) => (
+                <div className="multi-git-row" key={index}>
+                  <select value={repository.role} onChange={(e) => updateGitRepository(index, "role", e.target.value)}>
+                    <option value="frontend">前端</option>
+                    <option value="backend">后端</option>
+                    <option value="other">其他</option>
+                  </select>
+                  <input placeholder="Git 仓库地址" value={repository.git_url} onChange={(e) => updateGitRepository(index, "git_url", e.target.value)} />
+                  <input className="branch" placeholder="分支" value={repository.git_branch} onChange={(e) => updateGitRepository(index, "git_branch", e.target.value)} />
+                  <select value={repository.credential_id} onChange={(e) => updateGitRepository(index, "credential_id", e.target.value)}>
+                    <option value="">沿用主仓库凭据</option>
+                    {credentials.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+                  </select>
+                  <button className="icon danger" type="button" title="移除仓库" onClick={() => removeGitRepository(index)}><Trash2 /></button>
+                </div>
+              ))}
+            </div>
             <Field label="访问凭据">
               <div className="credential-picker">
                 <select

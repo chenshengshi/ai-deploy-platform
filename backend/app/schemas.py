@@ -118,6 +118,14 @@ class GitConnectionTest(BaseModel):
     credential_id: str | None = None
 
 
+class ProjectGitRepository(BaseModel):
+    git_url: str
+    git_branch: str = "main"
+    credential_id: str | None = None
+    role: Literal["frontend", "backend", "other"] = "other"
+    target_dir: str = Field(default="", max_length=120)
+
+
 class ProjectCreate(BaseModel):
     name: str
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
@@ -126,6 +134,7 @@ class ProjectCreate(BaseModel):
     git_url: str | None = None
     git_branch: str = "main"
     git_credential_id: str | None = None
+    git_repositories: list[ProjectGitRepository] = Field(default_factory=list, max_length=10)
     build_type: Literal["auto", "compose", "dockerfile"] = "auto"
     container_port: int | None = None
     host_port: int | None = None
@@ -146,6 +155,7 @@ class ProjectUpdate(BaseModel):
     image_retention_count: int | None = Field(default=None, ge=1, le=100)
     git_url: str | None = None
     git_branch: str | None = Field(default=None, max_length=100)
+    git_repositories: list[ProjectGitRepository] | None = None
 
 
 class ProjectOut(ORM):
@@ -158,6 +168,7 @@ class ProjectOut(ORM):
     git_url: str | None
     git_branch: str
     git_credential_id: str | None
+    git_repositories: list[dict] = Field(default_factory=list)
     build_type: str
     container_port: int | None
     host_port: int | None

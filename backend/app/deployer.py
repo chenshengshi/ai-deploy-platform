@@ -12,6 +12,7 @@ import hashlib
 import os
 import threading
 import time
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -501,6 +502,72 @@ def stage_source(project: Project, db, workspace_key: str | None = None) -> tupl
         shutil.copytree(project.source_path, temp, dirs_exist_ok=True)
         return temp, "upload", temp, ""
 
+    repositories = list(getattr(project, "git_repositories", None) or [])
+    if repositories:
+        revisions: list[str] = []
+        used_targets: set[str] = set()
+        staged_repositories: dict[tuple[str, str, str], tuple[str, str, str | None]] = {}
+        cleanup_roots: set[str] = set()
+        try:
+            for index, row in enumerate(repositories, start=1):
+                raw_url = str(row.get("git_url") or "").strip()
+                if not raw_url:
+                    raise RuntimeError(f"第 {index} 个 Git 仓库地址为空")
+                role = str(row.get("role") or "other").strip().lower()
+                requested_target = str(row.get("target_dir") or role or f"source-{index}").strip()
+                target_dir = re.sub(r"[^a-zA-Z0-9_.-]+", "-", requested_target).strip(".-")
+                if not target_dir:
+                    target_dir = f"source-{index}"
+                if target_dir in used_targets:
+                    target_dir = f"{target_dir}-{index}"
+                used_targets.add(target_dir)
+
+                base_url, branch, requested_path = git_source_location(
+                    raw_url, str(row.get("git_branch") or "main").strip() or "main",
+                )
+                credential_id = str(row.get("credential_id") or project.git_credential_id or "")
+                cache_key = (base_url, branch, credential_id)
+                staged = staged_repositories.get(cache_key)
+                if staged is None:
+                    repository_key = hashlib.sha1("\0".join(cache_key).encode()).hexdigest()[:12]
+                    child = SimpleNamespace(
+                        id=f"{project.id}-{repository_key}",
+                        slug=f"{project.slug}-repo-{repository_key}",
+                        source_type=SourceType.git,
+                        source_path=None,
+                        git_url=base_url,
+                        git_branch=branch,
+                        git_credential_id=credential_id or None,
+                        strict_source_path=False,
+                    )
+                    source_root, revision, child_root, _ = stage_source(
+                        child, db, workspace_key=f"{safe_key}-repo-{repository_key}",
+                    )
+                    staged = (source_root, revision, child_root)
+                    staged_repositories[cache_key] = staged
+                    if child_root:
+                        cleanup_roots.add(child_root)
+
+                source_root, revision, child_root = staged
+                selected_root = Path(source_root)
+                if requested_path:
+                    selected_root = (Path(child_root or source_root) / requested_path).resolve()
+                    try:
+                        selected_root.relative_to(Path(child_root or source_root).resolve())
+                    except ValueError as exc:
+                        raise RuntimeError(f"第 {index} 个 Git 项目子目录不安全") from exc
+                    if not selected_root.is_dir() or not _has_project_marker(selected_root):
+                        raise RuntimeError(f"第 {index} 个 Git 仓库中不存在可构建目录 /{requested_path}")
+                shutil.copytree(selected_root, Path(temp) / target_dir, dirs_exist_ok=True)
+                revisions.append(f"{target_dir}:{revision}")
+        finally:
+            for child_root in cleanup_roots:
+                shutil.rmtree(child_root, ignore_errors=True)
+        (Path(temp) / ".yunzhou-sources.json").write_text(
+            json.dumps(repositories, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        return temp, ",".join(revisions), temp, ""
+
     if not project.git_url:
         raise RuntimeError("Git 地址为空")
     url, branch, requested_path = git_source_location(project.git_url, project.git_branch)
@@ -594,7 +661,17 @@ def stage_source(project: Project, db, workspace_key: str | None = None) -> tupl
                 os.environ[key] = value
         if key_path:
             Path(key_path).unlink(missing_ok=True)
-    source_root, source_path = discover_source_root(Path(temp), requested_path)
+    if requested_path and getattr(project, "strict_source_path", False):
+        source_root = (Path(temp) / requested_path).resolve()
+        try:
+            source_root.relative_to(Path(temp).resolve())
+        except ValueError as exc:
+            raise RuntimeError("Git 项目子目录不安全") from exc
+        if not source_root.is_dir() or not _has_project_marker(source_root):
+            raise RuntimeError(f"Git 仓库中不存在可构建的项目目录 /{requested_path}")
+        source_path = requested_path
+    else:
+        source_root, source_path = discover_source_root(Path(temp), requested_path)
     return str(source_root), revision, temp, source_path
 
 

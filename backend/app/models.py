@@ -129,6 +129,7 @@ class Project(Base):
     git_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     git_branch: Mapped[str] = mapped_column(String(100), default="main")
     git_credential_id: Mapped[str | None] = mapped_column(ForeignKey("git_credentials.id"), nullable=True)
+    git_repositories_json: Mapped[str] = mapped_column(Text, default="[]")
     build_type: Mapped[str] = mapped_column(String(32), default="auto")
     container_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     host_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -156,6 +157,14 @@ class Project(Base):
             return value if isinstance(value, dict) else None
         except (TypeError, ValueError):
             return None
+
+    @property
+    def git_repositories(self) -> list[dict]:
+        try:
+            value = json.loads(self.git_repositories_json or "[]")
+            return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+        except (TypeError, ValueError):
+            return []
 
     @property
     def runtime_image_overrides(self) -> dict:
