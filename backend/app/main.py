@@ -37,7 +37,7 @@ from .ai import analyze_backup_scope, analyze_delete_scope, analyze_project_depl
 from .auth import current_user, hash_password, require, token_for, verify_password
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
-from .deployer import cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, environment_values, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
+from .deployer import cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
 from .proxy import get_proxy_config, proxy_for, proxy_with_auth, redact_proxy
@@ -2098,8 +2098,10 @@ def analyze_project_integrations(item_id: str, db: Session = Depends(get_db), us
         except Exception as exc:
             plan = None
             plan_error = str(exc)
-        if not plan and not local_services:
-            raise HTTPException(503, "AI 源码分析暂不可用：" + (plan_error or "尚未启用可用的 AI 模型"))
+        # AI is an enhancement, not a single point of failure for publishing.
+        # When the configured upstream is unavailable, keep the deterministic
+        # source scan (including an empty result) and allow the user to retry
+        # the richer analysis later without blocking deployment.
         if plan:
             # Source evidence is authoritative for the public API prefix.  The
             # model identifies service roles, while this deterministic pass
@@ -3846,7 +3848,36 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
     }
 
 
-def make_deployment_plan(project: Project, node: Node, db: Session, reserved_host_port: int | None = None) -> dict:
+def validate_external_integrations_for_deploy(project: Project, node: Node) -> None:
+    """Reject incomplete or unreachable external services before queue/build."""
+    effective_env = effective_project_environment(project)
+    errors = external_integration_preflight(project, effective_env)
+    if errors:
+        raise HTTPException(409, "；".join(errors))
+    values = environment_values(effective_env)
+    checks = []
+    for service, default_port in (("MYSQL", "3306"), ("REDIS", "6379")):
+        if values.get(f"YUNZHOU_{service}_MODE", "managed").lower() != "external":
+            continue
+        host = values.get(f"YUNZHOU_{service}_HOST", "").strip()
+        port = values.get(f"YUNZHOU_{service}_PORT", default_port).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:-]+", host) or not port.isdigit() or not (1 <= int(port) <= 65535):
+            raise HTTPException(409, f"外接 {service.title()} 地址或端口格式不正确")
+        checks.append((service.title(), host, port))
+    if not checks:
+        return
+    with SSHNode(node) as ssh:
+        for service, host, port in checks:
+            command = f"exec 3<>/dev/tcp/{host}/{port}"
+            code, _ = ssh.run("timeout 5 bash -c " + shlex.quote(command), timeout=10)
+            if code:
+                raise HTTPException(409, f"部署服务器无法连接外接 {service}：{host}:{port}，请检查地址、防火墙和监听范围")
+
+
+def make_deployment_plan(
+    project: Project, node: Node, db: Session, reserved_host_port: int | None = None,
+    *, allocate_port: bool = False,
+) -> dict:
     root = Path(project.source_path) if project.source_path else None
     compose_names = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
     compose_file = next((name for name in compose_names if root and (root / name).exists()), None)
@@ -3867,12 +3898,21 @@ def make_deployment_plan(project: Project, node: Node, db: Session, reserved_hos
             container_port, detected_from = 8080, "Java 项目默认值"
         elif not container_port and (root / "index.html").exists():
             container_port, detected_from = 80, "静态站点默认值"
-    host_port = None if is_compose else (reserved_host_port or project.host_port or choose_port(db, None))
+    host_port = None if is_compose else (
+        reserved_host_port or project.host_port or (choose_port(db, None) if allocate_port else None)
+    )
     address = node.public_address or node.host
     access_url = f"https://{project.domain}" if project.domain else (None if is_compose or not host_port else f"http://{address}:{host_port}")
     build_mode = "Docker Compose" if is_compose else ("Dockerfile" if project.build_type == "dockerfile" else "自动识别并生成 Dockerfile")
     git_url, git_branch, git_path = git_source_location(project.git_url or "", project.git_branch)
+    repositories = project.git_repositories
+    repository_details = [
+        f"{row.get('role') or '源码'}：{row.get('git_url') or '未填写'} · {row.get('git_branch') or 'main'} → {row.get('target_dir') or row.get('role') or 'source'}"
+        for row in repositories
+    ]
     source_step = (
+        {"title": "拉取多个 Git 源码", "detail": f"共 {len(repository_details)} 个仓库；" + "；".join(repository_details)}
+        if repository_details else
         {"title": "拉取 Git 源码", "detail": f"从 {git_url or '已配置仓库'} 的 {git_branch or '默认'} 分支读取源码，项目目录为 {'/' + git_path if git_path else '仓库根目录（拉取后自动扫描）'}"}
         if project.source_type == SourceType.git else
         {"title": "读取上传源码", "detail": "读取用户已上传并保存到平台的项目文件，不访问 Git 仓库"}
@@ -3899,12 +3939,16 @@ def make_deployment_plan(project: Project, node: Node, db: Session, reserved_hos
         "project": project.name,
         "node": node.name,
         "node_address": address,
-        "source": "Git 仓库" if project.source_type == SourceType.git else "已上传源码",
+        "source": (
+            f"{len(repository_details)} 个 Git 仓库"
+            if repository_details else "Git 仓库"
+        ) if project.source_type == SourceType.git else "已上传源码",
         "build_mode": build_mode,
         "container_port": container_port,
         "container_port_source": detected_from if container_port else "执行时继续识别",
         "host_port": host_port,
-        "port_mode": "由 Compose 配置管理" if is_compose else "已预留，不会分配给其他任务",
+        "port_mode": "由 Compose 配置管理" if is_compose else ("已预留，不会分配给其他任务" if host_port else "部署时自动分配"),
+        "source_repositories": repository_details,
         "access_url": access_url,
         "steps": [source_step, *execution_steps],
     }
@@ -3962,7 +4006,8 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
     )
     if active:
         raise HTTPException(409, f"该项目在此服务器已有进行中的部署任务（{active.id[:8]}），请等待完成或先停止该任务")
-    plan = make_deployment_plan(project, node, db)
+    validate_external_integrations_for_deploy(project, node)
+    plan = make_deployment_plan(project, node, db, allocate_port=True)
     item = Deployment(project_id=project.id, node_id=node.id, requested_by=user.id, status=DeployStatus.queued, host_port=plan["host_port"], log_text=plan_log(plan))
     db.add(item)
     db.flush()
@@ -7145,7 +7190,8 @@ def retry_deployment(item_id: str, db: Session = Depends(get_db), user: User = D
     )
     if active:
         raise HTTPException(409, f"该项目在此服务器已有进行中的部署任务（{active.id[:8]}），请等待完成或先停止该任务")
-    plan = make_deployment_plan(project, node, db)
+    validate_external_integrations_for_deploy(project, node)
+    plan = make_deployment_plan(project, node, db, allocate_port=True)
     item = Deployment(project_id=project.id, node_id=node.id, requested_by=user.id, status=DeployStatus.queued, trigger="retry", host_port=plan["host_port"], log_text=plan_log(plan) + f"[继续] 从任务 {previous.id[:8]} 重新安全执行\n")
     db.add(item)
     db.flush()
@@ -8879,7 +8925,8 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
                     node_id=node.id,
                     intent=None,
                 )
-            plan = make_deployment_plan(project, node, db)
+            validate_external_integrations_for_deploy(project, node)
+            plan = make_deployment_plan(project, node, db, allocate_port=True)
             item = Deployment(project_id=project.id, node_id=node.id, requested_by=user.id, status=DeployStatus.queued, trigger="ai", host_port=plan["host_port"], log_text=plan_log(plan))
             db.add(item)
             db.flush()
