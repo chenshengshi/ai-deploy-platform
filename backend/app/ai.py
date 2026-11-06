@@ -1,6 +1,7 @@
 import json
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -8,7 +9,8 @@ import yaml
 from sqlalchemy.orm import Session
 
 from .config import decrypt
-from .models import AiConfig, Deployment, DeploymentExperience, Node, Project
+from .experience import experience_confidence, infer_experience_tags, normalized_state, rank_learning_experiences, sanitize_learning_text
+from .models import AiConfig, Deployment, DeploymentExperience, DeploymentSettings, Node, Project
 from .proxy import proxy_for
 
 
@@ -268,7 +270,47 @@ def _ai_json_content(response: httpx.Response) -> dict:
     return result
 
 
-def analyze_project_deployment(db: Session, project: Project, source_path: str) -> dict | None:
+def _stream_ai_text(client: httpx.Client, url: str, headers: dict, payload: dict) -> tuple[str, str]:
+    """Receive long plan generation incrementally so gateways see activity."""
+    request_payload = dict(payload)
+    request_payload["stream"] = True
+    chunks: list[str] = []
+    response_model = str(payload.get("model") or "")
+    with client.stream("POST", url, headers=headers, json=request_payload) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            line = line.strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                event = json.loads(data)
+            except ValueError:
+                continue
+            response_model = str(event.get("model") or response_model)
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if content:
+                chunks.append(str(content))
+    if not chunks:
+        raise ValueError("AI 流式响应没有返回方案内容")
+    return "".join(chunks).strip(), response_model
+
+
+def analyze_project_deployment(
+    db: Session,
+    project: Project,
+    source_path: str,
+    *,
+    failure_context: str = "",
+    previous_plan: dict | None = None,
+    timeout_seconds: float = 360,
+) -> dict | None:
     """Let the configured platform AI design the deployment from real source evidence."""
     config = _preferred_ai_config(db)
     if not config:
@@ -277,7 +319,10 @@ def analyze_project_deployment(db: Session, project: Project, source_path: str) 
     ignored = {".git", "node_modules", "dist", "build", "target", ".venv", "vendor"}
     files = [item for item in root.rglob("*") if item.is_file() and not any(part in ignored for part in item.relative_to(root).parts)]
     files.sort(key=lambda item: item.relative_to(root).as_posix())
-    tree = [item.relative_to(root).as_posix() for item in files[:1200]]
+    # Keep planning requests bounded. Large repositories previously sent a
+    # huge directory listing plus source excerpts and could exceed an upstream
+    # gateway's long-request window before generation even began.
+    tree = [item.relative_to(root).as_posix() for item in files[:600]]
     preferred_names = {
         "README.md", "PROJECT_CONTEXT.yml", ".env", ".env.example", "package.json", "package-lock.json",
         "pnpm-lock.yaml", "yarn.lock", "pom.xml", "build.gradle", "settings.gradle", "requirements.txt",
@@ -286,14 +331,14 @@ def analyze_project_deployment(db: Session, project: Project, source_path: str) 
         "application.properties", "vite.config.js", "vite.config.ts", "next.config.js", "next.config.mjs",
     }
     evidence = {}
-    budget = 55_000
+    budget = 28_000
     candidates = sorted(files, key=lambda item: (0 if item.name in preferred_names or item.name.startswith("Dockerfile") else 1, len(item.relative_to(root).parts), item.as_posix()))
     for item in candidates:
         relative = item.relative_to(root).as_posix()
         if item.name not in preferred_names and not item.name.startswith("Dockerfile") and item.suffix.lower() not in {".json", ".yml", ".yaml", ".toml", ".xml", ".properties", ".js", ".mjs", ".cjs", ".ts", ".py", ".go", ".sh"}:
             continue
         try:
-            text = item.read_text(errors="ignore")[:10_000]
+            text = item.read_text(errors="ignore")[:6_000]
         except OSError:
             continue
         if not text.strip():
@@ -314,27 +359,54 @@ def analyze_project_deployment(db: Session, project: Project, source_path: str) 
     }
     if deployment_mode == "managed_fresh":
         integration_policy = {}
-    learned_rows = db.query(DeploymentExperience).order_by(
-        DeploymentExperience.verified.desc(),
-        DeploymentExperience.updated_at.desc(),
-    ).limit(30).all()
+    runtime_policy = db.get(DeploymentSettings, "default")
+    recommended_images = {
+        "nginx": getattr(runtime_policy, "default_nginx_image", "nginx:1.30.3-alpine"),
+        "redis": getattr(runtime_policy, "default_redis_image", "redis:7.4-alpine"),
+        "mysql": getattr(runtime_policy, "default_mysql_image", "mysql:8.4"),
+        "postgres": getattr(runtime_policy, "default_postgres_image", "postgres:16"),
+    }
+    experience_context = "\n".join(tree) + "\n" + "\n".join(
+        f"{name}\n{text[:1200]}" for name, text in evidence.items()
+    )
+    learned_rows = rank_learning_experiences(
+        db.query(DeploymentExperience).order_by(DeploymentExperience.updated_at.desc()).limit(500).all(),
+        experience_context,
+        limit=12,
+    )
+    now = datetime.now(timezone.utc)
+    for row in learned_rows:
+        row.use_count = (row.use_count or 0) + 1
+        row.last_used_at = now
+    db.flush()
     learned_experience = [{
         "category": row.category,
+        "stage": row.stage,
+        "state": normalized_state(row),
+        "confidence": experience_confidence(row.verified, row.successful_repairs, row.failed_repairs, row.occurrences),
+        "scope_tags": infer_experience_tags(row.category, row.error_sample, row.repair_summary),
         "verified_success": bool(row.verified),
         "successful_repairs": row.successful_repairs,
         "failed_repairs": row.failed_repairs,
-        "error_pattern": row.error_sample[:500],
-        "lesson": row.repair_summary[:1000],
+        "error_pattern": row.error_sample[:300],
+        "lesson": row.repair_summary[:600],
     } for row in learned_rows]
     context = {
         "project": project.name,
         "requested_build_type": project.build_type,
         "deployment_mode": deployment_mode,
         "integration_policy": integration_policy,
+        "recommended_runtime_images": recommended_images,
         "learned_deployment_experience": learned_experience,
         "file_tree": tree,
         "key_files": evidence,
     }
+    if failure_context:
+        context["failed_deployment"] = {
+            "error": sanitize_learning_text(failure_context, 4000),
+            "previous_plan": previous_plan if isinstance(previous_plan, dict) else {},
+            "instruction": "必须修改导致失败的生成方案，禁止原样返回上一方案；修复后重新核对构建、启动和健康检查。",
+        }
     schema = {
         "summary": "说明识别出的所有可运行模块、入口、模块调用、依赖、端口与选择理由",
         "build_strategy": "reuse、adapt 或 regenerate：分别表示仓库构建方案可直接复用、安全修订后复用、平台重新生成",
@@ -367,6 +439,7 @@ def analyze_project_deployment(db: Session, project: Project, source_path: str) 
     prompt = (
         "你是自助发布平台的自主部署工程师。仓库没有固定目录和固定技术栈，目录名不能作为唯一依据。"
         "必须根据全仓目录树、依赖清单、启动脚本、源码入口、配置引用、监听端口和模块调用关系，识别单体、前后端分离或任意多服务架构，再给出可执行方案。"
+        "Nginx、Redis、MySQL 与 PostgreSQL 都由平台按方案生成；版本优先级是用户明确指定、源码明确要求、context.recommended_runtime_images。源码没有版本要求时必须使用平台推荐，不得自行猜测其他版本。外置数据库或外置 Redis 不得创建对应容器。"
         "必须参考 context.learned_deployment_experience：verified_success=true 的经验可作为候选，但仍须由当前源码证据确认；未验证或失败次数较多的经验是反例，必须主动避免重复其错误。经验不能覆盖当前仓库的生产资产。"
         "仓库已有的生产 Dockerfile、Compose、Kubernetes Deployment、CI 发布脚本和 start:container 命令是重要参考证据，但不是可直接执行的发布产物。必须结合源码、依赖清单、锁文件、配置读取、入口、端口、健康检查、数据目录和服务关系重新预研；若证据明确只发布一个容器，应保持单容器拓扑，只有源码和生产证据共同证明需要多服务时才允许改变容器边界。"
         "Dockerfile/Compose 可能位于任意层级，也可能完全不存在。必须先逐项审计现有构建文件与真实源码是否一致，再选择 build_strategy：文件完整、路径存在、拓扑与源码一致、无旧环境绑定、无明文敏感信息、无危险挂载且兼容经典 Docker 时选 reuse；整体正确但需要改端口变量、环境变量引用、健康检查、旧地址或经典构建兼容性时选 adapt；缺文件、入口或拓扑错误、与源码明显不一致时选 regenerate。无论选择哪一种，都把最终方案写入 .yunzhou.ai.Dockerfile 和/或 .yunzhou.ai.compose.yml，保留可审计副本；不得直接覆盖用户源码。构建上下文必须与 COPY 路径匹配。"
@@ -377,6 +450,7 @@ def analyze_project_deployment(db: Session, project: Project, source_path: str) 
         "对 Node/Vite/TypeScript 等构建，必须检查源码中的跨目录 import；执行 build 前应复制完整构建上下文，不能只复制 src、public 等表面目录而遗漏 server、shared 或工作区包。"
         "前端、网关、后端模块和已生效的数据库必须全部纳入；不能只部署一个表面可访问的前端。"
         "前后端分离项目统一由平台网关负责转发和负载均衡。必须从实际生效的生产环境变量（VUE_APP_BASE_API、VITE_API_BASE_URL、VITE_BASE_API、API_BASE_URL、API_PREFIX）、运行时 postUrl.js/configUrl、请求客户端 baseURL、生产 Nginx location/proxy_pass 和后端上下文路径交叉识别唯一有效的公网接口前缀；禁止无证据写死 /api，也禁止把 development/stage/prod/profile 等所有别名一股脑发布。只生成源码实际需要的一条后端接口 location 和 location / 前端入口，并准确填写 strip_prefix；若运行时配置仍指向旧外部域名，只能改写为已由上述证据确认的相对接口前缀。前端 Nginx 只负责静态文件和 SPA 回退，不得 proxy_pass 后端。若项目本身是单体服务，则只生成 location /。traffic_plan 必须记录最终服务角色、实际前缀及源码证据。"
+        "纯静态前端的 Nginx 运行配置由平台在产物构建后统一生成。AI Dockerfile 的 Nginx 最终阶段只需复制 dist/build/out 产物、EXPOSE 80 并以前台方式启动 Nginx；不要用 RUN echo/printf 写入 /etc/nginx/conf.d 或覆盖 /etc/nginx/nginx.conf。平台会生成最小 server/location 配置并执行 nginx -t。"
         "在不改变仓库既有生产拓扑的前提下采用多阶段构建：前端按项目真实运行方式选择静态产物或 Node 网关运行；Java 在 Maven/Gradle 镜像构建并将 JAR/WAR 放入 JRE。不得把编译器、Maven/Gradle 本地仓库或包管理器缓存带入最终镜像。项目生产入口明确用 concurrently/supervisor 组织多个强耦合进程时允许保留，不得机械拆分。数据库、Redis 等是否独立托管仍按 deployment_mode 与 integration_policy 决定。"
         "生成的构建文件必须让经典 Docker 构建缓存可复用。普通 Node 项目应先只 COPY package.json 与实际 lockfile，单独 RUN npm/pnpm/yarn 安装，再 COPY 完整源码并执行 build；不得在依赖安装前 COPY 全部源码，也不得把 install 与 build 合并为同一个 RUN。Maven/Gradle 项目应先复制构建描述文件并单独解析依赖，再复制源码执行打包。工作区或多模块项目必须包含所有父级与子模块描述文件，不能为缓存而破坏模块关系。"
         "平台禁用 BuildKit/buildx。生成文件不得包含 # syntax=docker/dockerfile、RUN --mount、COPY --link、Dockerfile heredoc 或其他仅 BuildKit 支持的语法，也不得要求 --no-cache。若参考文件依赖这些能力，必须先研究等价的经典构建写法；无法安全转换时要在 mode_decision 中准确说明阻断语法和风险，不得偷偷切换构建器。"
@@ -398,28 +472,34 @@ def analyze_project_deployment(db: Session, project: Project, source_path: str) 
         "build_environment 必须逐个可运行模块填写；版本无法确认时明确写 unknown 并在 evidence 说明缺少依据，不得省略该字段。"
         "只返回严格 JSON，结构为：" + json.dumps(schema, ensure_ascii=False)
     )
+    if failure_context:
+        prompt += (
+            "context.failed_deployment 表示上一轮真实失败。你现在处于自动修复模式，必须根据错误修改生成文件，"
+            "不得原样复述或返回 previous_plan。只修平台生成的部署文件，不修改用户业务源码；"
+            "对 Nginx、Compose、端口、健康检查、依赖构建等平台可控问题必须给出可执行的新方案。"
+        )
     url = config.base_url.rstrip("/") + "/chat/completions"
     payload = {"model": config.model, "response_format": {"type": "json_object"}, "messages": [
         {"role": "system", "content": prompt},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]}
     headers = {"Authorization": "Bearer " + (decrypt(config.api_key_encrypted) or "")}
-    # Full repository plans are intentionally detailed and can take longer
-    # than ordinary chat calls. One bounded long read is safer and faster than
-    # timing out at 90 seconds and submitting the same expensive analysis a
-    # second time.
-    with httpx.Client(proxy=proxy_for(db, url), trust_env=False, timeout=240) as client:
-        response = _post_ai(client, url, headers, payload, max_attempts=1)
-        response.raise_for_status()
-    response_data = response.json()
-    content = response_data["choices"][0]["message"]["content"].strip()
+    # Full repository plans can take several minutes. Stream tokens as they are
+    # generated so an upstream gateway does not treat active generation as an
+    # idle request and return 504 before the JSON plan is complete.
+    with httpx.Client(
+        proxy=proxy_for(db, url),
+        trust_env=False,
+        timeout=max(30, min(float(timeout_seconds), 360)),
+    ) as client:
+        content, response_model = _stream_ai_text(client, url, headers, payload)
     if content.startswith("```"):
         content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
     result = json.loads(content)
     result["source"] = "ai"
     result["provider"] = config.provider_name
     result["requested_model"] = config.model
-    result["model"] = str(response_data.get("model") or config.model)
+    result["model"] = response_model or config.model
     result["managed_minio_image"] = managed_minio_image
     _apply_effective_production_images(root, result)
     return result
@@ -560,7 +640,7 @@ def understand(db: Session, message: str, project_id: str | None, node_id: str |
         last_parse_error: ValueError | None = None
         with httpx.Client(proxy=proxy_for(db, url), trust_env=False, timeout=60) as client:
             for attempt in range(2):
-                response = _post_ai(client, url, headers, payload)
+                response = _post_ai(client, url, headers, payload, max_attempts=2)
                 response.raise_for_status()
                 try:
                     return _ai_json_content(response)
@@ -593,6 +673,31 @@ def understand(db: Session, message: str, project_id: str | None, node_id: str |
 
 
 def deployment_followup(db: Session, deployment: Deployment, project: Project, node: Node, stage: str, stage_log: str) -> dict:
+    normalized_log = stage_log.upper()
+    if "INVALID ARGUMENT SYNTAX:" in normalized_log:
+        evidence = next(
+            (line.strip() for line in stage_log.splitlines() if "Invalid argument syntax:" in line),
+            "Invalid argument syntax",
+        )
+        return {
+            "source": "system",
+            "summary": "后端启动参数包含空的可选项，Spring Boot 在应用初始化前拒绝启动。",
+            "advice": "平台将删除形如 --配置项= 的空参数，保留所有非空配置后重新发布。",
+            "scope": "configuration",
+            "confidence": "high",
+            "evidence": [evidence[:300]],
+            "retry_safe": True,
+        }
+    if "WRONGPASS" in normalized_log or "NOAUTH" in normalized_log:
+        return {
+            "source": "system",
+            "summary": "Redis 已正常启动，但健康检查使用的凭据与 Redis 实际启动凭据不一致。",
+            "advice": "平台将统一 Redis 启动参数、健康检查和应用连接的托管密码，并仅重建 Redis 容器；持久化数据卷保持不变。",
+            "scope": "configuration",
+            "confidence": "high",
+            "evidence": ["AUTH failed: WRONGPASS invalid username-password pair"],
+            "retry_safe": True,
+        }
     config = _preferred_ai_config(db)
     context = {"project": project.name, "node": node.name, "status": deployment.status.value, "stage": stage, "release": deployment.release, "access_url": deployment.access_url, "host_port": deployment.host_port, "error": deployment.error, "recent_log": stage_log[-4000:]}
     if not config:

@@ -46,6 +46,8 @@ class UserOut(ORM):
     display_name: str
     role: Role
     active: bool
+    failed_login_attempts: int = 0
+    locked_until: datetime | None = None
     created_at: datetime
 
 
@@ -209,6 +211,7 @@ class DeploymentOut(ORM):
 class DeploymentSettingsIn(BaseModel):
     global_concurrency: int = Field(default=3, ge=1, le=20)
     per_node_concurrency: int = Field(default=2, ge=1, le=10)
+    analysis_concurrency: int = Field(default=2, ge=1, le=8)
     connection_timeout_seconds: int = Field(default=6, ge=2, le=30)
     external_port_start: int = Field(default=20000, ge=1024, le=65535)
     external_port_end: int = Field(default=21000, ge=1024, le=65535)
@@ -228,11 +231,16 @@ class DeploymentSettingsIn(BaseModel):
     pnpm_cache_dir: str = Field(default="/root/.local/share/pnpm/store", min_length=1, max_length=255)
     yarn_cache_dir: str = Field(default="/root/.cache/yarn", min_length=1, max_length=255)
     pip_cache_dir: str = Field(default="/root/.cache/pip", min_length=1, max_length=255)
+    default_nginx_image: str = Field(default="nginx:1.30.3-alpine", min_length=3, max_length=255)
+    default_redis_image: str = Field(default="redis:7.4-alpine", min_length=3, max_length=255)
+    default_mysql_image: str = Field(default="mysql:8.4", min_length=3, max_length=255)
+    default_postgres_image: str = Field(default="postgres:16", min_length=3, max_length=255)
 
 
 class DeploymentSettingsOut(ORM):
     global_concurrency: int
     per_node_concurrency: int
+    analysis_concurrency: int
     connection_timeout_seconds: int
     external_port_start: int
     external_port_end: int
@@ -252,6 +260,10 @@ class DeploymentSettingsOut(ORM):
     pnpm_cache_dir: str
     yarn_cache_dir: str
     pip_cache_dir: str
+    default_nginx_image: str
+    default_redis_image: str
+    default_mysql_image: str
+    default_postgres_image: str
     updated_at: datetime
 
 

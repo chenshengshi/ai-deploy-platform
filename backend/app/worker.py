@@ -13,14 +13,47 @@ from sqlalchemy import select
 
 from .config import settings
 from .database import Base, SessionLocal, engine
-from .deployer import cleanup_incomplete_release_images, execute, platform_gateway_node, stop_deployment
+from .deployer import (
+    cleanup_incomplete_release_images,
+    deployment_compose_project_name,
+    execute,
+    platform_gateway_node,
+    stop_deployment,
+)
+from .experience import prepare_new_experience, sanitize_learning_text
 from .models import DeployStatus, Deployment, DeploymentExperience, DeploymentSettings, Node, Project
 from .ssh import SSHNode
 
 
-MAX_AI_RETRIES = 3
+# Prefer one well-supported repair over repeated speculative rebuilds. A
+# second attempt is reserved for a genuinely different follow-up failure.
+MAX_AI_RETRIES = 2
 DEFERRED_CLEANUP_MARKER = "[待清理] 已登记本次失败版本镜像"
 DEFERRED_CLEANUP_DONE_MARKER = "[后台清理完成]"
+
+
+REPAIR_EVIDENCE_PREFIXES = (
+    "[方案]", "[配置预填]", "[配置预检]", "[识别]", "[托管服务]",
+    "[配置生成]", "[AI自动修复]", "[平台自愈]", "[数据服务自动修复]",
+    "[访问路径修正]", "[版本回退]",
+)
+
+
+def deployment_repair_evidence(log_text: str | None, limit: int = 12) -> list[str]:
+    """Extract concrete, secret-free repair actions from a real deployment."""
+    evidence = []
+    for raw_line in (log_text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith(REPAIR_EVIDENCE_PREFIXES):
+            continue
+        if any(fragment in line for fragment in (
+            "已创建后续修复任务", "正在对隔离发布副本", "正在根据真实错误生成修复方案",
+        )):
+            continue
+        cleaned = sanitize_learning_text(line, 500)
+        if cleaned and cleaned not in evidence:
+            evidence.append(cleaned)
+    return evidence[-max(1, limit):]
 
 
 def deployment_error_signature(error: str) -> tuple[str, str, str]:
@@ -98,11 +131,13 @@ def remember_deployment_outcome(db, deployment: Deployment) -> DeploymentExperie
         item.successful_repairs = (item.successful_repairs or 0) + 1
         item.verified = True
         item.last_verified_at = datetime.now(timezone.utc)
+        repair_actions = deployment_repair_evidence(deployment.log_text)
         item.repair_summary = json.dumps({
             "category": category,
             "outcome": "verified_success",
             "repair_trigger": deployment.trigger,
-            "experience": "同类错误可优先复用受控修复，但仍需按当前源码重新校验构建方案",
+            "repair_actions": repair_actions,
+            "experience": "优先复用这些真实成功动作，但必须按当前源码重新校验，不能只凭历史结论直接构建",
             "verification": ["构建完成", "服务启动", "健康检查", "访问验证"],
             "learned_at": datetime.now(timezone.utc).isoformat(),
         }, ensure_ascii=False)
@@ -111,6 +146,16 @@ def remember_deployment_outcome(db, deployment: Deployment) -> DeploymentExperie
         )[-200_000:]
     elif (deployment.trigger or "").startswith("ai_autofix_") and deployment.status == DeployStatus.failed:
         item.failed_repairs = (item.failed_repairs or 0) + 1
+        failed_actions = deployment_repair_evidence(deployment.log_text)
+        if failed_actions and not item.verified:
+            item.repair_summary = json.dumps({
+                "category": category,
+                "outcome": "failed_counterexample",
+                "attempted_actions": failed_actions,
+                "experience": "这些动作未解决当前错误，后续分析不得原样重复，必须结合新的源码或运行证据调整方案",
+                "learned_at": datetime.now(timezone.utc).isoformat(),
+            }, ensure_ascii=False)
+    prepare_new_experience(item)
     db.commit()
     return item
 
@@ -173,14 +218,24 @@ def maintain_builder_storage() -> None:
         shutil.rmtree(path, ignore_errors=True)
         total -= size
     with SSHNode(builder) as ssh:
-        ssh.run(
+        _code, cleanup_output = ssh.run(
+            "removed=0; "
+            "for id in $(docker ps -aq --filter status=exited); do "
+            "labels=$(docker inspect -f '{{len .Config.Labels}}' $id 2>/dev/null || echo 1); "
+            "mounts=$(docker inspect -f '{{len .Mounts}}' $id 2>/dev/null || echo 1); "
+            "image=$(docker inspect -f '{{.Image}}' $id 2>/dev/null || true); "
+            "tags=$(docker image inspect -f '{{json .RepoTags}}' $image 2>/dev/null || echo tagged); "
+            "test \"$labels\" = 0 -a \"$mounts\" = 0 -a \"$tags\" = null || continue; "
+            "docker rm $id >/dev/null && removed=$((removed+1)); done; echo CLASSIC_BUILD_CONTAINERS_REMOVED=$removed; "
             f"docker builder prune -af --filter until=168h --keep-storage {max(1, settings.docker_build_cache_keep_gb)}GB >/dev/null 2>&1 || true; "
             "docker image prune -f --filter dangling=true --filter until=24h >/dev/null 2>&1 || true"
         )
+        if cleanup_output.strip():
+            print(cleanup_output.strip(), flush=True)
 
 
 def process_deferred_failed_image_cleanup() -> None:
-    """Clean failed release images only when the whole build queue is idle."""
+    """Clean failed/cancelled release images only when the build queue is idle."""
     with SessionLocal() as db:
         active_count = db.query(Deployment).filter(
             Deployment.status.in_([DeployStatus.queued, DeployStatus.running])
@@ -296,6 +351,14 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
         failed = db.get(Deployment, deployment_id)
         if not failed or failed.status != DeployStatus.failed:
             return
+        existing_retry = db.scalar(select(Deployment).where(
+            Deployment.project_id == failed.project_id,
+            Deployment.node_id == failed.node_id,
+            Deployment.created_at > failed.created_at,
+            Deployment.trigger.like("ai_autofix_%"),
+        ).order_by(Deployment.created_at.desc()))
+        if existing_retry:
+            return
         experience = remember_deployment_outcome(db, failed)
         match = re.match(r"ai_autofix_(\d+)$", failed.trigger or "")
         attempt = int(match.group(1)) if match else 0
@@ -306,6 +369,21 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
         error = (failed.error or "").lower()
         project = db.get(Project, failed.project_id)
         repaired_managed_volume = repair_empty_managed_postgres_volume(db, failed, project)
+        ai_retry_safe = False
+        ai_result = {}
+        for line in reversed((failed.log_text or "").splitlines()):
+            if not line.startswith("[AI跟进] "):
+                continue
+            try:
+                ai_result = json.loads(line[len("[AI跟进] "):])
+            except (TypeError, ValueError):
+                continue
+            ai_retry_safe = bool(
+                ai_result.get("retry_safe") is True
+                and ai_result.get("confidence") in {"high", "medium"}
+                and ai_result.get("scope") in {"platform", "dependency_network", "configuration", "runtime"}
+            )
+            break
         recoverable = any(token in error for token in (
             "unhealthy", "connection refused", "timed out", "timeout", "temporarily",
             "connection reset", "访问验证未通过", "联合检查未通过", "容器启动后状态异常",
@@ -314,9 +392,13 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
             "object has no attribute 'rglob'",
             "lockfile needs to be updated", "requires node.js >=24",
             "target stage", "could not be found",
-            "unexpected eof", "docker daemon", "snapshotter", "creatediff",
+            "unexpected eof", "unexpected end of file", "expecting \"}\"", "nginx -t", "nginx: [emerg]",
+            "docker daemon", "snapshotter", "creatediff",
             "snapshot ", "does not exist: not found",
-        )) or missing_maven_reactor_module(error, project)
+            "find: ‘target’: no such file or directory",
+            "find: 'target': no such file or directory",
+            "find target -name '*.jar'",
+        )) or missing_maven_reactor_module(error, project) or ai_retry_safe
         learned_repair = bool(
             experience and experience.verified
             and (experience.successful_repairs or 0) > (experience.failed_repairs or 0)
@@ -334,9 +416,10 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
             and deployment_error_signature(previous_failed.error or "")[0]
             == deployment_error_signature(failed.error or "")[0]
         )
-        if attempt > 0 and same_as_previous and experience and (experience.failed_repairs or 0) >= 1 and not learned_repair and not repaired_managed_volume:
+        if attempt > 0 and same_as_previous and not repaired_managed_volume:
             failed.log_text = ((failed.log_text or "") +
-                "\n[AI学习] 同一错误在自动修复后再次出现，说明上一轮没有产生有效变化；已记录失败反例并停止重复构建。\n"
+                "\n[AI学习] 同一错误在自动修复后再次出现，说明上一方案没有产生有效变化；"
+                "已停止重复构建并保留失败反例，等待方案产生可验证变化后再部署。\n"
             )[-200_000:]
             db.commit()
             return
@@ -361,6 +444,19 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
             db.commit()
             return
         next_attempt = attempt + 1
+        failed_error_upper = str(failed.error or "").upper()
+        if "WRONGPASS" in failed_error_upper or "NOAUTH" in failed_error_upper:
+            problem_summary = "Redis 已启动，但启动凭据、健康检查凭据或应用连接凭据不一致"
+        elif "INVALID ARGUMENT SYNTAX:" in failed_error_upper:
+            problem_summary = "后端包含空的 Spring Boot 命令行参数，应用在初始化前拒绝启动"
+        else:
+            problem_summary = str(ai_result.get("summary") or "").strip()
+        if not problem_summary:
+            error_lines = [strip.strip() for strip in re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", failed.error or "").splitlines() if strip.strip()]
+            problem_summary = next(
+                (line for line in reversed(error_lines) if any(token in line.lower() for token in ("error", "failed", "no such", "not found", "returned a non-zero"))),
+                error_lines[-1] if error_lines else "平台识别到可安全修复的部署错误",
+            )[:600]
         retry = Deployment(
             project_id=failed.project_id,
             node_id=failed.node_id,
@@ -369,7 +465,8 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
             trigger=f"ai_autofix_{next_attempt}",
             host_port=failed.host_port,
             log_text=(f"[AI自动修复] 已分析任务 {failed.id[:8]} 的失败日志，"
-                      f"正在对隔离发布副本应用受控修复并重新部署（第 {next_attempt}/{MAX_AI_RETRIES} 次）。\n"),
+                      f"正在对隔离发布副本应用受控修复并重新部署（第 {next_attempt}/{MAX_AI_RETRIES} 次）。\n"
+                      f"[修复问题] {problem_summary}\n"),
         )
         db.add(retry)
         db.flush()
@@ -397,15 +494,26 @@ def reconcile_running_services(misses: dict[str, int]) -> None:
                     if dep.image_name:
                         command = f"docker inspect -f '{{{{.State.Status}}}}' {dep.container_name or ''} 2>/dev/null"
                     else:
-                        command = f"docker ps -q --filter label=com.docker.compose.project=yz-{project.slug}"
+                        # Compose project names are release-scoped so a verified
+                        # candidate can run beside the online version.  The old
+                        # fixed ``yz-{slug}`` lookup falsely reported every new
+                        # release as missing and the watchdog kept redeploying it.
+                        compose_project = deployment_compose_project_name(dep, project)
+                        command = (
+                            "docker ps -q "
+                            f"--filter label=com.docker.compose.project={shlex.quote(compose_project)}"
+                        )
                     code, output = ssh.run(command, timeout=15)
                     running = code == 0 and (output.strip() == "running" if dep.image_name else bool(output.strip()))
                     if running and dep.host_port:
                         check_code, status = ssh.run(f"curl -L -sS -o /dev/null -w '%{{http_code}}' --connect-timeout 3 --max-time 8 http://127.0.0.1:{dep.host_port}/", timeout=12)
                         status = status.strip()[-3:]
-                        running = check_code == 0 and status.isdigit() and (
-                            200 <= int(status) < 400 or int(status) in {401, 403}
-                        )
+                        # This is a liveness probe, not a homepage correctness
+                        # test. API-only services commonly answer / with 404 or
+                        # 405 while remaining fully healthy. Any explicit
+                        # non-5xx response proves the process is reachable and
+                        # must not trigger an AI watchdog redeployment.
+                        running = check_code == 0 and status.isdigit() and 100 <= int(status) < 500
                 if running:
                     misses.pop(dep.id, None)
                     continue
@@ -495,6 +603,7 @@ def main():
     next_watchdog = 0.0
     next_storage_maintenance = 0.0
     next_deferred_cleanup = 0.0
+    next_ai_repair_scan = 0.0
     while True:
         for future in list(active):
             if future.done():
@@ -536,14 +645,22 @@ def main():
                 node_counts[dep.node_id] += 1
             db.commit()
             source_jobs = []
-            if len(active_sources) < 2:
+            analysis_capacity = max(1, min(8, int(getattr(limits, "analysis_concurrency", 2) or 2)))
+            if len(active_sources) < analysis_capacity:
                 active_project_ids = set(active_sources.values())
                 for project in db.scalars(select(Project).order_by(Project.created_at)).all():
                     state = project.source_analysis or {}
                     if (state.get("phase") or state.get("status")) != "queued" or project.id in active_project_ids:
                         continue
+                    retry_at = str(state.get("next_retry_at") or "").strip()
+                    if retry_at:
+                        try:
+                            if datetime.fromisoformat(retry_at.replace("Z", "+00:00")) > datetime.now(timezone.utc):
+                                continue
+                        except ValueError:
+                            pass
                     source_jobs.append((project.id, project.owner_id))
-                    if len(source_jobs) >= 2 - len(active_sources):
+                    if len(source_jobs) >= analysis_capacity - len(active_sources):
                         break
         for deployment_id, node_id in selected:
             active[executor.submit(execute, deployment_id)] = (deployment_id, node_id)
@@ -558,6 +675,31 @@ def main():
             except Exception as exc:
                 print(f"watchdog reconciliation skipped after concurrent change: {exc}", flush=True)
             next_watchdog = time.monotonic() + 30
+        if time.monotonic() >= next_ai_repair_scan:
+            # Failure diagnosis runs asynchronously. Revisit diagnosed
+            # failures after the AI result arrives so a safe recommendation
+            # becomes an automatic repair instead of a passive message.
+            try:
+                with SessionLocal() as db:
+                    diagnosed = db.scalars(
+                        select(Deployment)
+                        .where(Deployment.status == DeployStatus.failed)
+                        .order_by(Deployment.created_at.desc())
+                        .limit(50)
+                    ).all()
+                    retry_ids = []
+                    for item in diagnosed:
+                        latest_ai = next(
+                            (line for line in reversed((item.log_text or "").splitlines()) if line.startswith("[AI跟进] ")),
+                            "",
+                        )
+                        if '\"retry_safe\": true' in latest_ai:
+                            retry_ids.append(item.id)
+                for item_id in retry_ids:
+                    maybe_schedule_ai_retry(item_id)
+            except Exception as exc:
+                print(f"AI repair scan failed: {exc}", flush=True)
+            next_ai_repair_scan = time.monotonic() + 15
         if not active and time.monotonic() >= next_deferred_cleanup:
             try:
                 process_deferred_failed_image_cleanup()

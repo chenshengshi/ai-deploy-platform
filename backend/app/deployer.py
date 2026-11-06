@@ -1,6 +1,7 @@
 import re
 import json
 import base64
+import copy
 from contextlib import contextmanager
 import ipaddress
 import shlex
@@ -11,6 +12,7 @@ import hashlib
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -23,8 +25,8 @@ from sqlalchemy import select, text
 from .config import decrypt, encrypt, settings
 from .ai import MANAGED_MINIO_FALLBACK, analyze_project_deployment, deployment_followup
 from .database import SessionLocal
-from .models import AiConfig, DeployStatus, Deployment, DeploymentSettings, GitCredential, Node, Project, ProjectDomainConfig, ProjectReplica, SourceType
-from .proxy import get_proxy_config
+from .models import AiConfig, DeployStatus, Deployment, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, Project, ProjectDomainConfig, ProjectReplica, SourceType
+from .proxy import get_proxy_config, proxy_with_auth
 from .ssh import SSHNode
 
 
@@ -39,8 +41,61 @@ DOCKER_HUB_MIRROR_HOSTS = {
     "docker.nju.edu.cn", "dockerhub.icu", "docker.ckyl.me",
     "docker.awsl9527.cn", "hub-mirror.c.163.com",
 }
+PLATFORM_NGINX_IMAGE = "nginx:1.30.3-alpine"
+PLATFORM_REDIS_IMAGE = "redis:7.4-alpine"
+PLATFORM_MYSQL_IMAGE = "mysql:8.4"
+
+
+def enforce_nginx_pid_compatibility(dockerfile_text: str) -> str:
+    """Let the Debian nginx image own its PID file; remove stale CLI overrides."""
+    from_lines = re.findall(
+        r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>\S+)",
+        dockerfile_text,
+    )
+    if not from_lines or not re.match(r"(?i)(?:[^/]+/)*nginx(?:[:@]|$)", from_lines[-1]):
+        return dockerfile_text
+
+    lines: list[str] = []
+    for line in dockerfile_text.splitlines():
+        if re.match(r"(?i)^\s*(?:CMD|ENTRYPOINT)\b", line):
+            line = re.sub(r"(?i)pid\s+[^;]+;\s*", "", line)
+        lines.append(line)
+    return "\n".join(lines).rstrip() + "\n"
 _SOURCE_CACHE_LOCKS: dict[str, threading.Lock] = {}
 _SOURCE_CACHE_LOCKS_GUARD = threading.Lock()
+_DEPLOYMENT_LOG_LOCKS: dict[str, threading.Lock] = {}
+_DEPLOYMENT_LOG_LOCKS_GUARD = threading.Lock()
+
+
+_NON_OPERATIONAL_PLAN_KEYS = {
+    "provider", "requested_model", "model", "summary", "mode_decision",
+    "reasoning", "analysis", "analysis_notes", "confidence",
+}
+
+
+def actionable_plan_fingerprint(plan: dict | None) -> str:
+    """Fingerprint only plan fields that can change the deployed result.
+
+    AI explanations often vary between calls even when the effective build,
+    runtime and routing plan is identical. Those prose-only differences must
+    never authorize another expensive build.
+    """
+    if not isinstance(plan, dict):
+        return ""
+
+    def normalize(value):
+        if isinstance(value, dict):
+            return {
+                key: normalize(item)
+                for key, item in sorted(value.items())
+                if key not in _NON_OPERATIONAL_PLAN_KEYS
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    payload = json.dumps(normalize(plan), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def cleanup_registry_versions(db, project: Project | None, repository: str) -> list[str]:
@@ -148,6 +203,15 @@ def canonical_docker_image(image: str, managed_minio_image: str = MANAGED_MINIO_
     repository = value.rsplit("@", 1)[0].rsplit(":", 1)[0].lower()
     if repository in {"minio/minio", "quay.io/minio/minio"}:
         return managed_minio_image
+    lowered = value.lower()
+    if re.match(r"^(?:library/)?nginx(?::[^/]+)?$", lowered):
+        return PLATFORM_NGINX_IMAGE
+    if re.match(r"^(?:library/)?redis(?::[^/]+)?$", lowered):
+        return PLATFORM_REDIS_IMAGE
+    if re.match(r"^(?:library/)?mysql(?::[^/]+)?$", lowered):
+        return PLATFORM_MYSQL_IMAGE
+    if re.match(r"^(?:library/)?postgres(?:ql)?(?::[^/]+)?$", lowered):
+        return PLATFORM_POSTGRES_IMAGE
     return value
 
 
@@ -202,7 +266,11 @@ def ensure_active(deployment_id: str) -> None:
             raise DeploymentCancelled("部署已由用户停止")
 
 
-def tracked_run(ssh: SSHNode, deployment_id: str, command: str, stream=None, timeout: int = 1800, pid_prefix: str = "yunzhou-deploy"):
+def tracked_run(
+    ssh: SSHNode, deployment_id: str, command: str, stream=None,
+    timeout: int = 1800, pid_prefix: str = "yunzhou-deploy",
+    stream_channel: str | None = None, stream_label: str | None = None,
+):
     """Run a remote deployment command in its own process group so stop is real."""
     pid_file = f"/tmp/{pid_prefix}-{deployment_id}.pid"
     inner = f"exec setsid sh -c {shlex.quote(command)}"
@@ -211,7 +279,24 @@ def tracked_run(ssh: SSHNode, deployment_id: str, command: str, stream=None, tim
         + "wait $pid; rc=$?; rm -f " + pid_file + "; exit $rc"
     )
     wrapped = f"sh -c {shlex.quote(supervisor)}"
-    return ssh.run(wrapped, timeout=timeout, stream=stream)
+    channel_stream = stream
+    if stream and stream_channel:
+        label = stream_label or stream_channel
+        log(deployment_id, f"[构建通道] {stream_channel}|{label}|开始|{datetime.now(timezone.utc).isoformat()}\n")
+
+        def channel_stream(chunk: str) -> None:
+            cleaned = ANSI_RE.sub("", str(chunk or "")).replace("\r", "\n")
+            stamped = "".join(
+                f"[{datetime.now(timezone.utc).isoformat()}][构建:{stream_channel}] {line}\n"
+                for line in cleaned.splitlines() if line.strip()
+            )
+            if stamped:
+                stream(stamped)
+    code, output = ssh.run(wrapped, timeout=timeout, stream=channel_stream)
+    if stream and stream_channel:
+        state = "完成" if code == 0 else "失败"
+        log(deployment_id, f"[构建通道] {stream_channel}|{stream_label or stream_channel}|{state}|{datetime.now(timezone.utc).isoformat()}\n")
+    return code, output
 
 
 def stop_tracked_process_groups(ssh: SSHNode, deployment_id: str) -> str:
@@ -244,6 +329,14 @@ def log(deployment_id: str, text: str) -> None:
     if not text:
         return
     text = ANSI_RE.sub("", text).replace("\r", "")
+    with _DEPLOYMENT_LOG_LOCKS_GUARD:
+        deployment_lock = _DEPLOYMENT_LOG_LOCKS.setdefault(deployment_id, threading.Lock())
+    with deployment_lock:
+        _write_deployment_log(deployment_id, text)
+
+
+def _write_deployment_log(deployment_id: str, text: str) -> None:
+    """Write one ordered log fragment; callers serialize per deployment."""
     # The database keeps a compact, fast UI window. The append-only file keeps
     # every raw line for troubleshooting and download without rendering it.
     try:
@@ -253,19 +346,38 @@ def log(deployment_id: str, text: str) -> None:
             handle.write(text)
     except OSError:
         pass
-    with SessionLocal() as db:
-        dep = db.get(Deployment, deployment_id)
-        if dep:
-            combined = (dep.log_text or "") + text
-            if len(combined) > 200_000:
+    try:
+        with SessionLocal() as db:
+            # UI progress is best-effort. It must never wait behind the main
+            # deployment transaction and deadlock the worker against itself.
+            db.execute(text("SET LOCAL lock_timeout = '2s'"))
+            dep = db.get(Deployment, deployment_id)
+            if dep:
+                combined = (dep.log_text or "") + text
+                if len(combined) > 200_000:
                 # Keep stage markers even when verbose Docker output is truncated.
-                markers = []
-                for line in combined.splitlines():
-                    if re.match(r"^\[(计划|方案|准备|源码|依赖分析|AI规划|架构分析|识别|上传|镜像|构建|平台构建|AI构建|启动|检查|完成|失败|停止|停止确认|AI跟进|AI修复|AI自动修复)\]", line) and line not in markers:
-                        markers.append(line)
-                combined = "\n".join(markers[-40:]) + "\n[日志] 较早的详细输出已折叠\n" + combined[-185_000:]
-            dep.log_text = combined
-            db.commit()
+                    markers = []
+                    for line in combined.splitlines():
+                        if re.match(r"^\[(计划|方案|准备|源码|依赖分析|AI规划|架构分析|识别|上传|镜像|构建|平台构建|AI构建|启动|检查|完成|失败|停止|停止确认|AI跟进|AI修复|AI自动修复|阶段开始|阶段完成|阶段失败|阶段停止|阶段时间)\]", line) and line not in markers:
+                            markers.append(line)
+                    combined = "\n".join(markers[-40:]) + "\n[日志] 较早的详细输出已折叠\n" + combined[-185_000:]
+                dep.log_text = combined
+                db.commit()
+    except Exception:
+        # The append-only file above remains authoritative if the compact UI
+        # row is temporarily locked.
+        pass
+
+
+def log_stage(deployment_id: str, action: str, stage: str, detail: str = "") -> None:
+    """Persist a readable boundary and a machine-readable UTC timestamp."""
+    suffix = f" | {detail}" if detail else ""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    log(
+        deployment_id,
+        f"[阶段{action}] {stage}{suffix}\n"
+        f"[阶段时间] {stage} {action} {timestamp}\n",
+    )
 
 
 def git_source_location(raw_url: str, configured_branch: str | None = None) -> tuple[str, str, str]:
@@ -410,10 +522,24 @@ def stage_source(project: Project, db, workspace_key: str | None = None) -> tupl
     proxy_config = get_proxy_config(db)
     proxy_env = {}
     if proxy_config and proxy_config.enabled:
+        proxy_password = decrypt(proxy_config.proxy_password_encrypted) if proxy_config.proxy_password_encrypted else ""
+        http_proxy = proxy_with_auth(
+            proxy_config.http_proxy or proxy_config.https_proxy,
+            proxy_config.proxy_username or "",
+            proxy_password or "",
+        )
+        https_proxy = proxy_with_auth(
+            proxy_config.https_proxy or proxy_config.http_proxy,
+            proxy_config.proxy_username or "",
+            proxy_password or "",
+        )
         proxy_env = {
-            "HTTP_PROXY": proxy_config.http_proxy or proxy_config.https_proxy,
-            "HTTPS_PROXY": proxy_config.https_proxy or proxy_config.http_proxy,
+            "HTTP_PROXY": http_proxy,
+            "HTTPS_PROXY": https_proxy,
             "NO_PROXY": proxy_config.no_proxy,
+            "http_proxy": http_proxy,
+            "https_proxy": https_proxy,
+            "no_proxy": proxy_config.no_proxy,
         }
     old_env = {}
     import os
@@ -725,6 +851,48 @@ def optimize_staged_sources(path: str) -> list[str]:
     return changed
 
 
+_OPTIONAL_STAGE_COPY_DIRECTORIES = {"public"}
+
+
+def remove_verified_missing_optional_stage_copy(dockerfile_text: str, previous_error: str) -> str:
+    """Remove an optional stage copy only after Docker proves it is absent.
+
+    Generated Node runtime stages often copy ``/app/public`` even though that
+    directory is optional and many API-only repositories never create it.  We
+    deliberately do not generalize this to build outputs such as ``dist`` or
+    ``build``: a missing primary artifact must still fail loudly.
+    """
+    missing_match = re.search(
+        r"COPY failed:\s*stat\s+/?(?P<path>[^:\r\n]+):\s*file does not exist",
+        previous_error or "",
+        re.I,
+    )
+    if not missing_match:
+        return dockerfile_text
+    missing_source = missing_match.group("path").strip().strip("'\"").replace("\\", "/").lstrip("/").rstrip("/")
+    if Path(missing_source).name.lower() not in _OPTIONAL_STAGE_COPY_DIRECTORIES:
+        return dockerfile_text
+
+    copy_pattern = re.compile(
+        r"(?im)^(?P<line>\s*COPY\s+(?=[^\r\n]*--from=)[^\r\n]+)(?:\r?\n|$)"
+    )
+
+    def remove_if_exact_source(match: re.Match) -> str:
+        line = match.group("line")
+        # Generated Dockerfiles use shell-form COPY.  Refuse JSON-form or an
+        # ambiguous multi-source instruction instead of guessing.
+        if "[" in line or "]" in line:
+            return match.group(0)
+        tokens = re.findall(r"(?:[^\s\"']+|\"[^\"]*\"|'[^']*')+", line.strip())
+        operands = [token.strip("'\"") for token in tokens[1:] if not token.startswith("--")]
+        if len(operands) != 2:
+            return match.group(0)
+        source = operands[0].replace("\\", "/").lstrip("/").rstrip("/")
+        return "" if source == missing_source else match.group(0)
+
+    return copy_pattern.sub(remove_if_exact_source, dockerfile_text)
+
+
 def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: str = "managed_fresh") -> list[str]:
     """Apply bounded, reversible fixes to the isolated release copy only.
 
@@ -779,7 +947,7 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
         # update to break an unchanged application at runtime.
         original_pinned = re.sub(
             r"(?im)^(\s*FROM\s+)nginx:alpine(\s*(?:AS\s+\S+)?\s*)$",
-            r"\1nginx:1.27-alpine\2",
+            rf"\1{PLATFORM_NGINX_IMAGE}\2",
             original,
         )
         if original_pinned != original:
@@ -794,6 +962,272 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
         if repaired != original:
             dockerfile.write_text(repaired, encoding="utf-8")
             changed.append(dockerfile.relative_to(root).as_posix())
+        # Do not let a generated runtime stage assume an optional directory
+        # exists.  This repair is evidence-driven: Docker must name the exact
+        # missing source path, and only the matching COPY --from instruction
+        # is removed.  Required artifacts remain strict build failures.
+        current = dockerfile.read_text(encoding="utf-8", errors="replace")
+        optional_copy_repaired = remove_verified_missing_optional_stage_copy(current, previous_error)
+        if optional_copy_repaired != current:
+            dockerfile.write_text(optional_copy_repaired, encoding="utf-8")
+            current = optional_copy_repaired
+            relative = dockerfile.relative_to(root).as_posix()
+            if relative not in changed:
+                changed.append(relative)
+        # A multi-module Maven build writes the executable JAR below a module
+        # directory (for example ruoyi-admin/target), not necessarily the
+        # reactor root's target/.  Repair only after Docker proves that the
+        # generated root-target lookup is wrong.  The release copy is isolated
+        # from the user's repository, and the largest non-source JAR is the
+        # same deterministic executable-artifact rule used by the platform's
+        # Maven pre-builder.
+        missing_root_maven_target = (
+            "find:" in error
+            and "target" in error
+            and "no such file or directory" in error
+            and ("find target" in error or "find: ‘target’" in error or "find: 'target'" in error)
+        )
+        if missing_root_maven_target:
+            current = dockerfile.read_text(encoding="utf-8", errors="replace")
+            root_target_find = re.compile(
+                r"find\s+(?:\./)?target\s+-name\s+(['\"])\*\.jar\1"
+                r"(?:\s+!\s+-name\s+(['\"])original-\*\2)?\s+-type\s+f\s*\|\s*head\s+-n\s*1"
+            )
+            repaired_maven = root_target_find.sub(
+                "find . -path '*/target/*.jar' ! -name 'original-*' "
+                "! -name '*-sources.jar' ! -name '*-javadoc.jar' -type f "
+                "-printf '%s %p\\n' | sort -nr | head -n1 | cut -d' ' -f2-",
+                current,
+            )
+            if repaired_maven != current:
+                dockerfile.write_text(repaired_maven, encoding="utf-8")
+                relative = dockerfile.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
+        # Debian 11 security indices can temporarily reference superseded
+        # openssl/ca-certificates packages that have already disappeared from
+        # every mirror.  For Node Bullseye images, prefer the same official
+        # non-slim base (which already contains OpenSSL and CA roots) instead
+        # of repeatedly changing mirrors or weakening the whole build.  Only
+        # an apt instruction whose install set is exactly these bootstrap
+        # packages is removed; mixed application dependencies stay intact.
+        current = dockerfile.read_text(encoding="utf-8", errors="replace")
+        node_bullseye_crypto_gap = (
+            "404" in error
+            and "bullseye-security" in error
+            and "openssl" in error
+            and "ca-certificates" in error
+            and re.search(r"(?im)^\s*FROM\s+node:[^\s]+-bullseye-slim", current)
+        )
+        if node_bullseye_crypto_gap:
+            node_repaired = re.sub(
+                r"(?im)^(\s*FROM\s+node:[^\s]+-bullseye)-slim(\s*(?:AS\s+\S+)?\s*)$",
+                r"\1\2",
+                current,
+            )
+            instruction_pattern = re.compile(
+                r"(?ims)^\s*RUN\s+.*?(?=^\s*(?:FROM|RUN|COPY|ADD|WORKDIR|ENV|ARG|CMD|ENTRYPOINT|"
+                r"EXPOSE|LABEL|USER|VOLUME|HEALTHCHECK|SHELL|STOPSIGNAL|ONBUILD)\b|\Z)"
+            )
+
+            def replace_crypto_bootstrap(match: re.Match) -> str:
+                instruction = match.group(0)
+                flattened = instruction.replace("\\\n", " ")
+                install_match = re.search(
+                    r"\bapt-get(?:\s+-o\s+\S+)*\s+install\s+([^;&\n]+)",
+                    flattened,
+                    re.I,
+                )
+                if not install_match:
+                    return instruction
+                packages = {
+                    token for token in re.split(r"\s+", install_match.group(1).strip())
+                    if token and not token.startswith("-")
+                }
+                if packages and packages <= {"openssl", "ca-certificates"}:
+                    return "RUN openssl version && test -s /etc/ssl/certs/ca-certificates.crt\n"
+                return instruction
+
+            node_repaired = instruction_pattern.sub(replace_crypto_bootstrap, node_repaired)
+            if node_repaired != current:
+                dockerfile.write_text(node_repaired, encoding="utf-8")
+                current = node_repaired
+                relative = dockerfile.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
+        # A mirror can finish publishing its package index before every
+        # referenced .deb is available (or an HTTP caching proxy can retain
+        # that stale index). Repeating the identical build only returns the
+        # same 404. On that verified signature, switch the disposable release
+        # file to a second HTTPS mirror, discard package lists and explicitly
+        # bypass intermediary caches before the next package install.
+        current = dockerfile.read_text(encoding="utf-8", errors="replace")
+        apt_mirror_out_of_sync = (
+            "apt-get" in error
+            and (
+                (
+                    "404" in error
+                    and ("mirrors.tuna.tsinghua.edu.cn" in error or "failed to fetch" in error)
+                )
+                or (
+                    "certificate verification failed" in error
+                    and "no system certificates available" in error
+                )
+            )
+        )
+        if apt_mirror_out_of_sync and "apt-get update" in current:
+            mirror_repaired = current.replace(
+                "https://mirrors.tuna.tsinghua.edu.cn",
+                "https://mirrors.aliyun.com",
+            ).replace(
+                "http://mirrors.tuna.tsinghua.edu.cn",
+                "https://mirrors.aliyun.com",
+            ).replace(
+                "mirrors.tuna.tsinghua.edu.cn",
+                "mirrors.aliyun.com",
+            )
+            # A minimal Debian/Ubuntu base can lack CA roots while an HTTPS
+            # intercepting proxy presents its own certificate.  Only the
+            # bootstrap apt invocations get Verify-Peer disabled; apt still
+            # validates signed Release metadata and package hashes, and no
+            # persistent apt.conf weakening is written into the image.
+            apt_bootstrap_options = (
+                "-o Acquire::http::Proxy=false "
+                "-o Acquire::https::Proxy=false "
+                "-o Acquire::http::No-Cache=true "
+                "-o Acquire::https::No-Cache=true "
+                "-o Acquire::http::Pipeline-Depth=0 "
+                "-o Acquire::https::Verify-Peer=false "
+                "-o Acquire::https::Verify-Host=false"
+            )
+            refresh_command = (
+                "rm -rf /var/lib/apt/lists/*; apt-get clean; "
+                "sed -i 's|http://mirrors.aliyun.com|https://mirrors.aliyun.com|g; "
+                "s|http://deb.debian.org|https://deb.debian.org|g; "
+                "s|http://security.debian.org|https://security.debian.org|g' "
+                "/etc/apt/sources.list /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; "
+                f"apt-get {apt_bootstrap_options} update --fix-missing"
+            )
+            mirror_repaired = mirror_repaired.replace("apt-get update", refresh_command)
+            mirror_repaired = re.sub(
+                r"\bapt-get\s+install\b",
+                f"apt-get {apt_bootstrap_options} install",
+                mirror_repaired,
+            )
+            if mirror_repaired != current:
+                dockerfile.write_text(mirror_repaired, encoding="utf-8")
+                current = mirror_repaired
+                relative = dockerfile.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
+        # Some repositories commit a uv.lock generated against an internal or
+        # third-party package depot.  A TLS failure on that depot cannot be
+        # repaired by merely retrying the frozen lock URLs.  Re-lock inside the
+        # disposable build stage against the platform-reachable PyPI mirror,
+        # retain the resolved versions/hashes where available, and give uv a
+        # bounded retry/timeout budget.  The repository lockfile is untouched.
+        current = dockerfile.read_text(encoding="utf-8", errors="replace")
+        uv_locked_source_unreachable = (
+            "uv sync" in error
+            and ("tls handshake" in error or "failed to download" in error)
+        )
+        if uv_locked_source_unreachable and re.search(r"(?im)^\s*RUN\s+uv\s+sync\b", current):
+            def repair_uv_sync(match: re.Match) -> str:
+                indent = match.group("indent") or ""
+                args = (match.group("args") or "").strip()
+                return (
+                    f"{indent}ENV UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=8\n"
+                    f"{indent}RUN uv lock --refresh --default-index "
+                    "https://pypi.tuna.tsinghua.edu.cn/simple "
+                    f"&& uv sync {args} --default-index "
+                    "https://pypi.tuna.tsinghua.edu.cn/simple"
+                )
+
+            uv_repaired = re.sub(
+                r"(?im)^(?P<indent>\s*)RUN\s+uv\s+sync(?P<args>[^\r\n]*)$",
+                repair_uv_sync,
+                current,
+                count=1,
+            )
+            if uv_repaired != current:
+                dockerfile.write_text(uv_repaired, encoding="utf-8")
+                current = uv_repaired
+                relative = dockerfile.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
+        # Some Go applications validate version metadata at process startup.
+        # A generic AI plan may use VERSION=dev, which builds successfully but
+        # then enters a restart loop. After that exact verified failure, give
+        # only the disposable release Dockerfile a syntactically valid
+        # development version; the repository remains untouched.
+        current = dockerfile.read_text(encoding="utf-8", errors="replace")
+        if "invalid build version" in error or "invalid build metadata" in error:
+            now = datetime.now(timezone.utc)
+            safe_version = f"{now:%y.%m}.{now.day}-dev.0000000"
+            version_repaired = re.sub(
+                r"(?im)^(\s*ARG\s+VERSION\s*=\s*)dev\s*$",
+                rf"\g<1>{safe_version}",
+                current,
+            )
+            if version_repaired == current and re.search(r"(?im)^\s*ARG\s+[^\n]*\bVERSION\b", current):
+                version_repaired = re.sub(
+                    r"(?im)^(\s*ARG\s+[^\n]*\bVERSION\b[^\n]*)$",
+                    rf"\1\nARG VERSION={safe_version}",
+                    current,
+                    count=1,
+                )
+            if version_repaired != current:
+                dockerfile.write_text(version_repaired, encoding="utf-8")
+                current = version_repaired
+                relative = dockerfile.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
+        # Production publishing must still reject real compiler errors, but a
+        # repository's local Roslyn analyzer policy must not turn style/global
+        # locale findings (for example CA1305) into an undeployable image.
+        # Disable analyzers only inside the disposable container build and
+        # lower warning promotion; the checked-out source and CI policy stay
+        # untouched.  MSBuild compilation errors continue to fail normally.
+        current = dockerfile.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"(?i)\bdotnet\s+publish\b", current):
+            # A semicolon list passed through ``-p:WarningsNotAsErrors`` is
+            # parsed by MSBuild as multiple property assignments; bare rule
+            # IDs then raise MSB1006 before compilation starts.  RunAnalyzers
+            # is disabled for this disposable publish anyway, so remove this
+            # redundant and shell-fragile switch rather than editing source.
+            normalized_dotnet = re.sub(
+                r"\s+-p:WarningsNotAsErrors=(?:\"[^\"]*\"|'[^']*'|[^\s\\]+)",
+                "",
+                current,
+                flags=re.I,
+            )
+            if normalized_dotnet != current:
+                dockerfile.write_text(normalized_dotnet, encoding="utf-8")
+                current = normalized_dotnet
+                relative = dockerfile.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
+
+            def relax_dotnet_analyzers(match: re.Match) -> str:
+                command = match.group(1)
+                if "RunAnalyzers=" in command:
+                    return command
+                suffix = " -p:RunAnalyzers=false -p:TreatWarningsAsErrors=false"
+                if command.rstrip().endswith("\\"):
+                    stripped = command.rstrip()
+                    return stripped[:-1].rstrip() + suffix + " \\"
+                return command + suffix
+
+            dotnet_repaired = re.sub(
+                r"(?im)(\bdotnet\s+publish\b[^\r\n]*)(?=\r?$)",
+                relax_dotnet_analyzers,
+                current,
+            )
+            if dotnet_repaired != current:
+                dockerfile.write_text(dotnet_repaired, encoding="utf-8")
+                relative = dockerfile.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
         # Generated Debian/Ubuntu stages are created after the initial source
         # optimization pass. Apply the same reachable mirror before package
         # installation so apt cannot silently consume the whole preflight
@@ -812,6 +1246,19 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
             relative = dockerfile.relative_to(root).as_posix()
             if relative not in changed:
                 changed.append(relative)
+    # Failures produced by the platform's own packaging contract must never
+    # authorize edits to application source files.  Keep any generated
+    # Dockerfile/Compose corrections above, but leave Vue/Java/Python/Go source
+    # untouched; the platform fix is applied by the deployer itself.
+    platform_only_failure = any(marker in error for marker in (
+        "invalid hostport",
+        "build-placeholder",
+        "平台生成的运行镜像配置校验失败",
+        "镜像封装不得重复构建源码",
+    ))
+    if platform_only_failure:
+        return list(dict.fromkeys(changed))
+
     # Git on Windows/macOS often hides import-path case mistakes that fail in
     # Linux containers. Repair only an unambiguous same-directory match in the
     # disposable release copy (for example noTasks.module.css ->
@@ -1470,7 +1917,7 @@ def prepare_build(path: str, requested: str) -> tuple[str, str, int | None]:
             managed_init_sql.write_text(sql_text)
         (root / ".yunzhou.frontend.Dockerfile").write_text(
             f"FROM node:22-alpine AS build\nWORKDIR /src\nCOPY {frontend_rel}/package*.json ./\nRUN npm config set registry https://registry.npmmirror.com && npm ci\n"
-            f"COPY {frontend_rel}/ ./\nRUN npm run build\nFROM nginx:1.27-alpine\n"
+            f"COPY {frontend_rel}/ ./\nRUN npm run build\nFROM {PLATFORM_NGINX_IMAGE}\n"
             "COPY .yunzhou.nginx.conf /etc/nginx/conf.d/default.conf\nCOPY --from=build /src/dist /usr/share/nginx/html/app\nEXPOSE 80\n"
         )
         (root / ".yunzhou.maven-settings.xml").write_text('<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"><mirrors><mirror><id>aliyun</id><mirrorOf>*</mirrorOf><name>Aliyun Maven</name><url>https://maven.aliyun.com/repository/public</url></mirror></mirrors></settings>')
@@ -1618,7 +2065,7 @@ volumes:
             generated.write_text(
                 "FROM node:22-alpine AS build\nWORKDIR /app\nCOPY package*.json ./\n"
                 "RUN npm config set registry https://registry.npmmirror.com && npm install\nCOPY . .\nRUN npm run build\n"
-                "FROM nginx:1.27-alpine\nCOPY --from=build /app/dist /usr/share/nginx/html\nEXPOSE 80\n"
+                f"FROM {PLATFORM_NGINX_IMAGE}\nCOPY --from=build /app/dist /usr/share/nginx/html\nEXPOSE 80\n"
             )
             return "dockerfile", generated.name, reference_port or 80
         generated.write_text(
@@ -1661,7 +2108,7 @@ volumes:
         static_dir = static_index.parent.relative_to(root).as_posix()
         copy_source = "." if static_dir == "." else static_dir + "/"
         generated.write_text(
-            f"FROM nginx:1.27-alpine\nCOPY {copy_source} /usr/share/nginx/html\nEXPOSE 80\n"
+            f"FROM {PLATFORM_NGINX_IMAGE}\nCOPY {copy_source} /usr/share/nginx/html\nEXPOSE 80\n"
         )
         return "dockerfile", generated.name, 80
     if (root / "Dockerfile").exists():
@@ -1926,6 +2373,36 @@ def ensure_java_runtime_directories(runtime: str, context: Path) -> str:
     return runtime[:from_line.end()] + command + runtime[from_line.end():]
 
 
+def platform_spa_runtime_dockerfile(image: str, artifact: str) -> str:
+    """Return the platform-owned static SPA runtime.
+
+    Repository/AI Nginx snippets are evidence only.  Every static frontend
+    gets the same route fallback, conservative caching and version hiding so
+    a direct refresh such as /login never becomes an Nginx 404.
+    """
+    source = artifact.rstrip("/") + "/"
+    return (
+        f"FROM {image}\n"
+        "RUN rm -f /etc/nginx/conf.d/default.conf \\\n"
+        " && printf '%s\\n' \\\n"
+        "      'server {' \\\n"
+        "      '    listen 80 default_server;' \\\n"
+        "      '    listen [::]:80 default_server;' \\\n"
+        "      '    server_name _;' \\\n"
+        "      '    server_tokens off;' \\\n"
+        "      '    root /usr/share/nginx/html;' \\\n"
+        "      '    index index.html;' \\\n"
+        "      '    charset utf-8;' \\\n"
+        "      '    location / { try_files $uri $uri/ /index.html; }' \\\n"
+        "      '}' \\\n"
+        "    > /etc/nginx/conf.d/app.conf \\\n"
+        " && nginx -t\n"
+        f"COPY {source} /usr/share/nginx/html/\n"
+        "EXPOSE 80\n"
+        'CMD ["nginx", "-g", "daemon off;"]\n'
+    )
+
+
 def runtime_stage_from_prebuilt_artifact(
     dockerfile_text: str, context: Path, artifact_paths: list[str], output_name: str,
     target: str | None = None,
@@ -1953,8 +2430,8 @@ def runtime_stage_from_prebuilt_artifact(
         runtime = dockerfile_text[stages[-1].start():]
     copied: list[str] = []
     pattern = re.compile(
-        r"(?im)^(?P<indent>\s*)COPY\s+(?P<flags>(?:--\S+\s+)*)--from=\S+\s+"
-        r"(?P<src>\S+)\s+(?P<dest>\S+)\s*$"
+        r"(?im)^(?P<indent>\s*)COPY\s+(?P<flags_before>(?:--\S+\s+)*)--from=\S+\s+"
+        r"(?P<flags_after>(?:--\S+\s+)*)(?P<src>\S+)\s+(?P<dest>\S+)\s*$"
     )
 
     def replace(match: re.Match) -> str:
@@ -1967,17 +2444,50 @@ def runtime_stage_from_prebuilt_artifact(
                 candidates.append(base)
         if not candidates and source_name:
             candidates.extend(path for path in context.rglob(source_name) if path.exists())
+        if not candidates and source.lower().endswith(".jar"):
+            # Multi-module Maven plans commonly normalize their builder output
+            # to app.jar while the host-built artifact keeps the module name.
+            # Reuse the largest compiled JAR instead of running Maven again.
+            jar_candidates = [
+                context / value for value in artifact_paths
+                if str(value).lower().endswith(".jar") and (context / value).is_file()
+            ]
+            if jar_candidates:
+                candidates.append(max(jar_candidates, key=lambda path: (path.stat().st_size, path.as_posix())))
         if not candidates:
             return match.group(0)
         artifact = candidates[0]
         relative = artifact.relative_to(context).as_posix()
         copied.append(relative)
         suffix = "/" if artifact.is_dir() else ""
-        return f'{match.group("indent")}COPY {relative}{suffix} {match.group("dest")}'
+        direct_flags = (match.group("flags_before") or "") + (match.group("flags_after") or "")
+        return f'{match.group("indent")}COPY {direct_flags}{relative}{suffix} {match.group("dest")}'
 
     runtime = pattern.sub(replace, runtime)
     if not copied or "--from=" in runtime:
         return None
+    # Static frontends are served by a platform-owned Nginx runtime.  AI plans
+    # may describe the correct topology while still emitting a subtly broken
+    # shell-generated config (for example a missing final ``}`` in server{}).
+    # Once the frontend artifact has been built successfully there is no value
+    # in carrying that generated shell fragment forward.  Replace the entire
+    # runtime stage with one small, deterministic SPA server.  API routing is
+    # owned by the platform gateway, so the frontend container never proxies
+    # backend traffic itself.
+    from_match = re.search(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?nginx:[^\s]+.*$", runtime)
+    artifact = next(
+        (
+            value for value in copied
+            if (context / value).is_dir()
+            and Path(value).name.lower() in {"dist", "build", "out", "public"}
+        ),
+        None,
+    )
+    if from_match and artifact:
+        image_match = re.search(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>nginx:[^\s]+)", from_match.group(0))
+        image = image_match.group("image") if image_match else PLATFORM_NGINX_IMAGE
+        runtime = platform_spa_runtime_dockerfile(image, artifact)
+        return runtime, [artifact]
     # AI-generated nginx stages sometimes create the configuration with one
     # ``RUN echo`` instruction per line.  The classic builder then has to
     # create and commit dozens of tiny layers even though the commands are a
@@ -2061,6 +2571,52 @@ def reconcile_compose_build_targets(root: Path, compose: dict) -> list[str]:
         build["dockerfile"] = replacement
         changes.append(f"{service_name}: {old} -> {replacement}（target={target}）")
     return changes
+
+
+def prune_undeclared_development_services(compose: dict, plan: dict) -> list[str]:
+    """Remove known local-development helpers omitted by the effective plan.
+
+    The model can correctly exclude tools such as Adminer in its summary and
+    ``services`` list while accidentally leaving the service copied from the
+    repository's development Compose file.  The explicit effective service
+    list is authoritative for these well-known helpers because Yunzhou owns
+    the public gateway and exposes data inspection separately.
+    """
+    services = compose.get("services") if isinstance(compose, dict) else None
+    declared = {
+        str(name).strip().lower()
+        for name in (plan.get("services") or [])
+        if str(name).strip()
+    }
+    if not isinstance(services, dict) or not declared:
+        return []
+
+    development_helpers = re.compile(
+        r"(?i)(?:^|[/_\s-])(?:adminer|phpmyadmin|pgadmin|mailpit|mailhog|traefik|"
+        r"selenium|playwright|cypress)(?=$|[:/_\s-])"
+    )
+    removed = []
+    for name, service in list(services.items()):
+        if str(name).strip().lower() in declared or not isinstance(service, dict):
+            continue
+        identity = " ".join((str(name), str(service.get("image") or "")))
+        if development_helpers.search(identity):
+            services.pop(name, None)
+            removed.append(str(name))
+
+    if not removed:
+        return []
+    removed_set = set(removed)
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        depends = service.get("depends_on")
+        if isinstance(depends, dict):
+            for name in removed_set:
+                depends.pop(name, None)
+        elif isinstance(depends, list):
+            service["depends_on"] = [name for name in depends if name not in removed_set]
+    return removed
 
 
 def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int | None]:
@@ -2157,9 +2713,17 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
     try:
         container_port = int(plan["container_port"]) if plan.get("container_port") not in (None, "") else None
     except (TypeError, ValueError):
-        raise RuntimeError("AI 返回的容器端口无效")
+        container_port = None
+        plan["container_port"] = None
+        plan["port_fallback_reason"] = "AI 端口不是有效数字，已改用源码与构建文件自动识别"
     if container_port is not None and not 1 <= container_port <= 65535:
-        raise RuntimeError("AI 返回的容器端口超出有效范围")
+        # A model may confuse host:container mapping, concatenate values or
+        # return a protocol port outside the valid range. This is advisory
+        # metadata, not a reason to make the whole source analysis unusable.
+        # EXPOSE/Compose/source detection below is deterministic and wins.
+        container_port = None
+        plan["container_port"] = None
+        plan["port_fallback_reason"] = "AI 端口超出 1-65535，已改用源码与构建文件自动识别"
     if kind == "dockerfile":
         requested_file = str(plan.get("primary_file") or ".yunzhou.ai.Dockerfile").replace("\\", "/").lstrip("/")
         dockerfile = (root / requested_file).resolve()
@@ -2206,6 +2770,12 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
     services = compose.get("services") if isinstance(compose, dict) else None
     if not isinstance(services, dict) or not services:
         raise RuntimeError("AI 生成的 Compose 没有可运行服务")
+    removed_helpers = prune_undeclared_development_services(compose, plan)
+    if removed_helpers:
+        plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + [
+            "已移除未纳入生产方案的开发辅助服务：" + "、".join(removed_helpers)
+        ]
+        services = compose["services"]
     target_repairs = reconcile_compose_build_targets(root, compose)
     if target_repairs:
         plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + target_repairs
@@ -2365,18 +2935,56 @@ def required_compose_variables(path: str, compose_file: str, env_text: str | Non
 
 
 def effective_project_environment(project: Project) -> str:
-    """Return effective values while letting managed integrations override stale external fields."""
+    """Render one deterministic Compose environment with dependencies first.
+
+    Compose expands values in an env file while reading it.  A derived value
+    such as ``SPRING_DATASOURCE_URL=${YUNZHOU_MYSQL_HOST}...`` must therefore
+    appear after the YUNZHOU connection fields.  Concatenating the managed and
+    user files used to put derived values first and silently expanded a valid
+    external database configuration to empty strings.
+    """
     managed = (project.managed_env_text or "").strip()
     user = (decrypt(project.env_text_encrypted) or "").strip()
     user_values = environment_values(user)
     managed_values = environment_values(managed)
-    lines = [managed, user]
+    values = {**managed_values, **user_values}
     for service in ("MYSQL", "REDIS"):
         if user_values.get(f"YUNZHOU_{service}_MODE", "managed").lower() != "external":
             for key, value in managed_values.items():
                 if key.startswith(f"YUNZHOU_{service}_") and key != f"YUNZHOU_{service}_MODE":
-                    lines.append(f"{key}={value}")
-    return "\n".join(item for item in lines if item)
+                    values[key] = value
+    priority = []
+    for service in ("MYSQL", "POSTGRES", "REDIS"):
+        priority.extend(
+            f"YUNZHOU_{service}_{suffix}"
+            for suffix in ("MODE", "HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD")
+        )
+    ordered = [key for key in priority if key in values]
+    ordered.extend(key for key in values if key not in ordered)
+    return "\n".join(f"{key}={values[key]}" for key in ordered)
+
+
+def external_integration_preflight(project: Project, env_text: str) -> list[str]:
+    """Validate saved external integrations before build or container startup."""
+    user_values = environment_values(decrypt(project.env_text_encrypted) or "")
+    effective = environment_values(env_text)
+    errors: list[str] = []
+    requirements = {
+        "MYSQL": ("HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD"),
+        "POSTGRES": ("HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD"),
+        "REDIS": ("HOST", "PORT"),
+    }
+    for service, suffixes in requirements.items():
+        if user_values.get(f"YUNZHOU_{service}_MODE", "managed").lower() != "external":
+            continue
+        missing = [
+            f"YUNZHOU_{service}_{suffix}"
+            for suffix in suffixes
+            if not effective.get(f"YUNZHOU_{service}_{suffix}", "").strip()
+        ]
+        if missing:
+            errors.append(f"外接 {service} 已启用，但保存配置缺少：{'、'.join(missing)}")
+    return errors
 
 
 def environment_values(text: str | None) -> dict[str, str]:
@@ -2415,8 +3023,6 @@ def adapt_plan_to_current_integrations(plan: dict, project: Project) -> tuple[di
         name for name, service in services.items()
         if isinstance(service, dict) and re.match(r"(?i)^(?:[^/]+/)?mysql(?::|$)", str(service.get("image") or ""))
     }
-    if not mysql_services:
-        return adapted, changes
     for name in mysql_services:
         services.pop(name, None)
     variable_map = {
@@ -2463,13 +3069,38 @@ def adapt_plan_to_current_integrations(plan: dict, project: Project) -> tuple[di
                         env[username_key] = "${YUNZHOU_MYSQL_USERNAME}"
                     if password_key in env:
                         env[password_key] = "${YUNZHOU_MYSQL_PASSWORD}"
+            # Spring Boot does not understand the platform's YUNZHOU_* names
+            # by itself.  Older RuoYi/Druid projects commonly keep a complete
+            # datasource URL in application-druid.yml, so merely passing the
+            # generic values leaves the baked-in address active.  Bind both
+            # the standard Spring datasource keys and the Druid master keys
+            # whenever this looks like a Spring/Java application.  Environment
+            # variables have higher precedence than the packaged YAML and the
+            # actual secrets remain in the deployment .env file.
+            spring_service = any(
+                key in env for key in ("SPRING_PROFILES_ACTIVE", "SERVER_PORT", "JAVA_OPTS")
+            ) or str(service.get("image") or "").lower().startswith(("openjdk", "eclipse-temurin"))
+            if spring_service:
+                jdbc = "jdbc:mysql://${YUNZHOU_MYSQL_HOST}:${YUNZHOU_MYSQL_PORT}/${YUNZHOU_MYSQL_DATABASE}"
+                env.update({
+                    "SPRING_DATASOURCE_URL": jdbc,
+                    "SPRING_DATASOURCE_USERNAME": "${YUNZHOU_MYSQL_USERNAME}",
+                    "SPRING_DATASOURCE_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+                    "SPRING_DATASOURCE_DRUID_MASTER_URL": jdbc,
+                    "SPRING_DATASOURCE_DRUID_MASTER_USERNAME": "${YUNZHOU_MYSQL_USERNAME}",
+                    "SPRING_DATASOURCE_DRUID_MASTER_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+                    "SPRING_REDIS_HOST": "${YUNZHOU_REDIS_HOST:-redis}",
+                    "SPRING_REDIS_PORT": "${YUNZHOU_REDIS_PORT:-6379}",
+                    "SPRING_REDIS_DATABASE": "${YUNZHOU_REDIS_DATABASE:-0}",
+                    "SPRING_REDIS_PASSWORD": "${YUNZHOU_REDIS_PASSWORD:-}",
+                })
     adapted["compose_yaml"] = yaml.safe_dump(compose, allow_unicode=True, sort_keys=False)
     adapted["services"] = [name for name in (adapted.get("services") or []) if name not in mysql_services and "mysql" not in str(name).lower()]
     adapted["inferred_config"] = [
         row for row in (adapted.get("inferred_config") or [])
         if str(row.get("key") or "") not in variable_map
     ]
-    changes.append("已按当前表单改用外部 MySQL，并移除平台托管 MySQL 服务")
+    changes.append("已按当前表单绑定外部 MySQL 到应用实际读取的运行参数，并移除平台托管 MySQL 服务")
     return adapted, changes
 
 
@@ -2529,7 +3160,29 @@ def ensure_managed_secrets(project: Project, compose_path: str, compose_file: st
     effective_env = "\n".join(filter(None, (project.managed_env_text or "", decrypt(project.env_text_encrypted) or "")))
     missing = required_compose_variables(compose_path, compose_file, effective_env)
     external_prefixes = ("OIDC_", "OAUTH_", "PAYMENT_", "SMS_", "SMTP_", "S3_EXTERNAL_")
-    secret_markers = ("PASSWORD", "SECRET", "TOKEN", "ACCESS_KEY")
+    secret_markers = (
+        "PASSWORD", "SECRET", "TOKEN", "ACCESS_KEY",
+        # ASP.NET commonly maps nested configuration keys with ``__`` and
+        # names its JWT secret ``Jwt__SigningKey``.  It is just as much a
+        # platform-owned credential as JWT_SECRET and must never require the
+        # user to invent a value during a managed-fresh deployment.
+        "SIGNINGKEY", "SIGNING_KEY", "PRIVATE_KEY", "ENCRYPTION_KEY",
+    )
+    # Compose permits `${JWT_SECRET:-}` and similar optional-empty defaults.
+    # They are syntactically valid but almost never operationally valid for a
+    # managed application.  Treat every referenced platform-owned secret as a
+    # value that needs generation, even when Compose itself would accept an
+    # empty default.  External integrations remain user-owned below.
+    supplied_values = environment_values(effective_env)
+    compose_source = (Path(compose_path) / compose_file).read_text(encoding="utf-8", errors="ignore")
+    referenced_names = re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}", compose_source)
+    known_missing = {item["name"] for item in missing}
+    for name in referenced_names:
+        upper_name = name.upper()
+        if (name not in known_missing and not supplied_values.get(name)
+                and any(marker in upper_name for marker in secret_markers)):
+            missing.append({"name": name, "hint": "Compose 引用了可为空的敏感配置，平台将生成非空安全值"})
+            known_missing.add(name)
     current_lines = (project.managed_env_text or "").splitlines()
     generated = []
     for item in missing:
@@ -2554,6 +3207,33 @@ def ensure_managed_secrets(project: Project, compose_path: str, compose_file: st
     return generated
 
 
+def managed_mysql_image_for_source(source_path: str, project: Project | None = None) -> tuple[str, str]:
+    """Choose a managed MySQL line that matches the application's framework era."""
+    root = Path(source_path)
+    evidence = "平台默认"
+    analysis_text = json.dumps((project.source_analysis or {}) if project else {}, ensure_ascii=False)
+    if re.search(r"(?:Java|JDK)[^0-9]{0,12}(?:1\.)?8\b", analysis_text, re.I) or re.search(
+        r"Spring\s*Boot[^0-9]{0,12}[12]\.", analysis_text, re.I
+    ):
+        return "mysql:8.0", "源码分析识别为旧 Java/Spring 兼容线"
+    for pom in root.rglob("pom.xml"):
+        if any(part in {"target", ".git", "node_modules"} for part in pom.parts):
+            continue
+        text = pom.read_text(encoding="utf-8", errors="ignore")[:500_000]
+        spring = re.search(r"spring-boot(?:-dependencies|-starter-parent)?[\s\S]{0,300}?<version>\s*([0-9]+)\.", text, re.I)
+        java = re.search(r"<(?:java\.version|maven\.compiler\.source)>\s*(?:1\.)?([0-9]+)", text, re.I)
+        spring_major = int(spring.group(1)) if spring else None
+        java_major = int(java.group(1)) if java else None
+        if (spring_major is not None and spring_major < 3) or (java_major is not None and java_major <= 11):
+            details = []
+            if spring_major is not None:
+                details.append(f"Spring Boot {spring_major}.x")
+            if java_major is not None:
+                details.append(f"Java {java_major}")
+            return "mysql:8.0", "、".join(details) + " 使用兼容线"
+    return PLATFORM_MYSQL_IMAGE, evidence
+
+
 def reconcile_managed_integrations(project: Project, compose_path: str, compose_file: str) -> list[str]:
     """Guarantee that every unchecked integration has a real managed Compose service."""
     target = Path(compose_path) / compose_file
@@ -2564,19 +3244,126 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
     user_values = environment_values(decrypt(project.env_text_encrypted) or "")
     changes = []
 
+    external_mysql = user_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() == "external"
+    if external_mysql:
+        mysql_names = {
+            name for name, service in services.items()
+            if isinstance(service, dict) and (
+                re.match(r"(?i)^(?:[^/]+/)?mysql(?::|$)", str(service.get("image") or ""))
+                or name.lower() in {"mysql", "db", "database"}
+            )
+        }
+        for name in mysql_names:
+            services.pop(name, None)
+        for name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            depends = service.get("depends_on")
+            if isinstance(depends, dict):
+                for mysql_name in mysql_names:
+                    depends.pop(mysql_name, None)
+            elif isinstance(depends, list):
+                service["depends_on"] = [value for value in depends if value not in mysql_names]
+            raw_env = service.get("environment")
+            if isinstance(raw_env, list):
+                raw_env = {
+                    value.split("=", 1)[0]: value.split("=", 1)[1]
+                    for value in raw_env if isinstance(value, str) and "=" in value
+                }
+                service["environment"] = raw_env
+            if not isinstance(raw_env, dict):
+                continue
+            jdbc = "jdbc:mysql://${YUNZHOU_MYSQL_HOST}:${YUNZHOU_MYSQL_PORT}/${YUNZHOU_MYSQL_DATABASE}"
+            aliases = {
+                "DB_URL": jdbc,
+                "DB_HOST": "${YUNZHOU_MYSQL_HOST}",
+                "DB_PORT": "${YUNZHOU_MYSQL_PORT}",
+                "DB_NAME": "${YUNZHOU_MYSQL_DATABASE}",
+                "DB_DATABASE": "${YUNZHOU_MYSQL_DATABASE}",
+                "DB_USERNAME": "${YUNZHOU_MYSQL_USERNAME}",
+                "DB_USER": "${YUNZHOU_MYSQL_USERNAME}",
+                "DB_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+                "MYSQL_HOST": "${YUNZHOU_MYSQL_HOST}",
+                "MYSQL_PORT": "${YUNZHOU_MYSQL_PORT}",
+                "MYSQL_DATABASE": "${YUNZHOU_MYSQL_DATABASE}",
+                "MYSQL_USER": "${YUNZHOU_MYSQL_USERNAME}",
+                "MYSQL_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+            }
+            backend_like = any(token in name.lower() for token in ("backend", "server", "api", "app"))
+            for key, value in aliases.items():
+                if backend_like or key in raw_env:
+                    raw_env[key] = value
+        changes.append("外接 MySQL 最终裁决：移除内置数据库并重写应用连接参数")
+    else:
+        # MySQL 8 uses caching_sha2_password by default.  For platform-managed
+        # databases on an isolated Docker network, generated JDBC URLs often
+        # disable TLS but omit the connector flag required to retrieve the
+        # server public key.  Keep MySQL 8.4 and repair only those managed,
+        # non-TLS URLs; external integrations remain entirely user-owned.
+        for name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            raw_env = service.get("environment")
+            if isinstance(raw_env, list):
+                raw_env = {
+                    value.split("=", 1)[0]: value.split("=", 1)[1]
+                    for value in raw_env if isinstance(value, str) and "=" in value
+                }
+                service["environment"] = raw_env
+            if not isinstance(raw_env, dict):
+                continue
+            for key, value in list(raw_env.items()):
+                jdbc = str(value or "")
+                if not re.search(r"(?i)^jdbc:mysql://", jdbc):
+                    continue
+                if not re.search(r"(?i)(?:[?&])useSSL=false(?:&|$)", jdbc):
+                    continue
+                if re.search(r"(?i)(?:[?&])allowPublicKeyRetrieval=", jdbc):
+                    continue
+                separator = "&" if "?" in jdbc else "?"
+                raw_env[key] = jdbc + separator + "allowPublicKeyRetrieval=true"
+                changes.append(f"{name} 托管 MySQL 认证参数")
+
+    # Generated/source Compose files sometimes express optional Spring Boot
+    # settings as `--property=`. Older Spring versions reject an empty command
+    # line option before the application context starts. Environment variables
+    # remain available, so omit only syntactically empty `--name=` arguments;
+    # never remove a non-empty user value.
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        command = service.get("command")
+        if isinstance(command, list):
+            filtered = [
+                value for value in command
+                if not (isinstance(value, str) and re.fullmatch(r"--[A-Za-z0-9_.-]+=", value.strip()))
+            ]
+            if filtered != command:
+                service["command"] = filtered or None
+                changes.append("空启动参数")
+        elif isinstance(command, str):
+            filtered = re.sub(r"(?<!\S)--[A-Za-z0-9_.-]+=(?=\s|$)", "", command)
+            filtered = re.sub(r"\s{2,}", " ", filtered).strip()
+            if filtered != command.strip():
+                service["command"] = filtered or None
+                changes.append("空启动参数")
+
     def consumers(prefix: str) -> list[str]:
         return [name for name, service in services.items()
                 if isinstance(service, dict) and prefix in yaml.safe_dump(service, allow_unicode=True)]
 
-    if consumers("YUNZHOU_REDIS_") and user_values.get("YUNZHOU_REDIS_MODE", "managed").lower() != "external":
+    existing_redis_name = next((name for name, service in services.items() if isinstance(service, dict) and (
+        str(service.get("image") or "").lower().startswith("redis:") or name.lower() in {"redis", "cache"}
+    )), None)
+    analysis_text = json.dumps(project.source_analysis or {}, ensure_ascii=False)
+    redis_required = bool(consumers("YUNZHOU_REDIS_") or existing_redis_name or re.search(r'"(?:service|services)"[^\n]{0,500}Redis', analysis_text, re.I))
+    if redis_required and user_values.get("YUNZHOU_REDIS_MODE", "managed").lower() != "external":
         password = hashlib.sha256(f"{settings.app_secret}:{project.id}:redis".encode()).hexdigest()[:32]
-        redis_name = next((name for name, service in services.items() if isinstance(service, dict) and (
-            str(service.get("image") or "").lower().startswith("redis:") or name.lower() in {"redis", "cache"}
-        )), None)
+        redis_name = existing_redis_name
         if not redis_name:
             redis_name = "redis"
             services[redis_name] = {
-                "image": "redis:7-alpine",
+                "image": PLATFORM_REDIS_IMAGE,
                 "command": ["redis-server", "--appendonly", "yes", "--requirepass", "${YUNZHOU_REDIS_PASSWORD}"],
                 "volumes": [f"{project.slug}_redis_data:/data"],
                 "healthcheck": {"test": ["CMD-SHELL", "redis-cli -a $$YUNZHOU_REDIS_PASSWORD ping | grep PONG"], "interval": "10s", "timeout": "5s", "retries": 10},
@@ -2593,12 +3380,46 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
             redis_service.setdefault("environment", {})
             if isinstance(redis_service["environment"], dict):
                 redis_service["environment"]["YUNZHOU_REDIS_PASSWORD"] = "${YUNZHOU_REDIS_PASSWORD}"
+                # Source plans commonly call this REDIS_PASSWORD while the
+                # platform contract uses YUNZHOU_REDIS_PASSWORD. Keep the
+                # source-facing alias, but bind it to the same managed value.
+                redis_service["environment"]["REDIS_PASSWORD"] = "${YUNZHOU_REDIS_PASSWORD}"
             command = redis_service.get("command")
             if isinstance(command, str):
-                if "requirepass" not in command.lower():
+                if "requirepass" in command.lower():
+                    # AI/source Compose may already contain a hard-coded or
+                    # historical password. Presence is not correctness: make
+                    # the Redis process, healthcheck and application clients
+                    # consume the same platform-managed credential.
+                    redis_service["command"] = re.sub(
+                        r"(?i)(--requirepass(?:=|\s+))\S+",
+                        r'\1"$${YUNZHOU_REDIS_PASSWORD}"',
+                        command,
+                    )
+                else:
                     redis_service["command"] = command.rstrip() + " --requirepass ${YUNZHOU_REDIS_PASSWORD}"
             elif isinstance(command, list):
-                if not any("requirepass" in str(item).lower() for item in command):
+                normalized_command = list(command)
+                require_index = next(
+                    (index for index, item in enumerate(normalized_command) if str(item).lower() == "--requirepass"),
+                    None,
+                )
+                if require_index is not None:
+                    if require_index + 1 < len(normalized_command):
+                        normalized_command[require_index + 1] = "${YUNZHOU_REDIS_PASSWORD}"
+                    else:
+                        normalized_command.append("${YUNZHOU_REDIS_PASSWORD}")
+                    redis_service["command"] = normalized_command
+                elif any("requirepass" in str(item).lower() for item in normalized_command):
+                    redis_service["command"] = [
+                        re.sub(
+                            r"(?i)(--requirepass(?:=|\s+))\S+",
+                            r'\1"$${YUNZHOU_REDIS_PASSWORD}"',
+                            str(item),
+                        ) if "requirepass" in str(item).lower() else item
+                        for item in normalized_command
+                    ]
+                else:
                     redis_service["command"] = [*command, "--requirepass", "${YUNZHOU_REDIS_PASSWORD}"]
             else:
                 redis_service["command"] = [
@@ -2610,26 +3431,59 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
                 "timeout": "5s",
                 "retries": 10,
             }
-        store_managed_values(project, {"YUNZHOU_REDIS_HOST": redis_name, "YUNZHOU_REDIS_PORT": "6379", "YUNZHOU_REDIS_DATABASE": "0", "YUNZHOU_REDIS_PASSWORD": password})
+        # Application releases reuse one stable project-level data stack.  The
+        # AI plan may call its Redis service ``frcloud-redis`` (or another
+        # release-specific name), while an older data stack is already running
+        # as ``redis``.  Always publish the stable DNS alias to applications;
+        # split_compose_runtime also adds this alias to newly created Redis
+        # services, so both fresh and reused stacks resolve the same hostname.
+        store_managed_values(project, {"YUNZHOU_REDIS_HOST": "redis", "YUNZHOU_REDIS_PORT": "6379", "YUNZHOU_REDIS_DATABASE": "0", "YUNZHOU_REDIS_PASSWORD": password})
+        for name, service in services.items():
+            if name == redis_name or not isinstance(service, dict):
+                continue
+            raw_env = service.setdefault("environment", {})
+            if isinstance(raw_env, list):
+                raw_env = {
+                    value.split("=", 1)[0]: value.split("=", 1)[1]
+                    for value in raw_env if isinstance(value, str) and "=" in value
+                }
+                service["environment"] = raw_env
+            if isinstance(raw_env, dict) and any(token in name.lower() for token in ("backend", "server", "api", "app")):
+                raw_env.update({
+                    "REDIS_HOST": "${YUNZHOU_REDIS_HOST}",
+                    "REDIS_PORT": "${YUNZHOU_REDIS_PORT}",
+                    "REDIS_PASSWORD": "${YUNZHOU_REDIS_PASSWORD}",
+                    "SPRING_REDIS_HOST": "${YUNZHOU_REDIS_HOST}",
+                    "SPRING_REDIS_PORT": "${YUNZHOU_REDIS_PORT}",
+                    "SPRING_REDIS_DATABASE": "${YUNZHOU_REDIS_DATABASE}",
+                    "SPRING_REDIS_PASSWORD": "${YUNZHOU_REDIS_PASSWORD}",
+                })
         changes.append("Redis")
 
     if consumers("YUNZHOU_MYSQL_") and user_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() != "external":
         digest = hashlib.sha256(f"{settings.app_secret}:{project.id}:mysql-managed".encode()).hexdigest()
         database = re.sub(r"[^a-zA-Z0-9_]", "_", project.slug)[:48] or "app"
+        mysql_image, mysql_evidence = managed_mysql_image_for_source(compose_path, project)
         services.setdefault("mysql", {
-            "image": "mysql:8.4",
+            "image": mysql_image,
             "environment": {"MYSQL_DATABASE": "${YUNZHOU_MYSQL_DATABASE}", "MYSQL_USER": "${YUNZHOU_MYSQL_USERNAME}", "MYSQL_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}", "MYSQL_ROOT_PASSWORD": "${YUNZHOU_MYSQL_ROOT_PASSWORD}"},
             "volumes": [f"{project.slug}_mysql_data:/var/lib/mysql"],
             "healthcheck": {"test": ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"], "interval": "10s", "timeout": "5s", "retries": 20},
             "restart": "unless-stopped",
         })
+        mysql_name = next((name for name, service in services.items() if isinstance(service, dict) and (
+            str(service.get("image") or "").lower().startswith("mysql:") or name.lower() in {"mysql", "db"}
+        )), None)
+        if mysql_name:
+            services[mysql_name]["image"] = mysql_image
+            changes.append(f"MySQL 版本 {mysql_image}（{mysql_evidence}）")
         document.setdefault("volumes", {}).setdefault(f"{project.slug}_mysql_data", {})
         store_managed_values(project, {"YUNZHOU_MYSQL_HOST": "mysql", "YUNZHOU_MYSQL_PORT": "3306", "YUNZHOU_MYSQL_DATABASE": database, "YUNZHOU_MYSQL_USERNAME": "yunzhou", "YUNZHOU_MYSQL_PASSWORD": digest[:32], "YUNZHOU_MYSQL_ROOT_PASSWORD": hashlib.sha256((digest + ":root").encode()).hexdigest()[:32]})
         changes.append("MySQL")
 
     if changes:
         target.write_text(yaml.safe_dump(document, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    return changes
+    return list(dict.fromkeys(changes))
 
 
 def analyze_runtime_dependencies(path: str) -> dict:
@@ -2768,18 +3622,58 @@ def infer_verified_access_path(source_path: str, ai_plan: dict | None) -> tuple[
     safe_path = re.compile(r"^/[A-Za-z0-9._~!$&*+,;=:@%/-]*$")
     if configured and configured != "/" and safe_path.fullmatch(configured):
         return (configured if configured.startswith("/") else "/" + configured), "AI 部署方案"
+    # A generated healthcheck is stronger evidence than a model's generic
+    # access_path="/". API-only services commonly return 404 at the root while
+    # their explicit readiness endpoint is healthy (for example /api/tags).
+    # Reuse only the URL path; host and port remain owned by the gateway.
+    compose_evidence = str((ai_plan or {}).get("compose_yaml") or "")
+    for match in re.finditer(r"https?://[^/\s'\"\]]+(?P<path>/[A-Za-z0-9._~!$&*+,;=:@%/-]*)", compose_evidence):
+        health_path = match.group("path").rstrip(".,;:") or "/"
+        if health_path != "/" and safe_path.fullmatch(health_path):
+            return health_path, "生成方案健康检查"
     root = Path(source_path)
     candidates: list[tuple[int, str, str]] = []
     route_pattern = re.compile(r"(?<![A-Za-z0-9_])(/(?:api|actuator)/[A-Za-z0-9_.~!$&*+,;=:@%/-]+)")
     preferred_names = {"README.md", "README", "readme.md"}
     files = [p for p in root.rglob("*") if p.is_file() and (
-        p.name in preferred_names or p.suffix.lower() in {".java", ".kt", ".py", ".js", ".ts", ".md"}
+        p.name in preferred_names or p.suffix.lower() in {".java", ".kt", ".py", ".js", ".ts", ".cs", ".md"}
     )]
+    # ASP.NET projects often apply a global prefix through an MVC convention
+    # and keep controller routes relative (for example prefix `api` plus
+    # `[Route("tags")]`). Resolve that convention once before inspecting the
+    # individual controllers so API-only applications are not rejected just
+    # because their root path intentionally returns 404.
+    csharp_prefix = ""
+    for candidate_file in files:
+        if candidate_file.suffix.lower() != ".cs":
+            continue
+        candidate_text = candidate_file.read_text(encoding="utf-8", errors="replace")[:300_000]
+        prefix_match = re.search(
+            r"ApiRoutePrefixConvention\s*\([^)]*?\?\?\s*[\"']([^\"']+)[\"']",
+            candidate_text,
+            re.S,
+        ) or re.search(r"UsePathBase\s*\(\s*[\"']([^\"']+)[\"']", candidate_text)
+        if prefix_match:
+            csharp_prefix = prefix_match.group(1).strip("/")
+            break
     for file in files[:500]:
         if any(part in {".git", "node_modules", "target", "dist", "build"} for part in file.relative_to(root).parts):
             continue
         text = file.read_text(encoding="utf-8", errors="replace")[:300_000]
         relative_file = file.relative_to(root).as_posix()
+        if file.suffix.lower() == ".cs":
+            controller_route = re.search(r"\[Route\s*\(\s*[\"']([^\"']+)[\"']\s*\)\s*\]", text)
+            route_root = controller_route.group(1).strip("/") if controller_route else ""
+            for method_path in re.findall(r"\[HttpGet(?:\s*\(\s*[\"']([^\"']*)[\"']\s*\))?\s*\]", text):
+                if "{" in method_path or "}" in method_path:
+                    continue
+                route = "/" + "/".join(
+                    part for part in (csharp_prefix, route_root, method_path.strip("/")) if part
+                )
+                route = re.sub(r"/+", "/", route)
+                if route != "/" and safe_path.fullmatch(route):
+                    route_rank = 0 if re.search(r"/(?:tags|list|health|status)(?:/|$)", route, re.I) else 1
+                    candidates.append((route_rank, route, relative_file))
         # Spring controllers commonly split a route between the class and the
         # method, for example `/api/device` + `list/{pageNum}/{pageSize}`.  A
         # class-level mapping is only a namespace and often returns 404, so
@@ -2838,7 +3732,10 @@ def preflight_ai_deployment_plan(
         shutil.copytree(
             source,
             rehearsal,
-            ignore=shutil.ignore_patterns(".git", "node_modules", "target", "dist", "build", "__pycache__"),
+            symlinks=True,
+            ignore=shutil.ignore_patterns(
+                ".git", ".agents", "node_modules", "target", "dist", "build", "__pycache__"
+            ),
         )
         effective_plan, automatic_repairs = adapt_plan_to_current_integrations(plan, project)
         build_type, build_file, detected_port = materialize_ai_deployment_plan(str(rehearsal), effective_plan)
@@ -3016,7 +3913,7 @@ def _run_temporary_privileged_preflight(db, rehearsal: Path, build_type: str, bu
             pass
 
 
-def choose_port(db, preferred: int | None) -> int:
+def choose_port(db, preferred: int | None, exclude_deployment_id: str | None = None) -> int:
     # Port selection and the subsequent Deployment/ProjectReplica write must be
     # serialized across worker and API processes.  Without this transaction
     # lock a release and a simultaneous scale request can both observe the same
@@ -3027,19 +3924,31 @@ def choose_port(db, preferred: int | None) -> int:
     internal_end = policy.internal_port_end if policy else 39999
     external_start = policy.external_port_start if policy else 20000
     external_end = policy.external_port_end if policy else 21000
+    deployment_filter = [Deployment.status.in_([DeployStatus.queued, DeployStatus.running, DeployStatus.success])]
+    if exclude_deployment_id:
+        deployment_filter.append(Deployment.id != exclude_deployment_id)
+    used = set(db.scalars(select(Deployment.host_port).where(*deployment_filter)).all())
+    used.update(db.scalars(select(ProjectReplica.host_port).where(ProjectReplica.status == "running")).all())
+    used.update(db.scalars(select(DeploymentPortReservation.host_port).where(
+        DeploymentPortReservation.status.in_(["reserved", "active"]),
+        *([DeploymentPortReservation.deployment_id != exclude_deployment_id] if exclude_deployment_id else []),
+    )).all())
+    used.discard(None)
     if preferred:
         if external_start <= preferred <= external_end:
             raise RuntimeError("项目指定的服务器端口占用了公网网关端口段，请改用内网实例端口段")
-        return preferred
-    used = set(db.scalars(select(Deployment.host_port).where(Deployment.status.in_([DeployStatus.queued, DeployStatus.running, DeployStatus.success]))).all())
-    used.update(db.scalars(select(ProjectReplica.host_port).where(ProjectReplica.status == "running")).all())
+        if preferred not in used:
+            return preferred
     for port in range(internal_start, internal_end + 1):
         if port not in used:
             return port
     raise RuntimeError("内网实例端口池已用完，请在系统设置中扩大端口范围")
 
 
-def choose_node_port(db, node: Node, preferred: int | None, reserved: set[int] | None = None) -> int:
+def choose_node_port(
+    db, node: Node, preferred: int | None, reserved: set[int] | None = None,
+    exclude_deployment_id: str | None = None,
+) -> int:
     """Choose a port that is free in both platform state and the real node.
 
     Old containers can outlive a deleted deployment record.  Looking only at
@@ -3049,12 +3958,19 @@ def choose_node_port(db, node: Node, preferred: int | None, reserved: set[int] |
     """
     policy = db.get(DeploymentSettings, "default")
     internal_end = policy.internal_port_end if policy else 39999
-    candidate = choose_port(db, preferred)
-    used = set(db.scalars(select(Deployment.host_port).where(
+    candidate = choose_port(db, preferred, exclude_deployment_id)
+    deployment_filters = [
         Deployment.status.in_([DeployStatus.queued, DeployStatus.running, DeployStatus.success])
-    )).all())
+    ]
+    if exclude_deployment_id:
+        deployment_filters.append(Deployment.id != exclude_deployment_id)
+    used = set(db.scalars(select(Deployment.host_port).where(*deployment_filters)).all())
     used.update(db.scalars(select(ProjectReplica.host_port).where(
         ProjectReplica.status == "running"
+    )).all())
+    used.update(db.scalars(select(DeploymentPortReservation.host_port).where(
+        DeploymentPortReservation.status.in_(["reserved", "active"]),
+        *([DeploymentPortReservation.deployment_id != exclude_deployment_id] if exclude_deployment_id else []),
     )).all())
     locally_reserved = {int(port) for port in (reserved or set()) if port}
     used.update(locally_reserved)
@@ -3066,7 +3982,7 @@ def choose_node_port(db, node: Node, preferred: int | None, reserved: set[int] |
                 "(docker ps --format '{{.Ports}}' 2>/dev/null | "
                 f"grep -Eq '(^|[^0-9]){candidate}->')"
             )
-            if code != 0 and candidate not in locally_reserved and (candidate == preferred or candidate not in used):
+            if code != 0 and candidate not in locally_reserved and candidate not in used:
                 return candidate
             candidate += 1
     raise RuntimeError("目标服务器内网实例端口池已被占满")
@@ -3084,6 +4000,124 @@ def platform_gateway_node(db) -> Node | None:
     return None
 
 
+def reconcile_runtime_frontend_routes(route_groups: list[dict] | None) -> tuple[list[dict] | None, str | None]:
+    """Reconcile planned routes with the frontend that was actually built.
+
+    Source trees often contain several environment files while the final image
+    contains only one effective ``baseURL``/runtime config.  The built artifact
+    is therefore the strongest evidence.  This also catches projects whose
+    production prefix is `/frapi` although an older Nginx sample still mentions
+    `/prod-api`.
+    """
+    if not route_groups:
+        return route_groups, None
+    frontend = next((group for group in route_groups if any(
+        str(path.get("path") if isinstance(path, dict) else path) == "/"
+        for path in (group.get("paths") or [])
+    )), None)
+    backend = next((group for group in route_groups if group is not frontend and group.get("targets")), None)
+    if not frontend or not backend or not frontend.get("targets"):
+        return route_groups, None
+
+    host, port = frontend["targets"][0]
+    origin = f"http://{host}:{port}"
+    candidates: dict[str, tuple[int, str]] = {}
+    artifact_texts: list[str] = []
+
+    def add(raw: str, score: int, source: str) -> None:
+        path = _public_path_from_value(raw)
+        if not path:
+            return
+        current = candidates.get(path)
+        if current is None or score > current[0]:
+            candidates[path] = (score, source)
+
+    try:
+        with httpx.Client(timeout=6, follow_redirects=True, trust_env=False) as client:
+            response = client.get(origin + "/")
+            if response.status_code >= 400:
+                return route_groups, None
+            html = response.text[:1_000_000]
+            asset_matches = re.finditer(
+                r"<(?:script|link)[^>]+(?:src|href)\s*=\s*(?:[\"']([^\"']+)[\"']|([^\s>]+))",
+                html,
+                re.I,
+            )
+            assets = [(match.group(1) or match.group(2) or "").strip() for match in asset_matches]
+            # Runtime config is intentionally checked before hashed bundles.
+            assets.sort(key=lambda value: (0 if re.search(r"posturl|runtime|config|env", value, re.I) else 1, value))
+            for asset in assets[:24]:
+                parsed = urlsplit(asset)
+                if parsed.scheme and parsed.netloc and parsed.netloc != f"{host}:{port}":
+                    continue
+                asset_path = parsed.path
+                if not asset_path.endswith((".js", ".mjs")):
+                    continue
+                try:
+                    content = client.get(origin + (asset_path if asset_path.startswith("/") else "/" + asset_path)).text[:2_500_000]
+                except httpx.HTTPError:
+                    continue
+                artifact_texts.append(content)
+                runtime_score = 150 if re.search(r"posturl|runtime|config|env", asset_path, re.I) else 125
+                for match in re.finditer(r"\b(?:const|let|var)\s+(?:IP|API_BASE_URL|BASE_API)\s*=\s*[\"']([^\"']+)[\"']", content):
+                    add(match.group(1), runtime_score, asset_path)
+                for match in re.finditer(r"\bbaseURL\s*:\s*[\"']([^\"']+)[\"']", content):
+                    add(match.group(1), runtime_score - 5, asset_path)
+    except httpx.HTTPError:
+        return route_groups, None
+    if not candidates:
+        return route_groups, None
+
+    path, (_, evidence) = max(candidates.items(), key=lambda item: (item[1][0], -len(item[0])))
+    public_path = path.rstrip("/") + "/"
+    previous_strip = next((
+        bool(row.get("strip_prefix", False))
+        for row in (backend.get("paths") or [])
+        if isinstance(row, dict) and str(row.get("path") or "").rstrip("/") == path.rstrip("/")
+    ), None)
+    strip_prefix = previous_strip
+
+    # When a cheap, read-only endpoint is visible in the bundle, compare the
+    # backend's root route with the public-prefix route. A JSON code=200 response
+    # is considerably stronger than status alone (many apps return HTTP 200 for
+    # their JSON 401 payloads).
+    probe = "/captchaImage" if any("/captchaImage" in text for text in artifact_texts) else None
+    if probe:
+        backend_host, backend_port = backend["targets"][0]
+        backend_origin = f"http://{backend_host}:{backend_port}"
+
+        def probe_score(url: str) -> int:
+            try:
+                with httpx.Client(timeout=5, follow_redirects=True, trust_env=False) as client:
+                    response = client.get(url)
+                score = 2 if response.status_code < 400 else 0
+                if "json" in response.headers.get("content-type", "").lower():
+                    score += 3
+                    payload = response.json()
+                    if isinstance(payload, dict) and int(payload.get("code", 200) or 200) == 200:
+                        score += 5
+                    if isinstance(payload, dict) and (payload.get("img") or payload.get("data")):
+                        score += 2
+                return score
+            except (httpx.HTTPError, ValueError, TypeError):
+                return 0
+
+        root_score = probe_score(backend_origin + probe)
+        prefixed_score = probe_score(backend_origin + path.rstrip("/") + probe)
+        if root_score != prefixed_score:
+            strip_prefix = root_score > prefixed_score
+    if strip_prefix is None:
+        # Production aliases conventionally live only at the gateway. Preserve
+        # neutral `/api` unless runtime probing or source Nginx proved otherwise.
+        strip_prefix = bool(re.fullmatch(r"/(?:prod|stage|staging|dev|fr)-api", path, re.I))
+
+    reconciled = copy.deepcopy(route_groups)
+    for group in reconciled:
+        if str(group.get("name") or "") == str(backend.get("name") or ""):
+            group["paths"] = [{"path": public_path, "strip_prefix": bool(strip_prefix)}]
+    return reconciled, f"{public_path} → {backend.get('name')}（{'去掉' if strip_prefix else '保留'}前缀，证据 {evidence}）"
+
+
 def configure_platform_gateway(
     db, deployment: Deployment, target_node: Node, target_port: int, domain: str | None = None,
     http_port: int = 80, https_enabled: bool = False, https_port: int = 443,
@@ -3091,6 +4125,11 @@ def configure_platform_gateway(
     upstreams: list[tuple[str, int]] | None = None, strategy: str = "round_robin",
     route_groups: list[dict] | None = None,
 ) -> str:
+    # Keep the caller's list object as the published routing contract. Runtime
+    # asset inspection may discover a more accurate API prefix (for example
+    # /frapi/) than source analysis did; final access verification must probe
+    # that reconciled route rather than the stale pre-gateway list.
+    caller_route_groups = route_groups
     # Domain settings can be changed while a deployment is finishing. Serialize
     # all gateway writes for the same project across API and worker processes,
     # then refresh the authoritative settings so an older deployment cannot
@@ -3116,18 +4155,80 @@ def configure_platform_gateway(
                 saved_routes = []
             automatic = {str(group.get("name") or ""): group for group in (route_groups or [])}
             custom_groups: dict[str, dict] = {}
+            routes_migrated = False
             for route in saved_routes:
                 service = str(route.get("service") or "")
                 source_group = automatic.get(service)
                 if not source_group:
-                    raise RuntimeError(f"自定义网关路由引用了不存在的运行服务：{service}")
+                    semantic = service.strip().lower()
+                    aliases = {
+                        "backend": ("backend", "server", "api", "app"),
+                        "api": ("backend", "server", "api", "app"),
+                        "server": ("backend", "server", "api", "app"),
+                        "frontend": ("frontend", "web", "ui"),
+                        "web": ("frontend", "web", "ui"),
+                    }
+                    tokens = aliases.get(semantic, ())
+                    route_path = str(route.get("path") or "/")
+                    # Generated service names commonly carry a project prefix
+                    # (wms-api, warehouse-backend, admin-web). Infer the saved
+                    # route's role from both its old name and public path, then
+                    # bind it to the unique current runtime service. This keeps
+                    # custom routes stable after delete/recreate and reanalysis.
+                    if not tokens:
+                        if route_path.rstrip("/"):
+                            tokens = ("backend", "server", "api", "app")
+                        else:
+                            tokens = ("frontend", "web", "ui")
+                    candidates = [
+                        (name, group) for name, group in automatic.items()
+                        if tokens and any(token in name.lower() for token in tokens)
+                    ]
+                    if len(candidates) != 1:
+                        role_candidates = []
+                        for name, group in automatic.items():
+                            group_paths = group.get("paths") or []
+                            owns_root = any(
+                                str(path.get("path") if isinstance(path, dict) else path) == "/"
+                                for path in group_paths
+                            )
+                            if (route_path.rstrip("/") and not owns_root) or (not route_path.rstrip("/") and owns_root):
+                                role_candidates.append((name, group))
+                        if len(role_candidates) == 1:
+                            candidates = role_candidates
+                    if len(candidates) == 1:
+                        service, source_group = candidates[0]
+                        route["service"] = service
+                        routes_migrated = True
+                    else:
+                        raise RuntimeError(f"自定义网关路由引用了不存在的运行服务：{service}")
                 group = custom_groups.setdefault(service, {
                     "name": service, "targets": source_group.get("targets") or [],
                     "strategy": source_group.get("strategy") or strategy, "paths": [],
                 })
                 group["paths"].append({"path": route.get("path") or "/", "strip_prefix": bool(route.get("strip_prefix", False))})
+            if routes_migrated:
+                current_domain.custom_routes_json = json.dumps(saved_routes, ensure_ascii=False)
+                # Do not touch Deployment.log_text inside this long-lived
+                # gateway transaction.  Progress logging uses an independent
+                # session, so changing the same deployment row here would make
+                # that logger wait on our own uncommitted row lock.
             if custom_groups:
                 route_groups = list(custom_groups.values())
+        else:
+            route_groups, runtime_evidence = reconcile_runtime_frontend_routes(route_groups)
+            if runtime_evidence:
+                marker = f"[网关识别] 最终前端产物：{runtime_evidence}\n"
+                if marker not in (deployment.log_text or ""):
+                    deployment.log_text = ((deployment.log_text or "") + marker)[-200_000:]
+    else:
+        route_groups, runtime_evidence = reconcile_runtime_frontend_routes(route_groups)
+        if runtime_evidence:
+            marker = f"[网关识别] 最终前端产物：{runtime_evidence}\n"
+            if marker not in (deployment.log_text or ""):
+                deployment.log_text = ((deployment.log_text or "") + marker)[-200_000:]
+    if caller_route_groups is not None and route_groups is not caller_route_groups:
+        caller_route_groups[:] = copy.deepcopy(route_groups or [])
     gateway = platform_gateway_node(db)
     if not gateway:
         return f"http://{target_node.public_address or target_node.host}:{target_port}"
@@ -3153,6 +4254,20 @@ def configure_platform_gateway(
         match = re.search(r":(\d+)(?:/|$)", value or "")
         if match:
             used.add(int(match.group(1)))
+    # Keep a database allocation ledger for the gateway listener as well as
+    # inspecting Nginx.  This covers domain-based URLs, where the internal
+    # 30000-range listener is intentionally not present in access_url.
+    gateway_reservations = db.scalars(select(DeploymentPortReservation).where(
+        DeploymentPortReservation.node_id == gateway.id,
+        DeploymentPortReservation.service_name == "__gateway__",
+        DeploymentPortReservation.status.in_(["reserved", "active"]),
+    )).all()
+    for reservation in gateway_reservations:
+        owner = db.get(Deployment, reservation.deployment_id)
+        if owner and owner.project_id == deployment.project_id:
+            service_port = service_port or reservation.host_port
+        else:
+            used.add(reservation.host_port)
     # Ports already used by applications hosted on the gateway cannot also be
     # bound by Nginx. Remote-node internal ports do not conflict here.
     used.update(x for x in db.scalars(select(Deployment.host_port).where(Deployment.node_id == gateway.id, Deployment.status.in_([DeployStatus.queued, DeployStatus.running, DeployStatus.success]))).all() if x)
@@ -3371,7 +4486,7 @@ server {{
             f"test -f {shlex.quote(filename)}.bak && mv {shlex.quote(filename)}.bak {shlex.quote(filename)} || rm -f {shlex.quote(filename)}; "
             + restore_legacy + " exit 43; fi; "
             + remove_legacy_backups +
-            f"rm -f {shlex.quote(filename)}.bak; docker exec yunzhou-platform-gateway nginx -s reload"
+            "docker exec yunzhou-platform-gateway nginx -s reload"
         )
         code, output = ssh.run(command, timeout=60)
         if code:
@@ -3380,12 +4495,77 @@ server {{
             raise RuntimeError("平台网关配置失败：" + output)
         code, output = ssh.run(f"curl -sS -o /dev/null --max-time 8 http://127.0.0.1:{gateway_port}/")
         if code:
+            ssh.run(
+                f"test -f {shlex.quote(filename)}.bak && mv {shlex.quote(filename)}.bak {shlex.quote(filename)} || rm -f {shlex.quote(filename)}; "
+                "docker exec yunzhou-platform-gateway nginx -t && docker exec yunzhou-platform-gateway nginx -s reload",
+                timeout=30,
+            )
             raise RuntimeError("平台网关映射后无法访问源站：" + output)
+        ssh.run(f"rm -f {shlex.quote(filename)}.bak", timeout=15)
+    gateway_reservation = db.scalar(select(DeploymentPortReservation).where(
+        DeploymentPortReservation.node_id == gateway.id,
+        DeploymentPortReservation.host_port == gateway_port,
+    ))
+    if gateway_reservation:
+        gateway_reservation.deployment_id = deployment.id
+        gateway_reservation.service_name = "__gateway__"
+        gateway_reservation.status = "active"
+        gateway_reservation.created_at = datetime.now(timezone.utc)
+    else:
+        db.add(DeploymentPortReservation(
+            deployment_id=deployment.id,
+            node_id=gateway.id,
+            service_name="__gateway__",
+            host_port=gateway_port,
+            status="active",
+        ))
+    # A project owns only one live gateway listener. Mark any stale listener
+    # reservation released after the replacement route has passed nginx -t
+    # and its reachability check.
+    for reservation in gateway_reservations:
+        owner = db.get(Deployment, reservation.deployment_id)
+        if owner and owner.project_id == deployment.project_id and reservation.host_port != gateway_port:
+            reservation.status = "released"
+    db.flush()
     if domain:
         scheme, port = ("https", https_port) if https_enabled else ("http", http_port)
         default_port = 443 if scheme == "https" else 80
         return f"{scheme}://{domain}{':' + str(port) if port != default_port else ''}"
     return f"http://{gateway.public_address or gateway.host}:{gateway_port}"
+
+
+def snapshot_platform_gateway(db, project_id: str) -> tuple[bool, str]:
+    """Capture the current project gateway file before a candidate switch."""
+    gateway = platform_gateway_node(db)
+    if not gateway:
+        return False, ""
+    filename = f"/data/yunzhou-control/data/gateway/conf.d/project-{project_id}.conf"
+    with SSHNode(gateway) as ssh:
+        code, encoded = ssh.run(
+            f"test -f {shlex.quote(filename)} && base64 -w0 {shlex.quote(filename)}",
+            timeout=20,
+        )
+    return code == 0 and bool(encoded.strip()), encoded.strip()
+
+
+def restore_platform_gateway(db, project_id: str, snapshot: tuple[bool, str]) -> None:
+    """Restore the previous gateway route after candidate verification fails."""
+    gateway = platform_gateway_node(db)
+    if not gateway:
+        return
+    existed, encoded = snapshot
+    filename = f"/data/yunzhou-control/data/gateway/conf.d/project-{project_id}.conf"
+    with SSHNode(gateway) as ssh:
+        if existed:
+            command = f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(filename)}"
+        else:
+            command = f"rm -f {shlex.quote(filename)}"
+        code, output = ssh.run(
+            command + "; docker exec yunzhou-platform-gateway nginx -t && docker exec yunzhou-platform-gateway nginx -s reload",
+            timeout=30,
+        )
+    if code:
+        raise RuntimeError("恢复旧网关配置失败：" + output[-800:])
 
 
 def ai_checkpoint(deployment_id: str, stage: str, evidence: str) -> None:
@@ -3404,7 +4584,7 @@ def ai_checkpoint(deployment_id: str, stage: str, evidence: str) -> None:
     threading.Thread(target=follow, name=f"ai-follow-{deployment_id[:8]}", daemon=True).start()
 
 
-def verify_access(db, deployment_id: str, access_url: str) -> None:
+def verify_access(db, deployment_id: str, access_url: str, required_paths: list[str] | None = None) -> str:
     """Do not mark a deployment complete until its public entry is reachable."""
     gateway = platform_gateway_node(db)
     if not gateway:
@@ -3433,7 +4613,7 @@ def verify_access(db, deployment_id: str, access_url: str) -> None:
             node = db.get(Node, dep.node_id) if dep else None
             if not dep or not project or not node:
                 return ""
-            compose_project = shlex.quote("yz-" + project.slug)
+            compose_project = shlex.quote(deployment_compose_project_name(dep, project))
             direct_path = shlex.quote(path)
             with SSHNode(node) as node_ssh:
                 _, text = node_ssh.run(
@@ -3467,12 +4647,70 @@ def verify_access(db, deployment_id: str, access_url: str) -> None:
             # Protected endpoints may legitimately answer 401/403; otherwise
             # require a normal success or redirect response.
             accepted = status.isdigit() and (200 <= int(status) < 400 or int(status) in {401, 403})
+            route_failures: list[str] = []
             if code == 0 and accepted:
-                qualifier = "（服务可达，需要鉴权）" if int(status) in {401, 403} else ""
-                log(deployment_id, f"[检查] 第 {attempt} 次访问验证通过：HTTP {status}{qualifier} · {access_url}\n")
-                ai_checkpoint(deployment_id, "验证访问地址", f"访问验证通过：HTTP {status}{qualifier}，地址 {access_url}")
-                return
-            last_output = output.strip() or f"curl exit={code}, HTTP {status}"
+                for required_path in dict.fromkeys(required_paths or []):
+                    required_path = "/" + str(required_path or "").lstrip("/")
+                    if required_path == "/":
+                        continue
+                    probe_target = (
+                        urlunsplit((parsed.scheme, parsed.netloc, required_path, "", ""))
+                        if parsed.scheme == "https" else f"http://127.0.0.1:{port}{required_path}"
+                    )
+                    probe_code, probe_output = gateway_ssh.run(
+                        "curl -sS -o /dev/null --connect-timeout 4 --max-time 10 "
+                        f"{route_args} -w '%{{http_code}}' {shlex.quote(probe_target)}"
+                    )
+                    probe_status = probe_output.strip()[-3:] if probe_output.strip() else "000"
+                    probe_ok = probe_code == 0 and probe_status.isdigit() and int(probe_status) < 500
+                    if not probe_ok:
+                        route_failures.append(f"{required_path}=HTTP {probe_status}")
+                if route_failures:
+                    last_output = "；".join(route_failures)
+                    log(deployment_id, f"[检查] 前端入口可达，但后端路由尚未就绪：{last_output}\n")
+                    accepted = False
+                else:
+                    qualifier = "（服务可达，需要鉴权）" if int(status) in {401, 403} else ""
+                    log(deployment_id, f"[检查] 第 {attempt} 次访问验证通过：HTTP {status}{qualifier} · {access_url}\n")
+                    ai_checkpoint(deployment_id, "验证访问地址", f"访问验证通过：HTTP {status}{qualifier}，地址 {access_url}")
+                    return access_url
+            # Model/source inference is useful for API-only services, but a
+            # concrete business endpoint is not a readiness contract.  It may
+            # legitimately be unavailable before seed data exists, or contain
+            # a repository-level bug, while the application's explicit root
+            # entry is already healthy.  For any failed inferred sub-path,
+            # probe `/` immediately.  A passing root proves deployment
+            # reachability; the original status remains in the audit log as a
+            # business-route warning instead of incorrectly failing the whole
+            # deployment.  Authentication responses are accepted above and
+            # therefore never enter this fallback.
+            if not accepted and path != "/" and not required_paths:
+                root_url = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+                root_target = root_url if parsed.scheme == "https" else f"http://127.0.0.1:{port}/"
+                root_code, root_output = gateway_ssh.run(
+                    "curl -L -sS -o /dev/null --connect-timeout 4 --max-time 10 "
+                    f"{route_args} -w '%{{http_code}}' {shlex.quote(root_target)}"
+                )
+                root_status = root_output.strip()[-3:] if root_output.strip() else "000"
+                root_accepted = root_status.isdigit() and (
+                    200 <= int(root_status) < 400 or int(root_status) in {401, 403}
+                )
+                if root_code == 0 and root_accepted:
+                    log(
+                        deployment_id,
+                        f"[访问路径修正] 推断业务路径 {path} 返回 HTTP {status}，"
+                        f"根入口验证通过 HTTP {root_status}；已采用 {root_url}，"
+                        "原业务路径异常已保留为诊断证据。\n",
+                    )
+                    ai_checkpoint(
+                        deployment_id,
+                        "验证访问地址",
+                        f"推断业务路径 {path} 返回 HTTP {status}，根入口通过 HTTP {root_status}，"
+                        f"部署可达地址 {root_url}；业务路径异常需单独诊断",
+                    )
+                    return root_url.rstrip("/")
+            if not route_failures:
+                last_output = output.strip() or f"curl exit={code}, HTTP {status}"
             log(deployment_id, f"[检查] 第 {attempt}/{max_attempts} 次访问尚未就绪：{last_output[-300:]}\n")
             if attempt in (2, 4, 6):
                 diagnostic_text = collect_diagnostics()
@@ -3510,9 +4748,41 @@ def node_platform(node: Node) -> str:
     return "linux/arm64" if machine in {"aarch64", "arm64"} else "linux/amd64"
 
 
-def _service_container_name(project_slug: str, service_name: str, sequence: int = 1) -> str:
+def compose_project_name(
+    project_slug: str, release: str | None = None, namespace: str = "yunzhou",
+) -> str:
+    """Return a release-isolated Compose project name.
+
+    Historical releases used ``yz-<slug>``. The fallback keeps those records
+    startable while every new release receives a separate ownership boundary.
+    """
+    safe_slug = re.sub(r"[^a-z0-9-]", "-", str(project_slug).lower()).strip("-") or "project"
+    safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(namespace).lower()).strip("-") or "yunzhou"
+    return f"{safe_namespace}-{safe_slug}-{safe_release}" if safe_release else f"{safe_namespace}-{safe_slug}"
+
+
+def deployment_compose_project_name(deployment: Deployment, project: Project, namespace: str = "yunzhou") -> str:
+    """Recover the immutable Compose project even if the global namespace later changes."""
+    release = str(deployment.release or "")
+    marker = f"-{project.slug}-{release}"
+    recorded = str(deployment.container_name or "")
+    if release and marker in recorded:
+        prefix = recorded.split(marker, 1)[0]
+        if prefix:
+            return compose_project_name(project.slug, release, prefix)
+    return compose_project_name(project.slug, release, namespace)
+
+
+def _service_container_name(
+    project_slug: str, service_name: str, sequence: int = 1,
+    release: str | None = None, namespace: str = "yunzhou",
+) -> str:
     safe_service = re.sub(r"[^a-z0-9-]", "-", str(service_name).lower()).strip("-") or "app"
-    return f"yz-{project_slug}-{safe_service}-{max(1, int(sequence))}"
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(namespace).lower()).strip("-") or "yunzhou"
+    safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
+    version = f"-{safe_release}" if safe_release else ""
+    return f"{safe_namespace}-{project_slug}{version}-{safe_service}-{max(1, int(sequence))}"
 
 
 def _project_traffic_plan(project: Project, deployment_plan: dict | None = None) -> dict:
@@ -3538,7 +4808,10 @@ def _traffic_service_roles(traffic_plan: dict) -> dict[str, tuple[str, bool]]:
         service = str(row.get("service") or "").strip()
         role = str(row.get("role") or "app").strip().lower()
         if service:
-            roles[service] = (role, bool(row.get("scalable", role in {"frontend", "backend", "app", "web", "api"})))
+            if role in {"frontend", "backend", "app", "web", "api"}:
+                roles[service] = (role, True)
+            else:
+                roles[service] = (role, bool(row.get("scalable", False)))
     return roles
 
 
@@ -3554,6 +4827,172 @@ def _compose_port_number(value) -> int | None:
     match = re.search(r"(\d{1,5})$", target)
     port = int(match.group(1)) if match else None
     return port if port and 1 <= port <= 65535 else None
+
+
+def _compose_published_port(value, environment: dict[str, str] | None = None) -> int | None:
+    if isinstance(value, dict):
+        raw = value.get("published")
+        published = str(raw or "").strip()
+    else:
+        raw = str(value or "").strip().split("/", 1)[0]
+        parts = raw.rsplit(":", 2)
+        if len(parts) < 2:
+            return None
+        published = parts[-2]
+    if not published.isdigit() and environment:
+        variable = re.fullmatch(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::-|-)([^}]*))?\}",
+            published,
+        )
+        if variable:
+            published = str(environment.get(variable.group(1), variable.group(2) or "")).strip()
+    return int(published) if published.isdigit() and 1 <= int(published) <= 65535 else None
+
+
+def _replace_compose_published_port(value, published: int):
+    if isinstance(value, dict):
+        return {**value, "published": published}
+    raw = str(value)
+    base, separator, protocol = raw.partition("/")
+    parts = base.rsplit(":", 2)
+    if len(parts) < 2:
+        return value
+    parts[-2] = str(published)
+    replaced = ":".join(parts)
+    return replaced + (separator + protocol if separator else "")
+
+
+def _reserve_reactivation_port(db, deployment: Deployment, node: Node, service: str, port: int) -> None:
+    reservation = db.scalar(select(DeploymentPortReservation).where(
+        DeploymentPortReservation.node_id == node.id,
+        DeploymentPortReservation.host_port == port,
+    ))
+    if reservation:
+        if reservation.status in {"reserved", "active"} and reservation.deployment_id != deployment.id:
+            raise RuntimeError(f"端口 {port} 已被其他发布任务占用")
+        reservation.deployment_id = deployment.id
+        reservation.service_name = service
+        reservation.status = "reserved"
+        reservation.created_at = datetime.now(timezone.utc)
+    else:
+        db.add(DeploymentPortReservation(
+            deployment_id=deployment.id,
+            node_id=node.id,
+            service_name=service,
+            host_port=port,
+            status="reserved",
+        ))
+
+
+def prepare_stopped_release_ports(
+    deployment: Deployment, project: Project, node: Node, actual_dir: str, db,
+) -> str:
+    """Reallocate historical host ports before a stopped release is started.
+
+    Stopped releases do not own their former ports. Another project may have
+    reused them, so both ordinary reactivation and rollback must reconcile the
+    saved runtime mapping with current database reservations and real listeners.
+    """
+    if db is None:
+        return ""
+    old_entry_port = int(deployment.host_port or 0)
+    changes: list[tuple[str, int, int]] = []
+    reserved: set[int] = set()
+    try:
+        if deployment.image_name:
+            allocated = choose_node_port(
+                db, node, old_entry_port or None,
+                reserved=reserved, exclude_deployment_id=deployment.id,
+            )
+            reserved.add(allocated)
+            _reserve_reactivation_port(db, deployment, node, "app", allocated)
+            if allocated != old_entry_port:
+                changes.append(("app", old_entry_port, allocated))
+            deployment.host_port = allocated
+        else:
+            app_file = ".yunzhou.app.yml"
+            remote_path = actual_dir.rstrip("/") + "/" + app_file
+            with SSHNode(node) as ssh:
+                if ssh.run(f"test -f {shlex.quote(remote_path)}", timeout=20)[0] != 0:
+                    # Legacy releases cannot be safely rewritten because their
+                    # source Compose file may still mix application and data.
+                    return ""
+                sftp = ssh.client.open_sftp()
+                try:
+                    with sftp.open(remote_path) as handle:
+                        original = handle.read().decode("utf-8", "replace")
+                    document = yaml.safe_load(original) or {}
+                    services = document.get("services") if isinstance(document, dict) else None
+                    if not isinstance(services, dict):
+                        raise RuntimeError("历史版本应用配置无效，无法重新分配端口")
+                    # Older managed releases interpolate published ports from
+                    # the release-local .env (for example
+                    # ${YUNZHOU_HOST_PORT}:80). Resolve those values before
+                    # deciding whether the historical port is still free. The
+                    # rewritten application file uses the newly allocated
+                    # number directly, so a stale .env value cannot reclaim it.
+                    compose_environment: dict[str, str] = {}
+                    for env_name in (".env.runtime", ".env"):
+                        try:
+                            with sftp.open(actual_dir.rstrip("/") + "/" + env_name) as handle:
+                                env_text = handle.read().decode("utf-8", "replace")
+                        except OSError:
+                            continue
+                        for line in env_text.splitlines():
+                            stripped = line.strip()
+                            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                                continue
+                            key, env_value = stripped.split("=", 1)
+                            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key.strip()):
+                                compose_environment[key.strip()] = env_value.strip().strip('"').strip("'")
+                    remapped_entry = None
+                    for service_name, service in services.items():
+                        if not isinstance(service, dict):
+                            continue
+                        mappings = list(service.get("ports") or [])
+                        updated = []
+                        for mapping in mappings:
+                            old_port = _compose_published_port(mapping, compose_environment)
+                            if not old_port:
+                                updated.append(mapping)
+                                continue
+                            allocated = choose_node_port(
+                                db, node, old_port,
+                                reserved=reserved, exclude_deployment_id=deployment.id,
+                            )
+                            reserved.add(allocated)
+                            _reserve_reactivation_port(db, deployment, node, str(service_name), allocated)
+                            updated.append(_replace_compose_published_port(mapping, allocated))
+                            if allocated != old_port:
+                                changes.append((str(service_name), old_port, allocated))
+                            if old_port == old_entry_port:
+                                remapped_entry = allocated
+                        if mappings:
+                            service["ports"] = updated
+                    if old_entry_port and remapped_entry is None:
+                        raise RuntimeError("历史版本入口端口不在应用配置中，无法安全回滚")
+                    if remapped_entry:
+                        deployment.host_port = remapped_entry
+                    if changes:
+                        temporary = remote_path + ".port-remap"
+                        with sftp.open(temporary, "w") as handle:
+                            handle.write(yaml.safe_dump(document, allow_unicode=True, sort_keys=False))
+                        code, output = ssh.run(
+                            f"mv -f -- {shlex.quote(temporary)} {shlex.quote(remote_path)}",
+                            timeout=20,
+                        )
+                        if code:
+                            raise RuntimeError("写入历史版本端口映射失败：" + output[-300:])
+                finally:
+                    sftp.close()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if not changes:
+        return "历史端口仍可用，已重新登记"
+    detail = "、".join(f"{service} {old or '未分配'}→{new}" for service, old, new in changes)
+    return "历史端口已自动重新分配：" + detail
 
 
 def _compose_service_container_port(root: Path, service: dict) -> int | None:
@@ -3630,13 +5069,21 @@ def _compose_route_groups(project: Project, service_targets: dict[str, list[tupl
 def prepare_compose_image_override(
     work: str, build_file: str, project: Project, release: str, platform: str, node: Node,
     db=None, primary_host_port: int | None = None, deployment_plan: dict | None = None,
+    deployment_id: str | None = None,
 ) -> tuple[str | None, list[str]]:
+    # Runtime names belong to the platform namespace, not to a local variable
+    # created later by execute().  Resolve it inside this helper because the
+    # helper is also used during Compose preparation before execute() assigns
+    # its release/runtime variables.
+    runtime_policy = db.get(DeploymentSettings, "default") if db is not None else None
+    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
     path = Path(work) / build_file
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore")) or {}
     except Exception as exc:
         raise RuntimeError(f"Compose 文件无法解析：{exc}")
     services = {}
+    volumes = {}
     images = []
     build_groups: dict[str, str] = {}
     compose_changed = False
@@ -3665,6 +5112,21 @@ def prepare_compose_image_override(
         and (root / "WMSCloud/pom.xml").is_file()
         and (root / "WMSCloud_ui/containers/nginx.conf").is_file()
     )
+    domain_config = db.get(ProjectDomainConfig, project.id) if db is not None else None
+    gateway_has_https = bool(domain_config and domain_config.https_enabled)
+    django_ssl_redirect_default = False
+    if not gateway_has_https:
+        for settings_file in root.rglob("*.py"):
+            if any(part in {".git", ".venv", "venv", "node_modules"} for part in settings_file.relative_to(root).parts):
+                continue
+            settings_text = settings_file.read_text(encoding="utf-8", errors="ignore")[:300_000]
+            if re.search(
+                r"SECURE_SSL_REDIRECT\s*=\s*os\.environ\.get\([^)]*[\"'](?:true|1|yes)[\"']",
+                settings_text,
+                re.I,
+            ):
+                django_ssl_redirect_default = True
+                break
     if mounted_wms_build:
         java_log_dirs = detect_java_log_directories(root / "WMSCloud")
         java_log_setup = ""
@@ -3672,10 +5134,12 @@ def prepare_compose_image_override(
             quoted_dirs = " ".join(shlex.quote(value) for value in java_log_dirs)
             java_log_setup = f"RUN mkdir -p {quoted_dirs} && chmod 0777 {quoted_dirs}\n"
         (root / "WMSCloud_ui/.yunzhou.runtime.Dockerfile").write_text(
-            "FROM nginx:1.23.3-alpine\n"
-            "COPY containers/nginx.conf /etc/nginx/nginx.conf\n"
-            "COPY dist/ /etc/nginx/html/\n"
-            "EXPOSE 80\n",
+            enforce_nginx_pid_compatibility(
+                f"FROM {PLATFORM_NGINX_IMAGE}\n"
+                "COPY containers/nginx.conf /etc/nginx/nginx.conf\n"
+                "COPY dist/ /etc/nginx/html/\n"
+                "EXPOSE 80\n"
+            ),
             encoding="utf-8",
         )
         (root / "WMSCloud_ui/.dockerignore").write_text(
@@ -3698,18 +5162,37 @@ def prepare_compose_image_override(
     for service_name, service in (document.get("services") or {}).items():
         if not isinstance(service, dict):
             continue
+        # The PID path is owned by the final nginx.conf layer above.  Remove
+        # stale AI-generated command-line directives so nginx never sees two
+        # competing ``pid`` directives.
+        service_command = service.get("command")
+        if isinstance(service_command, str):
+            service["command"] = re.sub(
+                r"(?i)pid\s+[^;]+;\s*", "", service_command
+            )
+        elif isinstance(service_command, list):
+            service["command"] = [
+                re.sub(r"(?i)pid\s+[^;]+;\s*", "", str(value))
+                for value in service_command
+            ]
         # Runtime time is a platform invariant. Apply it to application and
         # dependency containers alike, while Compose's map merge keeps an
         # explicit project-level TZ value authoritative. Mounting the host's
         # zone file also fixes minimal images (for example nginx/alpine) that
         # do not ship the IANA tzdata database.
+        managed_environment = {"TZ": "Asia/Shanghai"}
+        if django_ssl_redirect_default and (service_name in routed_services or service.get("build")):
+            # The application must not redirect an HTTP-only platform route to
+            # an unconfigured port 443. Once HTTPS is enabled for the project,
+            # the gateway supplies X-Forwarded-Proto and this override is not
+            # needed.
+            managed_environment["SECURE_SSL_REDIRECT"] = "False"
         services[service_name] = {
-            "environment": {"TZ": "Asia/Shanghai"},
+            "environment": managed_environment,
             "volumes": ["/etc/localtime:/etc/localtime:ro"],
-            # Compose owns the primary instance for every service. Keep its
-            # name stable across releases; manually scaled instances continue
-            # with -2, -3, ... and can therefore be reconciled predictably.
-            "container_name": _service_container_name(project.slug, service_name, 1),
+            # Include the release in the physical name so a candidate version
+            # can run beside the online version until gateway verification.
+            "container_name": _service_container_name(project.slug, service_name, 1, release, runtime_namespace),
         }
         # The platform gateway runs outside the Compose network. Every routed
         # or independently scalable application therefore needs one host-side
@@ -3722,9 +5205,37 @@ def prepare_compose_image_override(
                 raise RuntimeError(f"无法确认入口服务 {service_name} 的容器端口；请在 Compose 中声明 expose 或在镜像 Dockerfile 中声明 EXPOSE")
             if db is None:
                 raise RuntimeError(f"入口服务 {service_name} 缺少宿主端口，平台无法在无数据库上下文时安全分配")
-            published = choose_node_port(db, node, None, reserved=reserved_ports)
+            published = choose_node_port(
+                db, node, None, reserved=reserved_ports,
+                exclude_deployment_id=deployment_id,
+            )
             reserved_ports.add(published)
             services[service_name]["ports"] = [f"{published}:{container_target}"]
+            if deployment_id:
+                # Persist every Compose side-service port before the lengthy
+                # image build. Concurrent projects can then never reserve the
+                # same port while neither container is listening yet.
+                reservation = db.scalar(select(DeploymentPortReservation).where(
+                    DeploymentPortReservation.node_id == node.id,
+                    DeploymentPortReservation.host_port == published,
+                ))
+                if reservation:
+                    # The table keeps one durable slot per node/port. Released
+                    # slots are reassigned instead of inserting a second row
+                    # that violates the unique node+port constraint.
+                    reservation.deployment_id = deployment_id
+                    reservation.service_name = str(service_name)
+                    reservation.status = "reserved"
+                    reservation.created_at = datetime.now(timezone.utc)
+                else:
+                    db.add(DeploymentPortReservation(
+                        deployment_id=deployment_id,
+                        node_id=node.id,
+                        service_name=str(service_name),
+                        host_port=published,
+                        status="reserved",
+                    ))
+                db.commit()
         if not service.get("build"):
             continue
         original_build = service.get("build")
@@ -3785,13 +5296,47 @@ def prepare_compose_image_override(
         return None, []
     if compose_changed:
         path.write_text(yaml.safe_dump(document, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    # A release-specific Compose project must not create new empty database,
+    # Redis or upload volumes. Repository-declared named volumes therefore get
+    # stable project-level Docker names. Explicit external volumes retain the
+    # source-provided name because the platform does not own them.
+    for volume_name, volume_config in (document.get("volumes") or {}).items():
+        config = volume_config if isinstance(volume_config, dict) else {}
+        if config.get("external"):
+            if config.get("name"):
+                volumes[volume_name] = {"external": True, "name": config["name"]}
+            continue
+        safe_volume = re.sub(r"[^a-z0-9_.-]", "-", str(volume_name).lower()).strip("-.") or "data"
+        safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
+        volumes[volume_name] = {
+            "external": True,
+            "name": f"{safe_namespace}-{project.slug}-{safe_volume.replace('_', '-')}",
+        }
     override_name = ".yunzhou.images.yml"
-    (Path(work) / override_name).write_text(yaml.safe_dump({"services": services}, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    override_document = {"services": services}
+    if volumes:
+        override_document["volumes"] = volumes
+    (Path(work) / override_name).write_text(
+        yaml.safe_dump(override_document, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
     return override_name, images
 
 
 def remote_compose_files(ssh: SSHNode, directory: str) -> list[str]:
-    """Return the main Compose file plus Yunzhou's generated image override."""
+    """Return the release-owned application Compose files.
+
+    Newer releases split MySQL/Redis into a stable project data stack.  Start,
+    stop and rollback must therefore operate on ``.yunzhou.app.yml`` only;
+    falling back to the source Compose file would silently restart or stop the
+    persistent data services together with an application version.
+    """
+    app_file = ".yunzhou.app.yml"
+    if ssh.run(f"test -f {shlex.quote(directory + '/' + app_file)}")[0] == 0:
+        files = [app_file]
+        for override in (".yunzhou.app-images.yml", ".yunzhou.external-access.yml"):
+            if ssh.run(f"test -f {shlex.quote(directory + '/' + override)}")[0] == 0:
+                files.append(override)
+        return files
     # ``.yunzhou.compose.yml`` and ``.yunzhou.ai.compose.yml`` are valid main
     # files generated by the platform. Only ``.yunzhou.images.yml`` is an
     # override and it is intentionally not part of COMPOSE_NAMES.
@@ -3807,11 +5352,221 @@ def remote_compose_files(ssh: SSHNode, directory: str) -> list[str]:
     return files
 
 
+def split_compose_runtime(
+    work: str, compose_file: str, project: Project, runtime_namespace: str,
+    compose_override: str | None = None,
+) -> dict | None:
+    """Split stateful dependencies from release-scoped application services.
+
+    Users keep one source Compose file.  The platform materializes a stable
+    project data stack and a release-specific application stack at runtime so
+    MySQL/Redis are not recreated for every application version.
+    """
+    source = Path(work) / compose_file
+    document = yaml.safe_load(source.read_text(encoding="utf-8", errors="ignore")) or {}
+    services = document.get("services") if isinstance(document, dict) else None
+    if not isinstance(services, dict) or not services:
+        return None
+
+    image_prefixes = ("mysql", "mariadb", "postgres", "postgresql", "redis", "mongo", "mongodb", "minio")
+    stateful_names = {"mysql", "mariadb", "postgres", "postgresql", "redis", "mongo", "mongodb", "minio", "db", "database", "cache"}
+    data_targets = (
+        "/var/lib/mysql", "/var/lib/postgresql", "/var/lib/mongodb",
+        "/data", "/bitnami", "/var/lib/redis",
+    )
+
+    def is_stateful(name: str, service: dict) -> bool:
+        image = str(service.get("image") or "").lower().split("/")[-1]
+        if any(image == prefix or image.startswith(prefix + ":") for prefix in image_prefixes):
+            return True
+        if str(name).lower() in stateful_names and not service.get("build"):
+            return True
+        for mount in service.get("volumes") or []:
+            target = mount.get("target") if isinstance(mount, dict) else (str(mount).split(":")[1] if ":" in str(mount) else "")
+            if any(str(target).rstrip("/") == value for value in data_targets):
+                return True
+        return False
+
+    data_names = {name for name, service in services.items() if isinstance(service, dict) and is_stateful(name, service)}
+    app_names = set(services) - data_names
+    if not data_names or not app_names:
+        return None
+
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
+    data_project = f"{safe_namespace}-{project.slug}-data"
+    data_network_name = data_project
+    network_key = "yunzhou_project_data"
+    app_egress_key = "yunzhou_project_app"
+    source_volumes = document.get("volumes") if isinstance(document.get("volumes"), dict) else {}
+    used_data_volumes: set[str] = set()
+    data_services: dict = {}
+    requested_data_aliases: dict[str, set[str]] = {"redis": set(), "mysql": set(), "postgres": set()}
+    for app_name in app_names:
+        app_service = services.get(app_name) if isinstance(services.get(app_name), dict) else {}
+        environment = app_service.get("environment") or {}
+        if isinstance(environment, list):
+            environment = dict(str(item).split("=", 1) for item in environment if "=" in str(item))
+        if not isinstance(environment, dict):
+            continue
+        for env_key, env_value in environment.items():
+            upper_key = str(env_key).upper()
+            family = "redis" if "REDIS" in upper_key else ("postgres" if "POSTGRES" in upper_key else ("mysql" if "MYSQL" in upper_key else ""))
+            if not family or not any(token in upper_key for token in ("HOST", "ADDR", "ADDRESS")):
+                continue
+            host = str(env_value or "").strip()
+            fallback = re.fullmatch(r"\$\{[^}:]+:-([^}]+)\}", host)
+            if fallback:
+                host = fallback.group(1).strip()
+            if re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?", host) and host.lower() not in {"localhost", "127.0.0.1"}:
+                requested_data_aliases[family].add(host)
+    for name in data_names:
+        service = copy.deepcopy(services[name])
+        service.pop("ports", None)
+        image_name = str(service.get("image") or "").lower().split("/")[-1]
+        family = "redis" if image_name.startswith("redis:") or str(name).lower() in {"redis", "cache"} else ("postgres" if image_name.startswith(("postgres:", "postgresql:")) or str(name).lower() in {"postgres", "postgresql"} else ("mysql" if image_name.startswith(("mysql:", "mariadb:")) or str(name).lower() in {"mysql", "mariadb", "db", "database"} else ""))
+        aliases = [name] + sorted(requested_data_aliases.get(family) or set())
+        service["networks"] = {network_key: {"aliases": list(dict.fromkeys(aliases))}}
+        for mount in service.get("volumes") or []:
+            volume_name = mount.get("source") if isinstance(mount, dict) else str(mount).split(":", 1)[0]
+            if volume_name and not str(volume_name).startswith(('.', '/')):
+                used_data_volumes.add(str(volume_name))
+        depends = service.get("depends_on")
+        if isinstance(depends, dict):
+            service["depends_on"] = {key: value for key, value in depends.items() if key in data_names}
+        elif isinstance(depends, list):
+            service["depends_on"] = [key for key in depends if key in data_names]
+        data_services[name] = service
+
+    data_volumes = {}
+    for volume_name in used_data_volumes:
+        config = copy.deepcopy(source_volumes.get(volume_name) or {})
+        if not config.get("external"):
+            safe_volume = re.sub(r"[^a-z0-9_.-]", "-", volume_name.lower()).strip("-.") or "data"
+            config["name"] = f"{safe_namespace}-{project.slug}-{safe_volume.replace('_', '-')}"
+        data_volumes[volume_name] = config
+
+    app_services: dict = {}
+    for name in app_names:
+        service = copy.deepcopy(services[name])
+        depends = service.get("depends_on")
+        if isinstance(depends, dict):
+            service["depends_on"] = {key: value for key, value in depends.items() if key not in data_names}
+        elif isinstance(depends, list):
+            service["depends_on"] = [key for key in depends if key not in data_names]
+        networks = service.get("networks") or {}
+        if isinstance(networks, list):
+            networks = {key: None for key in networks}
+        elif not isinstance(networks, dict):
+            networks = {}
+        networks[network_key] = None
+        # Keep stateful services isolated while giving application containers a
+        # normal release-scoped route for explicitly configured external APIs
+        # and databases.
+        networks[app_egress_key] = None
+        service["networks"] = networks
+        app_services[name] = service
+
+    common = {key: copy.deepcopy(document[key]) for key in ("configs", "secrets") if key in document}
+    data_document = {
+        **common,
+        "services": data_services,
+        "volumes": data_volumes,
+        # Do not mark the shared data network as ``internal``. Application
+        # containers also join this network and Docker may select it as their
+        # default route. An internal network then silently removes the default
+        # gateway, so a host-side database probe succeeds while the actual
+        # application container cannot reach an external MySQL/PostgreSQL.
+        # Data services remain private because no host ports are published.
+        "networks": {network_key: {"name": data_network_name}},
+    }
+    app_networks = copy.deepcopy(document.get("networks") or {})
+    app_networks[network_key] = {"external": True, "name": data_network_name}
+    app_networks[app_egress_key] = {}
+    app_document = {
+        **common,
+        "services": app_services,
+        "networks": app_networks,
+    }
+    # Keep application-owned volumes (uploads, generated files, etc.) while
+    # excluding database volumes, which belong solely to the data stack.
+    app_volume_names = set()
+    for service in app_services.values():
+        for mount in service.get("volumes") or []:
+            volume_name = mount.get("source") if isinstance(mount, dict) else str(mount).split(":", 1)[0]
+            if volume_name in source_volumes and volume_name not in used_data_volumes:
+                app_volume_names.add(volume_name)
+    if app_volume_names:
+        app_document["volumes"] = {name: copy.deepcopy(source_volumes[name]) for name in app_volume_names}
+
+    # The general runtime override contains an entry for every original
+    # service (timezone, container name, image, ports). Merging it with the
+    # app-only file would recreate empty MySQL/Redis service stubs. Materialize
+    # an app-only override so the two stacks stay genuinely isolated.
+    app_override_file = None
+    if compose_override:
+        override_path = Path(work) / compose_override
+        override_document = yaml.safe_load(override_path.read_text(encoding="utf-8", errors="ignore")) or {}
+        override_services = override_document.get("services") if isinstance(override_document, dict) else {}
+        filtered_services = {
+            name: copy.deepcopy(config)
+            for name, config in (override_services or {}).items()
+            if name in app_names
+        }
+        # Runtime Compose is image-only. The build server already produced
+        # immutable release images; never upload a `build:` instruction to a
+        # target node where it could accidentally compile source again.
+        for name, config in filtered_services.items():
+            if isinstance(config, dict):
+                image = str(config.get("image") or "").strip()
+                config.pop("build", None)
+                if image and name in app_services:
+                    app_services[name]["image"] = image
+                    app_services[name].pop("build", None)
+        filtered_override = {"services": filtered_services}
+        override_volumes = override_document.get("volumes") if isinstance(override_document, dict) else {}
+        filtered_volumes = {
+            name: copy.deepcopy(config)
+            for name, config in (override_volumes or {}).items()
+            if name in app_volume_names
+        }
+        if filtered_volumes:
+            filtered_override["volumes"] = filtered_volumes
+        remaining_builds = [name for name, config in app_services.items() if isinstance(config, dict) and config.get("build")]
+        if remaining_builds:
+            raise RuntimeError(
+                "平台未能为以下服务生成固定运行镜像：" + "、".join(remaining_builds)
+            )
+        app_override_file = ".yunzhou.app-images.yml"
+        (Path(work) / app_override_file).write_text(
+            yaml.safe_dump(filtered_override, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+
+    data_file = ".yunzhou.data.yml"
+    app_file = ".yunzhou.app.yml"
+    (Path(work) / data_file).write_text(yaml.safe_dump(data_document, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    (Path(work) / app_file).write_text(yaml.safe_dump(app_document, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return {
+        "data_file": data_file,
+        "app_file": app_file,
+        "app_override_file": app_override_file,
+        "data_project": data_project,
+        "data_network": data_network_name,
+        "data_services": sorted(data_names),
+        "app_services": sorted(app_names),
+        "data_volumes": sorted(data_volumes),
+        "volume_names": sorted(str(config.get("name")) for config in data_volumes.values() if config.get("name")),
+    }
+
+
 def compose_file_args(files: list[str]) -> str:
     return " ".join(f"-f {shlex.quote(name)}" for name in files)
 
 
-def prepare_runtime_bundle(work: str, build_type: str, build_file: str, compose_override: str | None) -> str:
+def prepare_runtime_bundle(
+    work: str, build_type: str, build_file: str, compose_override: str | None,
+    extra_files: list[str] | None = None,
+) -> str:
     bundle = Path(tempfile.mkdtemp(prefix="yunzhou-runtime-"))
     if build_type != "compose":
         return str(bundle)
@@ -3840,6 +5595,8 @@ def prepare_runtime_bundle(work: str, build_type: str, build_file: str, compose_
     copy_runtime_path(build_file, root)
     if compose_override:
         copy_runtime_path(compose_override, root)
+    for extra_file in extra_files or []:
+        copy_runtime_path(extra_file, root)
     document = yaml.safe_load(compose_path.read_text(encoding="utf-8", errors="ignore")) or {}
     for service in (document.get("services") or {}).values():
         if not isinstance(service, dict):
@@ -3858,6 +5615,101 @@ def prepare_runtime_bundle(work: str, build_type: str, build_file: str, compose_
             if isinstance(config, dict) and config.get("file"):
                 copy_runtime_path(str(config["file"]))
     return str(bundle)
+
+
+def validate_runtime_only_dockerfiles(work: str, build_file: str, compose_override: str | None = None) -> None:
+    """Ensure image packaging cannot compile source a second time.
+
+    Repository Dockerfiles are evidence only.  By this point every effective
+    Compose build must point at a platform-generated, runtime-only Dockerfile.
+    """
+    root = Path(work)
+    services: dict[str, dict] = {}
+    for compose_name in (build_file, compose_override):
+        if not compose_name:
+            continue
+        compose_path = root / compose_name
+        if not compose_path.is_file():
+            continue
+        try:
+            document = yaml.safe_load(compose_path.read_text(encoding="utf-8", errors="ignore")) or {}
+        except Exception:
+            continue
+        for name, service in (document.get("services") or {}).items():
+            if isinstance(service, dict) and service.get("build"):
+                services[str(name)] = service
+
+    compile_pattern = re.compile(
+        r"(?im)^\s*RUN\s+.*(?:"
+        r"\bmvn\b.*\b(?:package|install)\b|\bgradle\w*\b.*\b(?:build|bootJar)\b|"
+        r"\b(?:npm|pnpm|yarn)\b.*\b(?:run\s+)?build\b|\bgo\s+build\b|\bdotnet\s+publish\b"
+        r")"
+    )
+    problems: list[str] = []
+    for service_name, service in services.items():
+        build = service.get("build")
+        build = {"context": build} if isinstance(build, str) else dict(build or {})
+        context = (root / str(build.get("context") or ".")).resolve()
+        dockerfile = context / str(build.get("dockerfile") or "Dockerfile")
+        if not dockerfile.is_file():
+            problems.append(f"{service_name}：找不到 {dockerfile.name}")
+            continue
+        content = dockerfile.read_text(encoding="utf-8", errors="ignore")
+        if compile_pattern.search(content):
+            problems.append(f"{service_name}：{dockerfile.name} 仍包含源码编译命令")
+    if problems:
+        raise RuntimeError(
+            "平台生成的运行镜像配置校验失败；镜像封装不得重复构建源码：" + "；".join(problems)
+        )
+
+
+def snapshot_deployment_files(deployment_id: str, work: str, build_file: str) -> None:
+    """Persist a small, redacted copy of the files that define one release."""
+    root = Path(work)
+    destination = Path(settings.upload_root) / "deployment-files" / deployment_id
+    shutil.rmtree(destination, ignore_errors=True)
+    destination.mkdir(parents=True, exist_ok=True)
+    candidates = []
+    for path in root.rglob("*"):
+        if not path.is_file() or ".git" in path.parts or "node_modules" in path.parts:
+            continue
+        relative = path.relative_to(root)
+        name = path.name
+        if not (
+            name.startswith("Dockerfile") or name.endswith(".Dockerfile")
+            or name in {"compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml", ".env", "nginx.conf", "default.conf"}
+            or (name.startswith(".yunzhou") and path.suffix in {".yml", ".yaml"})
+        ):
+            continue
+        try:
+            if path.stat().st_size > 300_000:
+                continue
+        except OSError:
+            continue
+        candidates.append((relative, path))
+        if len(candidates) >= 40:
+            break
+    secret_pattern = re.compile(r"(password|secret|token|credential|private[_-]?key)", re.I)
+    manifest = []
+    for relative, source in candidates:
+        raw = source.read_bytes()
+        text_value = raw.decode("utf-8", "replace")
+        safe_lines = []
+        for line in text_value.splitlines():
+            env_match = re.match(r"^(\s*(?:[-]\s*)?(?:ENV\s+|ARG\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)(.*)$", line, re.I)
+            if env_match and secret_pattern.search(env_match.group(2)):
+                safe_lines.append(env_match.group(1) + "******")
+            else:
+                safe_lines.append(line)
+        output = destination / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("\n".join(safe_lines), encoding="utf-8")
+        manifest.append({
+            "path": relative.as_posix(),
+            "used": relative.as_posix() == build_file,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+    (destination / "manifest.json").write_text(json.dumps({"build_file": build_file, "files": manifest}, ensure_ascii=False), encoding="utf-8")
 
 
 def central_build_and_distribute(
@@ -3887,6 +5739,7 @@ def central_build_and_distribute(
     # provide safe ephemeral placeholders for every required variable instead
     # of maintaining a fragile hard-coded list (Redis, OIDC, SMTP, etc.).
     required_build_vars: set[str] = set()
+    referenced_build_vars: set[str] = set()
     if build_type == "compose":
         for filename in (build_file, compose_override):
             if not filename:
@@ -3896,15 +5749,109 @@ def central_build_and_distribute(
                 continue
             text = candidate.read_text(encoding="utf-8", errors="ignore")
             required_build_vars.update(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?\?)", text))
+            referenced_build_vars.update(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", text))
+    # Populate generic substitutions first, then override typed platform
+    # values.  Otherwise a referenced YUNZHOU_HOST_PORT is overwritten with
+    # the string ``build-placeholder`` and Compose rejects it as hostPort.
     build_env = {
+        **{key: "build-placeholder" for key in referenced_build_vars | required_build_vars},
         "YUNZHOU_HOST_PORT": "1",
         "CRM_DB_PASSWORD": "build-placeholder",
         "CRM_DB_ROOT_PASSWORD": "build-placeholder",
         "CRM_JWT_SECRET": "build-placeholder",
-        **{key: "build-placeholder" for key in required_build_vars},
     }
+    build_env.update({
+        "YUNZHOU_MYSQL_HOST": "127.0.0.1",
+        "YUNZHOU_MYSQL_PORT": "3306",
+        "YUNZHOU_MYSQL_DATABASE": "build",
+        "YUNZHOU_MYSQL_USERNAME": "build",
+        "YUNZHOU_MYSQL_PASSWORD": "build-placeholder",
+        "YUNZHOU_REDIS_HOST": "127.0.0.1",
+        "YUNZHOU_REDIS_PORT": "6379",
+        "YUNZHOU_REDIS_DATABASE": "0",
+        "YUNZHOU_REDIS_PASSWORD": "build-placeholder",
+    })
+    # Application proxy settings must also reach the short-lived toolchain
+    # containers.  Merely setting the worker process environment does not make
+    # `yarn install`, npm, Maven or pip inside `docker run` use that proxy.
+    proxy_config = get_proxy_config(db)
+    build_proxy_env: dict[str, str] = {}
+    if proxy_config and proxy_config.enabled:
+        proxy_password = decrypt(proxy_config.proxy_password_encrypted) if proxy_config.proxy_password_encrypted else ""
+        http_proxy = proxy_with_auth(
+            proxy_config.http_proxy or proxy_config.https_proxy,
+            proxy_config.proxy_username or "",
+            proxy_password or "",
+        )
+        https_proxy = proxy_with_auth(
+            proxy_config.https_proxy or proxy_config.http_proxy,
+            proxy_config.proxy_username or "",
+            proxy_password or "",
+        )
+        no_proxy = (proxy_config.no_proxy or "").strip()
+        build_proxy_env = {
+            "HTTP_PROXY": http_proxy,
+            "HTTPS_PROXY": https_proxy,
+            "NO_PROXY": no_proxy,
+            "http_proxy": http_proxy,
+            "https_proxy": https_proxy,
+            "no_proxy": no_proxy,
+        }
+        build_proxy_env = {key: value for key, value in build_proxy_env.items() if value}
+        build_env.update(build_proxy_env)
+        log(deployment.id, "[网络] 应用代理已启用，源码与构建依赖下载统一通过代理；内网地址继续直连。\n")
+    else:
+        log(deployment.id, "[网络] 应用代理未启用，源码与构建依赖下载使用直连。\n")
+    proxy_run_args = " ".join(
+        f"-e {key}={shlex.quote(value)}" for key, value in sorted(build_proxy_env.items())
+    )
+    proxy_build_args = " ".join(
+        f"--build-arg {key}={shlex.quote(value)}" for key, value in sorted(build_proxy_env.items())
+    )
+    proxy_compose_override: str | None = None
+    if build_type == "compose" and build_proxy_env:
+        # Compose has no command-line equivalent of `docker build --build-arg`
+        # that applies to every service.  Add a disposable override containing
+        # environment references (never credentials) so every service build
+        # receives the same global proxy policy.
+        build_services: set[str] = set()
+        for filename in (build_file, compose_override):
+            if not filename:
+                continue
+            candidate = Path(work) / filename
+            if not candidate.is_file():
+                continue
+            try:
+                document = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            for service_name, service in (document.get("services") or {}).items():
+                if isinstance(service, dict) and service.get("build"):
+                    build_services.add(str(service_name))
+        if build_services:
+            proxy_compose_override = ".yunzhou.proxy-build.yml"
+            proxy_refs = {key: f"${{{key}:-}}" for key in sorted(build_proxy_env)}
+            proxy_document = {
+                "services": {
+                    service_name: {"build": {"args": proxy_refs}}
+                    for service_name in sorted(build_services)
+                }
+            }
+            (Path(work) / proxy_compose_override).write_text(
+                yaml.safe_dump(proxy_document, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
     build_env_prefix = " ".join(
         f"{key}={shlex.quote(value)}" for key, value in sorted(build_env.items())
+    )
+    # Compose expands the complete document even when only one image service
+    # is being packaged. Give it a non-secret build-only env file so optional
+    # runtime variables do not become empty strings or flood the UI with false
+    # warnings. Real runtime values are injected later on the target node.
+    build_env_file = Path(work) / ".yunzhou.build.env"
+    build_env_file.write_text(
+        "\n".join(f"{key}={str(value).replace(chr(10), '')}" for key, value in sorted(build_env.items())) + "\n",
+        encoding="utf-8",
     )
     with SSHNode(builder) as build_ssh:
         build_ssh.run(f"mkdir -p {shlex.quote(builder_dir)}")
@@ -3918,7 +5865,7 @@ def central_build_and_distribute(
         pip_cache_dir = (build_policy.pip_cache_dir if build_policy else "") or "/root/.cache/pip"
         cache_dirs = " ".join(
             shlex.quote(f"{cache_root}/{name}")
-            for name in ("maven", "gradle", "pnpm", "npm", "yarn", "pip")
+            for name in ("maven", "gradle", "pnpm", "npm", "yarn", "pip", "nuget", "go-mod", "go-build")
         )
         code, output = build_ssh.run(f"mkdir -p {cache_dirs}")
         if code:
@@ -3926,7 +5873,7 @@ def central_build_and_distribute(
         log(
             deployment.id,
             "[构建策略] 使用经典 Docker 构建（BuildKit/Buildx 已关闭）；"
-            f"公共依赖缓存位于 {cache_root}/{{maven,gradle,npm,pnpm,yarn,pip}}。\n",
+            f"公共依赖缓存位于 {cache_root}/{{maven,gradle,npm,pnpm,yarn,pip,nuget,go-mod,go-build}}。\n",
         )
 
         # Discover dependency manifests recursively instead of assuming that
@@ -3946,7 +5893,7 @@ def central_build_and_distribute(
             existing = ignore_file.read_text(encoding="utf-8", errors="ignore") if ignore_file.is_file() else ""
             required = (
                 ".git", "**/.git", "node_modules", "**/node_modules",
-                ".pnpm-store", "**/.pnpm-store",
+                ".pnpm-store", "**/.pnpm-store", ".agents", "**/.agents",
             )
             lines = existing.splitlines()
             changed = False
@@ -3956,6 +5903,56 @@ def central_build_and_distribute(
                     changed = True
             if changed or not ignore_file.is_file():
                 ignore_file.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+        def ensure_generated_copy_inputs(context: Path, dockerfile: Path) -> list[str]:
+            """Make generated COPY inputs authoritative over repo ignores.
+
+            Source repositories legitimately exclude generated assets such as
+            ``/web/`` from their own production Docker context.  When source
+            analysis creates a new multi-stage Dockerfile that explicitly
+            builds that directory, retaining the old ignore rule makes Docker
+            report the files as missing.  Append narrow negations only for
+            real top-level inputs referenced by the generated file.
+            """
+            if not dockerfile.is_file():
+                return []
+            docker_text = dockerfile.read_text(encoding="utf-8", errors="ignore")
+            collapsed = re.sub(r"\\\s*\r?\n\s*", " ", docker_text)
+            required_roots: set[str] = set()
+            for match in re.finditer(r"(?im)^\s*(?:COPY|ADD)\s+(.+)$", collapsed):
+                instruction = match.group(1).strip()
+                try:
+                    values = json.loads(instruction) if instruction.startswith("[") else shlex.split(instruction)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(values, list):
+                    continue
+                values = [str(value) for value in values]
+                if any(value == "--from" or value.startswith("--from=") for value in values):
+                    continue
+                while values and values[0].startswith("--"):
+                    values.pop(0)
+                for source in values[:-1]:
+                    normalized = source.strip("/.")
+                    if not normalized or any(token in normalized for token in ("$", "*", "?", "[")):
+                        continue
+                    top = normalized.replace("\\", "/").split("/", 1)[0]
+                    if top and (context / top).exists():
+                        required_roots.add(top)
+            if not required_roots:
+                return []
+            ignore_file = context / ".dockerignore"
+            existing = ignore_file.read_text(encoding="utf-8", errors="ignore") if ignore_file.is_file() else ""
+            lines = existing.splitlines()
+            added: list[str] = []
+            for top in sorted(required_roots):
+                for pattern in (f"!{top}/", f"!{top}/**"):
+                    if pattern not in lines:
+                        lines.append(pattern)
+                        added.append(pattern)
+            if added:
+                ignore_file.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+            return added
 
         ensure_context_ignore(source_root)
         node_built_contexts: set[str] = set()
@@ -3969,6 +5966,305 @@ def central_build_and_distribute(
             )
 
         node_manifests = source_manifests("package.json")
+        generated_dockerfiles = [
+            path for path in source_root.rglob(".yunzhou*.Dockerfile") if path.is_file()
+        ]
+        for generated_dockerfile in generated_dockerfiles:
+            context = generated_dockerfile.parent
+            ensure_context_ignore(context)
+            restored_inputs = ensure_generated_copy_inputs(context, generated_dockerfile)
+            if restored_inputs:
+                log(
+                    deployment.id,
+                    "[构建上下文] 生成文件明确引用的源码已从仓库忽略规则中恢复："
+                    + "、".join(restored_inputs) + "。\n",
+                )
+        has_generated_multistage = any(
+            len(re.findall(r"(?im)^\s*FROM\s+", path.read_text(encoding="utf-8", errors="ignore"))) > 1
+            for path in generated_dockerfiles
+        )
+        pom_files = source_manifests("pom.xml")
+        reactor_poms = [
+            pom for pom in pom_files
+            if not any(parent / "pom.xml" in pom_files for parent in pom.parents if parent != pom.parent)
+        ]
+
+        # WMS-style Java + Vue projects already have platform-owned, runtime-
+        # only Dockerfiles at this point.  Package each side as soon as its
+        # artifact is ready instead of waiting for the other compiler.  The
+        # global image-store lock still protects classic Docker commits, while
+        # Maven/Node compilation remains concurrent outside that lock.
+        eager_package_specs: dict[str, dict[str, str]] = {}
+        eager_packaged_services: set[str] = set()
+        eager_package_guard = threading.Lock()
+        # The generated image overlay is not guaranteed to keep the same file
+        # name between analyzers (and legacy plans may place it beside the
+        # primary compose file). Discover every platform-owned compose snapshot
+        # for this release so eager packaging never depends on a project or
+        # service naming convention.
+        eager_compose_files: list[Path] = []
+        for eager_candidate in (
+            Path(work) / str(build_file or ""),
+            Path(work) / str(compose_override or ""),
+            *sorted(Path(work).glob(".yunzhou*.yml")),
+            *sorted(Path(work).glob(".yunzhou*.yaml")),
+        ):
+            if eager_candidate.is_file() and eager_candidate not in eager_compose_files:
+                eager_compose_files.append(eager_candidate)
+        for eager_compose_file in eager_compose_files:
+            try:
+                eager_override = yaml.safe_load(
+                    eager_compose_file.read_text(encoding="utf-8", errors="ignore")
+                ) or {}
+            except Exception:
+                continue
+            for eager_name, eager_service in (eager_override.get("services") or {}).items():
+                if not isinstance(eager_service, dict) or not isinstance(eager_service.get("build"), dict):
+                    continue
+                eager_build = eager_service["build"]
+                eager_context = str(eager_build.get("context") or "")
+                eager_dockerfile = str(eager_build.get("dockerfile") or "")
+                eager_image = str(eager_service.get("image") or "")
+                eager_dockerfile_path = Path(work) / eager_context.removeprefix("./") / eager_dockerfile
+                eager_dockerfile_text = (
+                    eager_dockerfile_path.read_text(encoding="utf-8", errors="ignore")
+                    if eager_dockerfile_path.is_file() else ""
+                )
+                eager_hint = " ".join((
+                    str(eager_name).lower(),
+                    str(eager_build.get("target") or "").lower(),
+                ))
+                eager_role = (
+                    "web" if any(token in eager_hint for token in ("web", "ui", "front", "nginx"))
+                    else "api" if any(token in eager_hint for token in ("api", "back", "server", "java"))
+                    else "web" if re.search(r"(?im)^\s*FROM\s+nginx\b", eager_dockerfile_text)
+                    else "api" if re.search(r"(?im)^\s*FROM\s+.*(?:temurin|openjdk|corretto|java)", eager_dockerfile_text)
+                    else ""
+                )
+                if eager_image and eager_dockerfile and eager_role:
+                    eager_package_specs[str(eager_name)] = {
+                        "context": eager_context,
+                        "dockerfile": eager_dockerfile,
+                        "image": eager_image,
+                        "role": eager_role,
+                    }
+        if eager_package_specs:
+            log(
+                deployment.id,
+                "[即时封装计划] "
+                + "、".join(
+                    f"{name}={spec['role']}" for name, spec in eager_package_specs.items()
+                )
+                + "；各服务产物完成后立即封装，不等待其他服务。\n",
+            )
+        elif node_manifests or reactor_poms:
+            log(
+                deployment.id,
+                "[即时封装计划] 未发现可安全独立封装的运行镜像，保留统一封装流程。\n",
+            )
+
+        def eager_package_ready_service(role: str, ready_root: Path | None = None) -> None:
+            candidates = [
+                (name, spec) for name, spec in eager_package_specs.items()
+                if spec.get("role") == role
+            ]
+            # The authoritative runtime Compose overlay is deliberately
+            # generated after compilation, so a first-time project has no
+            # service specs to discover here yet.  The release image names,
+            # however, are already final.  Derive a minimal per-service spec
+            # from those names and the artifact root; this lets the completed
+            # side start packaging without waiting for its peer or for the
+            # late Compose normalization pass.
+            if not candidates and ready_root is not None:
+                role_tokens = (
+                    ("api", "backend", "server", "app")
+                    if role == "api" else
+                    ("web", "frontend", "ui")
+                )
+                image_prefix = f"yunzhou/{project.slug}-"
+                for release_image in images:
+                    image_repository = str(release_image).split(":", 1)[0]
+                    if not image_repository.startswith(image_prefix):
+                        continue
+                    derived_name = image_repository[len(image_prefix):]
+                    lowered_name = derived_name.lower()
+                    if not any(token in lowered_name for token in role_tokens):
+                        continue
+                    try:
+                        derived_context = ready_root.resolve().relative_to(Path(work).resolve()).as_posix()
+                    except ValueError:
+                        continue
+                    derived_spec = {
+                        "context": derived_context or ".",
+                        "dockerfile": f".yunzhou.{derived_name}.bootstrap.Dockerfile",
+                        "image": str(release_image),
+                        "role": role,
+                    }
+                    eager_package_specs[derived_name] = derived_spec
+                    candidates.append((derived_name, derived_spec))
+                if candidates:
+                    log(
+                        deployment.id,
+                        "[即时封装计划] 已根据实际构建产物补全运行镜像："
+                        + "、".join(name for name, _ in candidates)
+                        + "。\n",
+                    )
+            for service_name, spec in candidates:
+                context_path = (Path(work) / spec["context"].removeprefix("./")).resolve()
+                if ready_root is not None:
+                    resolved_ready = ready_root.resolve()
+                    if context_path != resolved_ready and context_path not in resolved_ready.parents and resolved_ready not in context_path.parents:
+                        continue
+                with eager_package_guard:
+                    if service_name in eager_packaged_services:
+                        continue
+                # Runtime-only Dockerfiles may normally be produced by a
+                # later normalization pass. Materialize the small packaging
+                # file here from the artifact that just completed, so a fast
+                # backend can be packaged while a slower frontend is still
+                # compiling (and vice versa).
+                dockerfile_candidate = context_path / spec["dockerfile"]
+                if not spec["dockerfile"].lower().endswith(".runtime.dockerfile"):
+                    original_text = (
+                        dockerfile_candidate.read_text(encoding="utf-8", errors="ignore")
+                        if dockerfile_candidate.is_file() else ""
+                    )
+                    safe_service = re.sub(r"[^a-z0-9_.-]+", "-", service_name.lower()).strip("-.") or role
+                    runtime_name = f".yunzhou.{safe_service}.runtime.Dockerfile"
+                    runtime_path = context_path / runtime_name
+                    runtime_text = ""
+                    if role == "api" and ready_root is not None:
+                        jars = sorted(
+                            path for path in ready_root.rglob("*.jar")
+                            if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
+                        )
+                        jars = [path for path in jars if path == ready_root or ready_root in path.parents]
+                        jars = [path for path in jars if context_path == path.parent or context_path in path.parents]
+                        if jars:
+                            jar = next(
+                                (path for path in jars if "ruoyi-admin" in path.as_posix().lower()),
+                                max(jars, key=lambda path: (path.stat().st_size, path.as_posix())),
+                            )
+                            java_images = re.findall(
+                                r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]*(?:temurin|openjdk|corretto|java)[^\s]*)",
+                                original_text,
+                            )
+                            java_image = java_images[-1] if java_images else "eclipse-temurin:8-jre"
+                            relative_jar = jar.relative_to(context_path).as_posix()
+                            runtime_text = (
+                                f"FROM {java_image}\nWORKDIR /app\n"
+                                f"COPY {relative_jar} /app/app.jar\n"
+                                "EXPOSE 8080\n"
+                                'ENTRYPOINT ["java", "-jar", "/app/app.jar"]\n'
+                            )
+                    elif role == "web" and ready_root is not None:
+                        static_dirs = []
+                        for directory_name in ("dist", "build", "out"):
+                            static_dirs.extend(
+                                path for path in ready_root.rglob(directory_name)
+                                if path.is_dir() and (path / "index.html").is_file()
+                                and (context_path == path.parent or context_path in path.parents)
+                            )
+                        if static_dirs:
+                            static_dir = min(static_dirs, key=lambda path: len(path.parts))
+                            nginx_images = re.findall(
+                                r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(nginx:[^\s]+)",
+                                original_text,
+                            )
+                            runtime_text = platform_spa_runtime_dockerfile(
+                                nginx_images[-1] if nginx_images else PLATFORM_NGINX_IMAGE,
+                                static_dir.relative_to(context_path).as_posix(),
+                            )
+                    if runtime_text:
+                        runtime_path.write_text(
+                            enforce_nginx_pid_compatibility(runtime_text), encoding="utf-8"
+                        )
+                        ensure_generated_copy_inputs(context_path, runtime_path)
+                        spec["dockerfile"] = runtime_name
+                    else:
+                        # No verified artifact means this service is not safe
+                        # to package early; leave it to the normal build path.
+                        continue
+                relative_context = spec["context"].removeprefix("./")
+                dockerfile_path = f"{relative_context}/{spec['dockerfile']}"
+                package_command = (
+                    f"cd {shlex.quote(builder_dir)} && "
+                    f"DOCKER_BUILDKIT=0 DOCKER_DEFAULT_PLATFORM={shlex.quote(platform)} "
+                    f"docker build {proxy_build_args} -f {shlex.quote(dockerfile_path)} "
+                    f"-t {shlex.quote(spec['image'])} {shlex.quote(relative_context)}"
+                )
+                log(
+                    deployment.id,
+                    f"[即时封装] {service_name} 构建产物已就绪，不等待其他服务，立即生成运行镜像。\n",
+                )
+                image_lock = hashlib.sha256(spec["image"].encode("utf-8")).hexdigest()[:16]
+                locked_command = (
+                    f"flock -w 1200 /tmp/yunzhou-image-{image_lock}.lock sh -lc "
+                    + shlex.quote(package_command)
+                )
+                with SSHNode(builder) as package_ssh:
+                    code, output = tracked_run(
+                        package_ssh, deployment.id, locked_command, stream=stream, timeout=1500,
+                        pid_prefix=f"yunzhou-eager-package-{role}",
+                        stream_channel="package", stream_label="镜像封装",
+                    )
+                if code:
+                    raise RuntimeError(f"{service_name} 即时镜像封装失败：" + output[-2000:])
+                with eager_package_guard:
+                    eager_packaged_services.add(service_name)
+                log(deployment.id, f"[即时封装] {service_name} 运行镜像已完成。\n")
+
+        def build_maven_reactors() -> set[str]:
+            completed: set[str] = set()
+            if not has_generated_multistage:
+                return completed
+            with SSHNode(builder) as maven_ssh:
+                for pom_index, pom in enumerate(reactor_poms, start=1):
+                    relative = pom.relative_to(source_root).as_posix()
+                    maven_image = "maven:3.9-eclipse-temurin-17"
+                    ranked_dockerfiles = sorted(
+                        generated_dockerfiles,
+                        key=lambda candidate: (
+                            0 if candidate.parent == pom.parent else 1,
+                            len(candidate.relative_to(source_root).parts),
+                        ),
+                    )
+                    for candidate in ranked_dockerfiles:
+                        candidate_text = candidate.read_text(encoding="utf-8", errors="ignore")
+                        image_match = re.search(
+                            r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(maven:[^\s]+)",
+                            candidate_text,
+                        )
+                        if image_match:
+                            maven_image = image_match.group(1)
+                            break
+                    command = (
+                        f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                        f"-v {shlex.quote(str(pom.parent))}:/workspace "
+                        f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                        f"-w /workspace {shlex.quote(maven_image)} sh -lc "
+                        + shlex.quote("mvn -B -DskipTests package")
+                    )
+                    log(deployment.id, f"[平台构建] {maven_image}：{relative}，与前端并发构建并写入 {cache_root}/maven。\n")
+                    maven_code, maven_output = tracked_run(
+                        maven_ssh, deployment.id, command, stream=stream, timeout=1800,
+                        pid_prefix=f"yunzhou-maven-build-{pom_index}",
+                        stream_channel="api", stream_label="后端 API",
+                    )
+                    if maven_code:
+                        log(deployment.id, f"[平台构建] Maven 外置编译未完成，保留原始方案继续诊断：{maven_output[-800:]}\n")
+                    else:
+                        completed.add(str(pom.parent.resolve()))
+                        log(deployment.id, f"[平台构建] Maven 已使用公共缓存 {maven_cache_dir} 生成 JAR：{relative}。\n")
+                        eager_package_ready_service("api", pom.parent)
+            return completed
+
+        maven_executor = None
+        maven_future = None
+        if reactor_poms and has_generated_multistage:
+            log(deployment.id, "[并发构建] 前端 Web 与后端 API 已同时开始。\n")
+            maven_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yunzhou-maven")
+            maven_future = maven_executor.submit(build_maven_reactors)
         for package_file in node_manifests:
             package_dir = package_file.parent
             ensure_context_ignore(package_dir)
@@ -4022,7 +6318,7 @@ def central_build_and_distribute(
                 )
             elif (package_dir / "yarn.lock").is_file() or manager_hint.startswith("yarn"):
                 manager = "yarn"
-                install = "yarn install --frozen-lockfile" + ("; yarn build" if build_script else " --ignore-scripts")
+                install = "yarn install --frozen-lockfile --prefer-offline --network-timeout 600000" + ("; yarn build" if build_script else " --ignore-scripts")
             else:
                 manager = "npm"
                 # Keep the checkout's node_modules between releases. npm's
@@ -4037,9 +6333,34 @@ def central_build_and_distribute(
                 re.search(r'"(?:webpack|@vue/cli-service)"\s*:\s*"?[~^]?(?:[0-4])(?:\.|"|$)', package_text)
             )
             node_image = "node:16.20.2" if legacy_webpack else "node:20-alpine"
+            if not legacy_webpack:
+                # Keep the external, cache-warming build on the exact Node
+                # major already selected by source analysis for the generated
+                # Dockerfile.  Using a fixed Node 20 helper made modern pnpm
+                # itself fail on ``node:sqlite`` before the real image build,
+                # so the expensive compile then had to run while holding the
+                # shared Docker image-store lock.
+                selected_node_image = None
+                for candidate in generated_dockerfiles:
+                    dockerfile_text = candidate.read_text(encoding="utf-8", errors="ignore")
+                    image_match = re.search(r"(?im)^\s*FROM\s+(node:[^\s]+)", dockerfile_text)
+                    if image_match:
+                        selected_node_image = image_match.group(1)
+                        break
+                if selected_node_image:
+                    node_image = selected_node_image
+                else:
+                    engine_hint = str((package_meta.get("engines") or {}).get("node") or "")
+                    package_manager_match = re.search(r"\bpnpm@(\d+)", manager_hint)
+                    if re.search(r"(?:>=|\^|~)?\s*2[4-9](?:\D|$)", engine_hint):
+                        node_image = "node:24-alpine"
+                    elif re.search(r"(?:>=|\^|~)?\s*22(?:\D|$)", engine_hint) or (
+                        package_manager_match and int(package_manager_match.group(1)) >= 11
+                    ):
+                        node_image = "node:22-alpine"
             relative = package_dir.relative_to(source_root).as_posix() or "."
             node_modules_mount = ""
-            if manager == "npm":
+            if manager in {"npm", "yarn", "pnpm"}:
                 # Release checkouts under runs/ are disposable. Keep the
                 # unpacked dependency tree in the project's stable workspace
                 # and mount it at npm's normal /workspace/node_modules path.
@@ -4055,7 +6376,7 @@ def central_build_and_distribute(
                         pass
                 node_modules_mount = f"-v {shlex.quote(str(persistent_modules) + ':/workspace/node_modules')} "
             command = (
-                f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                 f"-v {shlex.quote(str(package_dir))}:/workspace "
                 f"-v {shlex.quote(cache_root + '/pnpm' + ':' + pnpm_cache_dir)} "
                 f"-v {shlex.quote(cache_root + '/npm' + ':' + npm_cache_dir)} "
@@ -4067,47 +6388,21 @@ def central_build_and_distribute(
             log(deployment.id, f"[平台构建] {node_image}/{manager}：{relative}，正式构建同时写入公共缓存。\n")
             warm_code, warm_output = tracked_run(
                 build_ssh, deployment.id, command, stream=stream, timeout=1200,
-                pid_prefix="yunzhou-node-cache",
+                pid_prefix="yunzhou-node-cache", stream_channel="web", stream_label="前端 Web",
             )
             if warm_code:
                 log(deployment.id, f"[平台构建] {relative} 本次未生成产物，交由项目方案诊断：{warm_output[-500:]}\n")
             else:
                 node_built_contexts.add(str(package_dir.resolve()))
                 log(deployment.id, f"[平台构建] Node 已使用默认公共缓存生成运行产物：{relative}。\n")
+                eager_package_ready_service("web", package_dir)
             shutil.rmtree(package_dir / ".pnpm-store", ignore_errors=True)
-
-        generated_dockerfiles = [
-            path for path in source_root.rglob(".yunzhou*.Dockerfile") if path.is_file()
-        ]
-        has_generated_multistage = any(
-            len(re.findall(r"(?im)^\s*FROM\s+", path.read_text(encoding="utf-8", errors="ignore"))) > 1
-            for path in generated_dockerfiles
-        )
-        pom_files = source_manifests("pom.xml")
-        # A reactor root resolves its child modules itself; avoid repeating the
-        # same Maven graph for every nested module.
-        reactor_poms = [pom for pom in pom_files if not any(parent / "pom.xml" in pom_files for parent in pom.parents if parent != pom.parent)]
-        for pom in reactor_poms:
-            if not has_generated_multistage:
-                continue
-            relative = pom.relative_to(source_root).as_posix()
-            command = (
-                f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
-                f"-v {shlex.quote(str(pom.parent))}:/workspace "
-                f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
-                "-w /workspace maven:3.9-eclipse-temurin-17 sh -lc "
-                + shlex.quote("mvn -B -DskipTests package")
-            )
-            log(deployment.id, f"[平台构建] Maven：{relative}，正式构建同时写入 {cache_root}/maven。\n")
-            maven_code, maven_output = tracked_run(
-                build_ssh, deployment.id, command, stream=stream, timeout=1800,
-                pid_prefix="yunzhou-maven-build",
-            )
-            if maven_code:
-                log(deployment.id, f"[平台构建] Maven 外置编译未完成，保留原始方案继续诊断：{maven_output[-800:]}\n")
-            else:
-                maven_built_contexts.add(str(pom.parent.resolve()))
-                log(deployment.id, f"[平台构建] Maven 已使用公共缓存 {maven_cache_dir} 生成 JAR：{relative}。\n")
+        if maven_future is not None:
+            try:
+                maven_built_contexts.update(maven_future.result())
+            finally:
+                maven_executor.shutdown(wait=True)
+            log(deployment.id, "[并发构建] 前端 Web 与后端 API 已全部完成，继续处理尚未封装的服务。\n")
 
         gradle_roots = sorted({path.parent for name in ("settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts") for path in source_manifests(name)})
         gradle_roots = [root_path for root_path in gradle_roots if not any(parent in gradle_roots for parent in root_path.parents)]
@@ -4179,7 +6474,7 @@ def central_build_and_distribute(
                 # Never silently downgrade a project toolchain.
                 gradle_helper_image = f"gradle:jdk{requested_jdk}"
                 compile_command = (
-                    f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                    f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                     f"-v {shlex.quote(str(gradle_root))}:/workspace "
                     # Official Gradle images run as the `gradle` user. Mount
                     # the persistent cache at that image's real default home;
@@ -4192,7 +6487,7 @@ def central_build_and_distribute(
                 log(deployment.id, f"[平台构建] Gradle 使用 {gradle_helper_image} 与公共缓存外置编译，镜像阶段仅打包 bootJar。\n")
                 compile_code, compile_output = tracked_run(
                     build_ssh, deployment.id, compile_command, stream=stream, timeout=1800,
-                    pid_prefix="yunzhou-gradle-build",
+                    pid_prefix="yunzhou-gradle-build", stream_channel="api", stream_label="后端 API",
                 )
                 if compile_code:
                     raise RuntimeError("Gradle 公共缓存编译失败：" + compile_output[-2000:])
@@ -4278,8 +6573,26 @@ def central_build_and_distribute(
                 if not result:
                     continue
                 runtime_text, copied = result
+                nginx_images = re.findall(
+                    r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(nginx:[^\s]+)",
+                    runtime_text,
+                )
+                static_artifact = next(
+                    (
+                        value for value in copied
+                        if (context / value).is_dir()
+                        and (context / value / "index.html").is_file()
+                    ),
+                    None,
+                )
+                if nginx_images and static_artifact:
+                    runtime_text = platform_spa_runtime_dockerfile(
+                        nginx_images[-1], static_artifact
+                    )
+                    copied = [static_artifact]
                 safe_service = re.sub(r"[^a-z0-9_.-]+", "-", str(service_name).lower()).strip("-.") or "app"
                 runtime_name = f".yunzhou.{safe_service}.runtime.Dockerfile"
+                runtime_text = enforce_nginx_pid_compatibility(runtime_text)
                 (context / runtime_name).write_text(runtime_text, encoding="utf-8")
                 build["dockerfile"] = runtime_name
                 build.pop("target", None)
@@ -4316,9 +6629,8 @@ def central_build_and_distribute(
                 dockerfile_rel = str(build.get("dockerfile") or "Dockerfile") if isinstance(build, dict) else "Dockerfile"
                 context = (Path(work) / context_rel).resolve()
                 dockerfile = context / dockerfile_rel
-                requirements = context / "requirements.txt"
                 context_key = str(context)
-                if context_key in warmed_contexts or not dockerfile.is_file() or not requirements.is_file():
+                if context_key in warmed_contexts or not dockerfile.is_file():
                     continue
                 docker_text = dockerfile.read_text(encoding="utf-8", errors="ignore")
                 base_match = re.search(r"(?im)^FROM\s+(python:[^\s]+)", docker_text)
@@ -4345,13 +6657,13 @@ def central_build_and_distribute(
                         block_text = "".join(block_lines)
                         collapsed = re.sub(r"\\\s*\r?\n\s*", " ", block_text)
                         wheel_match = re.search(
-                            r"(?i)\bpip\s+wheel\b.*?--wheel-dir(?:=|\s+)([^\s;&]+).*?\s-r\s+([^\s;&]+requirements\.txt)\b",
+                            r"(?i)\bpip\s+wheel\b.*?--wheel-dir(?:=|\s+)([^\s;&]+).*?\s-r\s+([^\s;&]+\.txt)\b",
                             collapsed,
                         )
                         if wheel_match:
                             wheel_block = (block_start, offset, wheel_match.group(1))
                         requirement_match = re.search(
-                            r"(?i)\bpip\s+install\b.*?\s-r\s+([^\s;&]+requirements\.txt)\b",
+                            r"(?i)\bpip\s+install\b.*?\s-r\s+([^\s;&]+\.txt)\b",
                             collapsed,
                         )
                         if requirement_match:
@@ -4360,8 +6672,29 @@ def central_build_and_distribute(
                     line_index += 1
                 if not base_match or not pip_block:
                     continue
+                requirement_path = pip_block[3].strip("'\"")
+                requirement_relative = requirement_path.lstrip("/")
+                requirements = context / requirement_relative
+                if not requirements.is_file() and "/requirements/" in ("/" + requirement_relative):
+                    requirement_relative = "requirements/" + requirement_relative.split("/requirements/", 1)[-1]
+                    requirements = context / requirement_relative
+                if not requirements.is_file():
+                    continue
                 warmed_contexts.add(context_key)
-                req_hash = hashlib.sha256(requirements.read_bytes()).hexdigest()[:16]
+                requirement_payload = bytearray(requirements.read_bytes())
+                requirement_text = requirements.read_text(encoding="utf-8", errors="ignore")
+                for include in re.findall(r"(?im)^\s*(?:-r|--requirement)\s+([^\s#]+)", requirement_text):
+                    included = (requirements.parent / include.strip("'\"")).resolve()
+                    if included.is_file() and (included == context or context in included.parents):
+                        requirement_payload.extend(b"\n--included--\n")
+                        requirement_payload.extend(included.read_bytes())
+                # Bump the cache contract when the platform-owned wheelhouse
+                # contents change. Python sdists may create an isolated build
+                # environment even when all application requirements were
+                # downloaded, so include the standard PEP 517 bootstrap
+                # wheels as well.
+                requirement_payload.extend(b"\n--yunzhou-wheelhouse-v3-compiled-sdists--\n")
+                req_hash = hashlib.sha256(requirement_payload).hexdigest()[:16]
                 wheel_dir = f"{cache_root}/pip/{req_hash}"
                 marker = f"{wheel_dir}/.complete"
                 code, _ = build_ssh.run(f"test -f {shlex.quote(marker)}")
@@ -4369,11 +6702,21 @@ def central_build_and_distribute(
                     build_ssh.run(f"rm -rf {shlex.quote(wheel_dir)} && mkdir -p {shlex.quote(wheel_dir)}")
                     python_image = base_match.group(1)
                     pip_command = (
-                        f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                        f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                         f"-v {shlex.quote(context_key)}:/workspace:ro "
                         f"-v {shlex.quote(wheel_dir)}:/wheelhouse "
                         f"{shlex.quote(python_image)} sh -lc "
-                        + shlex.quote("pip download -r /workspace/requirements.txt -d /wheelhouse")
+                        + shlex.quote(
+                            "set -e; "
+                            "if command -v apt-get >/dev/null 2>&1; then "
+                            "apt-get update >/dev/null && "
+                            "apt-get install -y --no-install-recommends build-essential >/dev/null; "
+                            "elif command -v apk >/dev/null 2>&1; then "
+                            "apk add --no-cache build-base linux-headers >/dev/null; "
+                            "fi; "
+                            "pip wheel setuptools wheel packaging -w /wheelhouse && "
+                            f"pip wheel -r /workspace/{requirement_relative} -w /wheelhouse"
+                        )
                     )
                     log(deployment.id, f"[平台构建] Python：{python_image}，首次填充公共 pip wheel 缓存。\n")
                     code, output = tracked_run(
@@ -4390,25 +6733,45 @@ def central_build_and_distribute(
                 shutil.rmtree(staged_wheels, ignore_errors=True)
                 shutil.copytree(Path(wheel_dir), staged_wheels, ignore=shutil.ignore_patterns(".complete"))
                 block_start, block_end, _, requirement_path = pip_block
+                virtual_env_match = re.search(
+                    r"(?im)\bVIRTUAL_ENV\s*=\s*([^\s\\]+)",
+                    docker_text,
+                )
+                virtual_env = virtual_env_match.group(1).strip("'\"") if virtual_env_match else ""
+                virtual_env_ready = bool(
+                    virtual_env
+                    and (
+                        re.search(
+                            rf"(?im)\bpython(?:3)?\s+-m\s+venv\s+{re.escape(virtual_env)}(?:\s|$)",
+                            docker_text,
+                        )
+                        or re.search(
+                            rf"(?im)^\s*COPY\s+--from=\S+\s+{re.escape(virtual_env)}\s+{re.escape(virtual_env)}\s*$",
+                            docker_text,
+                        )
+                    )
+                )
+                if virtual_env.startswith("/"):
+                    pip_executable = f"{virtual_env}/bin/pip"
+                    venv_setup = "" if virtual_env_ready else f"python -m venv {virtual_env} && "
+                else:
+                    pip_executable = "pip"
+                    venv_setup = ""
                 replacement = (
                     "COPY .yunzhou-pip-wheels /opt/yunzhou-pip-wheels\n"
-                    "RUN pip install --no-index --find-links=/opt/yunzhou-pip-wheels "
+                    f"RUN {venv_setup}{pip_executable} install --no-index --find-links=/opt/yunzhou-pip-wheels "
                     f"-r {requirement_path} \\\n"
                     "    && rm -rf /opt/yunzhou-pip-wheels"
                 )
                 rewritten_docker = docker_text[:block_start] + replacement + docker_text[block_end:]
-                # Generated multi-stage Dockerfiles may have already created a
-                # separate ``pip wheel`` stage. Once the public wheelhouse is
-                # complete, replace that network download step too; otherwise
-                # the later offline install is cached but the builder stage
-                # still downloads every dependency again.
-                if wheel_block:
-                    wheel_start, wheel_end, wheel_target = wheel_block
-                    rewritten_docker = (
-                        rewritten_docker[:wheel_start]
-                        + f"COPY .yunzhou-pip-wheels {wheel_target}\n"
-                        + rewritten_docker[wheel_end:]
-                    )
+                # Do not replace an upstream ``pip wheel`` RUN instruction as
+                # a whole. Such instructions commonly also create /venv or
+                # perform other setup in the same continued shell command.
+                # Replacing the complete RUN block made an otherwise valid
+                # image build successfully but fail at runtime because
+                # /venv/bin/python no longer existed. The final offline install
+                # still consumes the platform wheelhouse; preserving this
+                # builder step is the safe behaviour for arbitrary projects.
                 dockerfile.write_text(rewritten_docker, encoding="utf-8")
                 wheel_count = len(list(staged_wheels.glob("*")))
                 log(deployment.id, f"[缓存命中] pip {cache_state}：requirements={req_hash}，wheel={wheel_count}。\n")
@@ -4463,7 +6826,7 @@ def central_build_and_distribute(
                                   f"pnpm install --store-dir {shlex.quote(pnpm_cache_dir)} --frozen-lockfile; pnpm run build"
                     elif package_manager.startswith("yarn") or (has_yarn_lock and not has_package_lock):
                         manager = "yarn"
-                        install = "yarn install --frozen-lockfile; yarn build"
+                        install = "yarn install --frozen-lockfile --prefer-offline --network-timeout 600000; yarn build"
                     else:
                         manager = "npm"
                         install = "npm install --prefer-offline --no-audit --no-fund; npm run build"
@@ -4481,7 +6844,7 @@ def central_build_and_distribute(
                     if context_key not in node_built_contexts:
                         relative_context = context.relative_to(source_root).as_posix() or "."
                         node_modules_mount = ""
-                        if manager == "npm":
+                        if manager in {"npm", "yarn", "pnpm"}:
                             persistent_modules = persistent_dependency_root / relative_context / "node_modules"
                             persistent_modules.mkdir(parents=True, exist_ok=True)
                             visible_modules = Path(builder_root) / "projects" / project.slug / "source-cache" / relative_context / "node_modules"
@@ -4492,7 +6855,7 @@ def central_build_and_distribute(
                                     pass
                             node_modules_mount = f"-v {shlex.quote(str(persistent_modules) + ':/workspace/node_modules')} "
                         command = (
-                            f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                            f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                             f"-v {shlex.quote(context_key)}:/workspace "
                             f"-v {shlex.quote(cache_root + '/pnpm' + ':' + pnpm_cache_dir)} "
                             f"-v {shlex.quote(cache_root + '/npm' + ':' + npm_cache_dir)} "
@@ -4503,7 +6866,7 @@ def central_build_and_distribute(
                         )
                         log(deployment.id, f"[平台构建] Node 正式构建：{node_match.group(1)} + {manager}。\n")
                         code, output = tracked_run(build_ssh, deployment.id, command, stream=stream, timeout=1800,
-                                                   pid_prefix="yunzhou-node-build")
+                                                   pid_prefix="yunzhou-node-build", stream_channel="web", stream_label="前端 Web")
                         if code:
                             raise RuntimeError("Node 公共缓存构建失败：" + output[-2000:])
                         node_built_contexts.add(context_key)
@@ -4521,7 +6884,7 @@ def central_build_and_distribute(
                 if runtime_text is None and pom.is_file() and maven_match and "--from=" in docker_text:
                     if context_key not in maven_built_contexts:
                         command = (
-                            f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                            f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                             f"-v {shlex.quote(context_key)}:/workspace "
                             f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
                             f"-w /workspace {shlex.quote(maven_match.group(1))} "
@@ -4529,7 +6892,7 @@ def central_build_and_distribute(
                         )
                         log(deployment.id, f"[平台构建] Maven 正式构建：{maven_match.group(1)}。\n")
                         code, output = tracked_run(build_ssh, deployment.id, command, stream=stream, timeout=1800,
-                                                   pid_prefix="yunzhou-maven-build")
+                                                   pid_prefix="yunzhou-maven-build", stream_channel="api", stream_label="后端 API")
                         if code:
                             raise RuntimeError("Maven 公共缓存构建失败：" + output[-2000:])
                         maven_built_contexts.add(context_key)
@@ -4541,6 +6904,148 @@ def central_build_and_distribute(
                     result = runtime_stage_from_prebuilt_artifact(docker_text, context, jar_paths, "maven")
                     if result:
                         runtime_text, artifacts = result
+
+                # Go backends can be substantially more expensive than their
+                # frontend (Memos is a representative example). Compile the
+                # binary before entering the serialized image-store section,
+                # with persistent module and compiler caches mounted from the
+                # builder. The final Docker stage then only copies the binary
+                # and any referenced runtime scripts.
+                go_image_match = re.search(
+                    r"(?im)^FROM\s+(?:--platform=\S+\s+)?(golang:[^\s]+)",
+                    docker_text,
+                )
+                go_build_match = re.search(
+                    r"(?ims)\bgo\s+build\s+(?P<args>.*?)(?=\n\s*\n|^\s*FROM\s+)",
+                    docker_text,
+                )
+                if (
+                    runtime_text is None
+                    and go_image_match
+                    and go_build_match
+                    and (context / "go.mod").is_file()
+                    and "--from=" in docker_text
+                ):
+                    raw_go_command = "go build " + go_build_match.group("args")
+                    raw_go_command = re.sub(r"\\\s*\n\s*", " ", raw_go_command).strip()
+                    output_match = re.search(r"(?:^|\s)-o\s+(?:[\"']?)([^\s\"']+)", raw_go_command)
+                    if output_match:
+                        binary_name = Path(output_match.group(1).rstrip("/")).name or "app"
+                        artifact_dir = context / ".yunzhou-go-build"
+                        artifact_dir.mkdir(parents=True, exist_ok=True)
+                        binary_path = artifact_dir / binary_name
+                        raw_go_command = re.sub(
+                            r"(?:^|\s)-o\s+(?:[\"']?)[^\s\"']+",
+                            f" -o /workspace/.yunzhou-go-build/{binary_name}",
+                            raw_go_command,
+                            count=1,
+                        ).strip()
+                        now = datetime.now(timezone.utc)
+                        safe_go_version = f"{now:%y.%m}.{now.day}-dev.0000000"
+                        go_command = (
+                            "set -e; export PATH=/usr/local/go/bin:$PATH; "
+                            "apk add --no-cache git ca-certificates >/dev/null; "
+                            f"export CGO_ENABLED=0 GOOS=linux GOARCH=amd64 VERSION=${{VERSION:-{safe_go_version}}} COMMIT=${{COMMIT:-0000000}}; "
+                            + raw_go_command
+                        )
+                        command = (
+                            f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                            f"-v {shlex.quote(context_key)}:/workspace "
+                            f"-v {shlex.quote(cache_root + '/go-mod:/go/pkg/mod')} "
+                            f"-v {shlex.quote(cache_root + '/go-build:/root/.cache/go-build')} "
+                            f"-w /workspace {shlex.quote(go_image_match.group(1))} sh -c "
+                            + shlex.quote(go_command)
+                        )
+                        log(
+                            deployment.id,
+                            f"[平台构建] Go 使用 {go_image_match.group(1)} 与公共模块缓存并发编译；镜像阶段仅打包二进制。\n",
+                        )
+                        code, output = tracked_run(
+                            build_ssh, deployment.id, command, stream=stream, timeout=1800,
+                            pid_prefix="yunzhou-go-build", stream_channel="api", stream_label="后端 API",
+                        )
+                        if code:
+                            raise RuntimeError("Go 公共缓存构建失败：" + output[-2000:])
+                        runtime_artifacts = [str(binary_path.relative_to(context)).replace('\\', '/')]
+                        for copy_match in re.finditer(
+                            r"(?im)^\s*COPY\s+(?:--\S+\s+)*--from=\S+\s+(?:--\S+\s+)*([^\s]+)\s+([^\s]+)\s*$",
+                            docker_text,
+                        ):
+                            source_name = Path(copy_match.group(1).strip("\"'")).name
+                            for candidate in context.rglob(source_name):
+                                if candidate.is_file() and not any(part == ".git" for part in candidate.parts):
+                                    runtime_artifacts.append(candidate.relative_to(context).as_posix())
+                                    break
+                        result = runtime_stage_from_prebuilt_artifact(
+                            docker_text, context, list(dict.fromkeys(runtime_artifacts)), "go"
+                        )
+                        if result:
+                            runtime_text, artifacts = result
+
+                # .NET compilation is safe to run concurrently with Node,
+                # Java and Python when it writes to a host-mounted NuGet
+                # cache.  Publish outside Docker first, then let the short
+                # image-store critical section package only the runtime
+                # files.  This avoids a three-minute dotnet publish holding
+                # the global classic-Docker commit lock and blocking unrelated
+                # projects on the same builder.
+                dotnet_sdk_match = re.search(
+                    r"(?im)^FROM\s+(mcr\.microsoft\.com/dotnet/sdk:[^\s]+)",
+                    docker_text,
+                )
+                if runtime_text is None and dotnet_sdk_match and "--from=" in docker_text:
+                    publish_match = re.search(
+                        r"(?im)\bdotnet\s+publish\s+['\"]?([^\s'\"]+\.csproj)",
+                        docker_text,
+                    )
+                    csproj_candidates = sorted(
+                        path for path in context.rglob("*.csproj")
+                        if not any(part in {"bin", "obj", ".git"} for part in path.relative_to(context).parts)
+                    )
+                    csproj = None
+                    if publish_match:
+                        declared = publish_match.group(1).replace("\\", "/")
+                        for prefix in ("/src/", "/workspace/", "./"):
+                            if declared.startswith(prefix):
+                                declared = declared[len(prefix):]
+                                break
+                        candidate = context / declared
+                        if candidate.is_file():
+                            csproj = candidate
+                    if csproj is None and len(csproj_candidates) == 1:
+                        csproj = csproj_candidates[0]
+                    if csproj is not None:
+                        publish_dir = context / "publish"
+                        shutil.rmtree(publish_dir, ignore_errors=True)
+                        project_rel = csproj.relative_to(context).as_posix()
+                        publish_command = (
+                            f"dotnet restore {shlex.quote(project_rel)} && "
+                            f"dotnet publish {shlex.quote(project_rel)} -c Release -o /workspace/publish "
+                            "--no-restore /p:UseAppHost=false "
+                            "-p:RunAnalyzers=false -p:TreatWarningsAsErrors=false"
+                        )
+                        command = (
+                            f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                            f"-v {shlex.quote(context_key)}:/workspace "
+                            f"-v {shlex.quote(cache_root + '/nuget:/root/.nuget/packages')} "
+                            f"-w /workspace {shlex.quote(dotnet_sdk_match.group(1))} sh -lc "
+                            + shlex.quote(publish_command)
+                        )
+                        log(
+                            deployment.id,
+                            f"[平台构建] .NET 使用 {dotnet_sdk_match.group(1)} 与公共 NuGet 缓存并发发布；镜像阶段仅打包产物。\n",
+                        )
+                        code, output = tracked_run(
+                            build_ssh, deployment.id, command, stream=stream, timeout=1800,
+                            pid_prefix="yunzhou-dotnet-build", stream_channel="api", stream_label="后端 API",
+                        )
+                        if code:
+                            raise RuntimeError(".NET 公共缓存发布失败：" + output[-2000:])
+                        result = runtime_stage_from_prebuilt_artifact(
+                            docker_text, context, ["publish"], "dotnet"
+                        )
+                        if result:
+                            runtime_text, artifacts = result
 
                 if runtime_text is None:
                     continue
@@ -4567,16 +7072,20 @@ def central_build_and_distribute(
         # Compile recognized Java + Vue repositories in disposable toolchain
         # containers. Package-manager state lives in visible host directories,
         # shared by every project and independent from application images.
+        # Detect the repository from source evidence, not from runtime files
+        # produced by an older analysis.  Fresh projects and re-analysis runs
+        # must enter this path before any runtime-only Dockerfile exists.
         mounted_wms_build = (
-            (Path(work) / "WMSCloud_ui/.yunzhou.runtime.Dockerfile").is_file()
-            and (Path(work) / "WMSCloud/ruoyi-admin/.yunzhou.runtime.Dockerfile").is_file()
+            (Path(work) / "WMSCloud/pom.xml").is_file()
+            and (Path(work) / "WMSCloud/ruoyi-admin/pom.xml").is_file()
+            and (Path(work) / "WMSCloud_ui/package.json").is_file()
         )
         if mounted_wms_build:
             log(deployment.id, f"[平台构建] 公共缓存：{cache_root}/{{maven,pnpm,npm,yarn,gradle,pip}}\n")
             frontend_dist = Path(builder_dir) / "WMSCloud_ui/dist"
             if not frontend_dist.is_dir() or not any(frontend_dist.iterdir()):
                 node_command = (
-                    f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                    f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                     f"-v {shlex.quote(builder_dir + '/WMSCloud_ui')}:/workspace "
                     f"-v {shlex.quote(cache_root + '/pnpm' + ':' + pnpm_cache_dir)} "
                     f"-v {shlex.quote(cache_root + '/npm' + ':' + npm_cache_dir)} "
@@ -4590,7 +7099,7 @@ def central_build_and_distribute(
                 log(deployment.id, "[平台构建] 前端：Node 16.20.2 + pnpm 8.15.9，挂载公共 pnpm/npm/yarn 缓存。\n")
                 code, output = tracked_run(
                     build_ssh, deployment.id, node_command, stream=stream,
-                    timeout=1800, pid_prefix="yunzhou-node-build",
+                    timeout=1800, pid_prefix="yunzhou-node-build", stream_channel="web", stream_label="前端 Web",
                 )
                 if code:
                     raise RuntimeError("前端挂载缓存构建失败：" + output[-2000:])
@@ -4608,25 +7117,559 @@ def central_build_and_distribute(
                     '<id>yunzhou-mirror</id><mirrorOf>*</mirrorOf><url>https://maven.aliyun.com/repository/public</url>'
                     '</mirror></mirrors></settings>', encoding="utf-8",
                 )
-            maven_command = (
-                f"docker run --rm --label yunzhou.deployment={shlex.quote(deployment.id)} "
-                f"-v {shlex.quote(builder_dir)}:/workspace "
-                f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
-                "-w /workspace maven:3.8.8-eclipse-temurin-8 "
-                "mvn -s /workspace/.yunzhou.maven-settings.xml -B -f WMSCloud/pom.xml "
-                "-pl ruoyi-admin -am package -DskipTests"
+            existing_wms_jars = sorted(
+                path for path in (Path(builder_dir) / "WMSCloud").rglob("target/*.jar")
+                if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
             )
-            log(deployment.id, f"[平台构建] 后端：Maven 3.8.8 + Java 8，挂载公共 {maven_cache_dir} 缓存。\n")
-            code, output = tracked_run(
-                build_ssh, deployment.id, maven_command, stream=stream,
-                timeout=1800, pid_prefix="yunzhou-maven-build",
+            if existing_wms_jars:
+                log(
+                    deployment.id,
+                    "[平台构建] 后端产物已由并发 Maven 构建生成，跳过第二次 package："
+                    + existing_wms_jars[-1].relative_to(Path(builder_dir)).as_posix() + "。\n",
+                )
+            else:
+                maven_command = (
+                    f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                    f"-v {shlex.quote(builder_dir)}:/workspace "
+                    f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                    "-w /workspace maven:3.8.8-eclipse-temurin-8 "
+                    "mvn -s /workspace/.yunzhou.maven-settings.xml -B -f WMSCloud/pom.xml "
+                    "-pl ruoyi-admin -am package -DskipTests"
+                )
+                log(deployment.id, f"[平台构建] 后端：Maven 3.8.8 + Java 8，挂载公共 {maven_cache_dir} 缓存。\n")
+                code, output = tracked_run(
+                    build_ssh, deployment.id, maven_command, stream=stream,
+                    timeout=1800, pid_prefix="yunzhou-maven-build", stream_channel="api", stream_label="后端 API",
+                )
+                if code:
+                    raise RuntimeError("Maven 挂载缓存构建失败：" + output[-2000:])
+                downloaded = len(re.findall(r"Downloading from ", output))
+                log(deployment.id, f"[缓存命中] Maven 本次远程下载请求={downloaded}。\n")
+
+            # WMS-style repositories keep the frontend and the Maven reactor
+            # below one shared Compose build context.  The generic converter
+            # above intentionally looks only at manifests in the immediate
+            # context, so it cannot safely guess which nested artifact belongs
+            # to each service.  At this point both builds have completed and
+            # their real outputs are available.  Resolve them by service
+            # runtime evidence and replace every generated multi-stage file
+            # with a per-service, runtime-only Dockerfile.
+            compose_path = Path(work) / build_file
+            try:
+                wms_compose = yaml.safe_load(compose_path.read_text(encoding="utf-8", errors="ignore")) or {}
+            except Exception:
+                wms_compose = {}
+            wms_override: dict = {}
+            if compose_override:
+                try:
+                    wms_override = yaml.safe_load(
+                        (Path(work) / compose_override).read_text(encoding="utf-8", errors="ignore")
+                    ) or {}
+                except Exception:
+                    wms_override = {}
+            wms_jars = sorted(
+                path for path in (Path(work) / "WMSCloud").rglob("target/*.jar")
+                if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
             )
-            if code:
-                raise RuntimeError("Maven 挂载缓存构建失败：" + output[-2000:])
-            downloaded = len(re.findall(r"Downloading from ", output))
-            log(deployment.id, f"[缓存命中] Maven 本次远程下载请求={downloaded}（二次构建应明显下降）。\n")
+            wms_dist = Path(work) / "WMSCloud_ui/dist"
+            rewritten_services: list[str] = []
+            for service_name, service in (wms_compose.get("services") or {}).items():
+                if not isinstance(service, dict) or not service.get("build"):
+                    continue
+                build = service["build"]
+                build = {"context": build} if isinstance(build, str) else dict(build)
+                context_rel = str(build.get("context") or ".")
+                context = (Path(work) / context_rel).resolve()
+                dockerfile = context / str(build.get("dockerfile") or "Dockerfile")
+                if not dockerfile.is_file():
+                    continue
+                docker_text = dockerfile.read_text(encoding="utf-8", errors="ignore")
+                lower_name = str(service_name).lower()
+                environment = service.get("environment") or {}
+                environment_keys = " ".join(
+                    str(key).lower()
+                    for key in (environment.keys() if isinstance(environment, dict) else [])
+                )
+                # Runtime role is authoritative. A previous generic pass may
+                # already have replaced the Dockerfile with Nginx, so the
+                # current base image alone is not trustworthy evidence.
+                is_backend = bool(
+                    any(token in lower_name for token in ("api", "backend", "server"))
+                    or any(token in environment_keys for token in ("spring_", "server_port", "java_"))
+                )
+                is_frontend = bool(
+                    not is_backend
+                    and re.search(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(?:node|nginx):", docker_text)
+                    and ("web" in lower_name or "front" in lower_name or "ui" in lower_name or "nginx" in docker_text.lower())
+                )
+                if is_frontend and wms_dist.is_dir():
+                    artifact_values = [wms_dist.relative_to(context).as_posix()]
+                    output_kind = "wms-frontend"
+                elif is_backend and wms_jars:
+                    artifact_values = [path.relative_to(context).as_posix() for path in wms_jars]
+                    output_kind = "wms-backend"
+                else:
+                    continue
+                if is_frontend:
+                    nginx_images = re.findall(
+                        r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(nginx:[^\s]+)",
+                        docker_text,
+                    )
+                    runtime_text = platform_spa_runtime_dockerfile(
+                        nginx_images[-1] if nginx_images else PLATFORM_NGINX_IMAGE,
+                        artifact_values[0],
+                    )
+                    copied = [artifact_values[0]]
+                else:
+                    # Prefer the executable application module, then the
+                    # largest JAR. Never copy a library module merely because
+                    # its path sorts last.
+                    jar_candidates = [context / value for value in artifact_values]
+                    selected_jar = next(
+                        (path for path in jar_candidates if "ruoyi-admin" in path.as_posix().lower()),
+                        max(jar_candidates, key=lambda path: (path.stat().st_size, path.as_posix())),
+                    )
+                    java_match = re.search(
+                        r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]*(?:temurin|openjdk)[^\s]*)",
+                        docker_text,
+                    )
+                    java_image = java_match.group(1) if java_match else "eclipse-temurin:8-jre"
+                    relative_jar = selected_jar.relative_to(context).as_posix()
+                    runtime_text = (
+                        f"FROM {java_image}\nWORKDIR /app\n"
+                        f"COPY {relative_jar} /app/app.jar\n"
+                        "EXPOSE 8080\n"
+                        'ENTRYPOINT ["java", "-jar", "/app/app.jar"]\n'
+                    )
+                    copied = [relative_jar]
+                safe_service = re.sub(r"[^a-z0-9_.-]+", "-", lower_name).strip("-.") or "app"
+                runtime_name = f".yunzhou.{safe_service}.runtime.Dockerfile"
+                runtime_text = enforce_nginx_pid_compatibility(runtime_text)
+                (context / runtime_name).write_text(runtime_text, encoding="utf-8")
+                clean_build = {"context": context_rel, "dockerfile": runtime_name}
+                service["build"] = clean_build
+                override_service = (wms_override.get("services") or {}).get(service_name)
+                if isinstance(override_service, dict):
+                    override_service["build"] = clean_build
+                rewritten_services.append(str(service_name))
+                log(
+                    deployment.id,
+                    f"[平台构建] {service_name} 已改为纯运行镜像，仅复制：{', '.join(copied)}。\n",
+                )
+            if rewritten_services:
+                compose_path.write_text(
+                    yaml.safe_dump(wms_compose, allow_unicode=True, sort_keys=False), encoding="utf-8"
+                )
+                if compose_override:
+                    (Path(work) / compose_override).write_text(
+                        yaml.safe_dump(wms_override, allow_unicode=True, sort_keys=False), encoding="utf-8"
+                    )
+                log(
+                    deployment.id,
+                    "[封装准备] 多模块产物已汇合，运行镜像不再执行 npm/pnpm/Maven："
+                    + "、".join(rewritten_services) + "。\n",
+                )
+
+        # Generic shared-root monorepo fallback.  Node/Maven builds above scan
+        # manifests recursively and therefore may have produced artifacts in
+        # VUE/dist, frontend/build, API/target, or any other module name.  Do
+        # not key packaging to project/service names: map real artifacts to
+        # each remaining generated multi-stage Dockerfile by runtime role.
         if build_type == "compose":
+            compose_path = Path(work) / build_file
+            try:
+                generic_compose = yaml.safe_load(
+                    compose_path.read_text(encoding="utf-8", errors="ignore")
+                ) or {}
+            except Exception:
+                generic_compose = {}
+            generic_override: dict = {}
+            if compose_override:
+                try:
+                    generic_override = yaml.safe_load(
+                        (Path(work) / compose_override).read_text(encoding="utf-8", errors="ignore")
+                    ) or {}
+                except Exception:
+                    generic_override = {}
+            frontend_artifacts = sorted(
+                path for path in Path(work).rglob("*")
+                if path.is_dir()
+                and path.name.lower() in {"dist", "build", "out", "public"}
+                and (path / "index.html").is_file()
+                and not any(part in {"node_modules", ".git"} for part in path.relative_to(Path(work)).parts)
+            )
+            backend_artifacts = sorted(
+                path for path in Path(work).rglob("target/*.jar")
+                if path.is_file()
+                and not path.name.startswith(("original-", "sources-", "javadoc-"))
+            )
+            planned_roles = _traffic_service_roles(
+                _project_traffic_plan(
+                    project,
+                    (project.source_analysis or {}).get("deployment_plan") or {},
+                )
+            )
+            generic_changes: list[str] = []
+            for service_name, service in (generic_compose.get("services") or {}).items():
+                if not isinstance(service, dict) or not service.get("build"):
+                    continue
+                build = service["build"]
+                build = {"context": build} if isinstance(build, str) else dict(build)
+                context_rel = str(build.get("context") or ".")
+                context = (Path(work) / context_rel).resolve()
+                dockerfile = context / str(build.get("dockerfile") or "Dockerfile")
+                if not dockerfile.is_file():
+                    continue
+                docker_text = dockerfile.read_text(encoding="utf-8", errors="ignore")
+                has_compile_step = bool(re.search(
+                    r"(?im)^\s*RUN\s+.*(?:\bmvn\b.*\b(?:package|install)\b|"
+                    r"\bgradle\w*\b.*\b(?:build|bootJar)\b|"
+                    r"\b(?:npm|pnpm|yarn)\b.*\b(?:run\s+)?build\b)",
+                    docker_text,
+                ))
+                lower_name = str(service_name).lower()
+                environment = service.get("environment") or {}
+                environment_keys = " ".join(
+                    str(key).lower()
+                    for key in (environment.keys() if isinstance(environment, dict) else [])
+                )
+                nginx_images = re.findall(
+                    r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(nginx:[^\s]+)", docker_text
+                )
+                context_poms = list(context.rglob("pom.xml")) if context.is_dir() else []
+                context_jars = [path for path in backend_artifacts if context == path or context in path.parents]
+                planned_role = str((planned_roles.get(str(service_name)) or ("", False))[0]).lower()
+                name_is_frontend = any(token in lower_name for token in ("web", "front", "ui"))
+                name_is_backend = any(token in lower_name for token in ("api", "backend", "server"))
+                backend_role = bool(
+                    planned_role in {"backend", "api", "server"}
+                    or name_is_backend
+                    or (
+                        planned_role not in {"frontend", "web", "ui"}
+                        and not name_is_frontend
+                        and (
+                            (lower_name in {"app", "application"} and bool(backend_artifacts))
+                            or any(token in environment_keys for token in ("spring_", "server_port", "java_"))
+                            or context_poms
+                            or context_jars
+                            or re.search(r"(?i)\b(?:java|mvn|maven|gradle|jar)\b", docker_text)
+                        )
+                    )
+                )
+                frontend_role = bool(
+                    planned_role in {"frontend", "web", "ui"}
+                    or (
+                        not backend_role
+                        and (
+                        name_is_frontend
+                        or (nginx_images and not backend_artifacts)
+                        )
+                    )
+                )
+                artifact_values: list[str]
+                if frontend_role and frontend_artifacts:
+                    # Prefer the shallowest artifact; ties are deterministic.
+                    chosen_frontend = min(
+                        frontend_artifacts,
+                        key=lambda path: (len(path.relative_to(context).parts), path.as_posix()),
+                    )
+                    artifact_values = [chosen_frontend.relative_to(context).as_posix()]
+                    runtime_text = platform_spa_runtime_dockerfile(
+                        nginx_images[-1] if nginx_images else PLATFORM_NGINX_IMAGE,
+                        artifact_values[0],
+                    )
+                    copied = artifact_values
+                elif backend_role and backend_artifacts:
+                    usable_jars = context_jars or [
+                        path for path in backend_artifacts if Path(work) in path.parents
+                    ]
+                    selected_jar = max(
+                        usable_jars,
+                        key=lambda path: (
+                            "admin" in path.name.lower() or "app" in path.name.lower(),
+                            path.stat().st_size,
+                        ),
+                    )
+                    if context not in selected_jar.parents:
+                        # A faulty AI plan may point the backend service at the
+                        # frontend directory.  Re-anchor the generated runtime
+                        # image at the release root where the proven JAR lives.
+                        context = Path(work).resolve()
+                        context_rel = "."
+                    relative_jar = selected_jar.relative_to(context).as_posix()
+                    java_version = detect_java_version(str(context))
+                    runtime_text = (
+                        f"FROM eclipse-temurin:{java_version}-jre\nWORKDIR /app\n"
+                        f"COPY {relative_jar} /app/app.jar\n"
+                        "EXPOSE 8080\n"
+                        'ENTRYPOINT ["java", "-jar", "/app/app.jar"]\n'
+                    )
+                    copied = [relative_jar]
+                    log(
+                        deployment.id,
+                        f"[角色校正] {service_name} 检测到后端源码/可执行 JAR；忽略参考 Dockerfile 中的 Nginx，按后端运行镜像封装。\n",
+                    )
+                else:
+                    continue
+                safe_service = re.sub(r"[^a-z0-9_.-]+", "-", lower_name).strip("-.") or "app"
+                runtime_name = f".yunzhou.{safe_service}.runtime.Dockerfile"
+                (context / runtime_name).write_text(
+                    enforce_nginx_pid_compatibility(runtime_text), encoding="utf-8"
+                )
+                clean_build = {"context": context_rel, "dockerfile": runtime_name}
+                service["build"] = clean_build
+                override_service = (generic_override.get("services") or {}).get(service_name)
+                if isinstance(override_service, dict):
+                    override_service["build"] = clean_build
+                generic_changes.append(f"{service_name}→{', '.join(copied)}")
+            if generic_changes:
+                compose_path.write_text(
+                    yaml.safe_dump(generic_compose, allow_unicode=True, sort_keys=False), encoding="utf-8"
+                )
+                if compose_override:
+                    (Path(work) / compose_override).write_text(
+                        yaml.safe_dump(generic_override, allow_unicode=True, sort_keys=False), encoding="utf-8"
+                    )
+                log(
+                    deployment.id,
+                    "[封装准备] 已按实际产物自动生成纯运行镜像：" + "；".join(generic_changes) + "。\n",
+                )
+        # Materialize the generic platform-artifact contract used by AI
+        # runtime Dockerfiles. This is technology based, never project-name
+        # based: Docker only packages outputs that the platform has already
+        # built and verified.
+        if build_type == "compose":
+            artifact_compose_path = Path(work) / build_file
+            try:
+                artifact_compose = yaml.safe_load(
+                    artifact_compose_path.read_text(encoding="utf-8", errors="ignore")
+                ) or {}
+            except Exception:
+                artifact_compose = {}
+            for artifact_service_name, artifact_service in (artifact_compose.get("services") or {}).items():
+                if not isinstance(artifact_service, dict) or not artifact_service.get("build"):
+                    continue
+                artifact_build = artifact_service["build"]
+                artifact_build = {"context": artifact_build} if isinstance(artifact_build, str) else dict(artifact_build)
+                artifact_context = (Path(work) / str(artifact_build.get("context") or ".")).resolve()
+                artifact_dockerfile = artifact_context / str(artifact_build.get("dockerfile") or "Dockerfile")
+                if not artifact_dockerfile.is_file():
+                    continue
+                artifact_text = artifact_dockerfile.read_text(encoding="utf-8", errors="ignore")
+                requested = set(re.findall(
+                    r"(?im)^\s*COPY\s+(?!--from=)(?:--\S+\s+)*(\.yunzhou/artifacts/[^\s]+)",
+                    artifact_text,
+                ))
+                requested = {value.rstrip("/") for value in requested}
+                missing = [value for value in requested if not (artifact_context / value).exists()]
+                if not missing:
+                    continue
+                requirements_candidates = sorted(
+                    path for path in artifact_context.rglob("requirements.txt")
+                    if not any(part in {".git", ".venv", "venv", "node_modules"} for part in path.relative_to(artifact_context).parts)
+                )
+                backend_requirements = min(
+                    requirements_candidates,
+                    key=lambda path: (
+                        0 if path.parent.name.lower() in {"backend", "server", "api"} else 1,
+                        len(path.relative_to(artifact_context).parts),
+                        path.as_posix(),
+                    ),
+                    default=None,
+                )
+                package_candidates = []
+                for package_file in artifact_context.rglob("package.json"):
+                    if any(part in {".git", "node_modules", "dist", "build"} for part in package_file.relative_to(artifact_context).parts):
+                        continue
+                    try:
+                        package_data = json.loads(package_file.read_text(encoding="utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    scripts = package_data.get("scripts") if isinstance(package_data, dict) else {}
+                    if isinstance(scripts, dict) and scripts.get("build"):
+                        package_candidates.append((package_file, package_data))
+                frontend_package, frontend_meta = min(
+                    package_candidates,
+                    key=lambda item: (
+                        0 if item[0].parent.name.lower() in {"frontend", "web", "ui"} else 1,
+                        len(item[0].relative_to(artifact_context).parts),
+                        item[0].as_posix(),
+                    ),
+                    default=(None, {}),
+                )
+                for relative_artifact in missing:
+                    destination = artifact_context / relative_artifact
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    artifact_kind = destination.name.lower()
+                    if artifact_kind == "backend-runtime":
+                        if backend_requirements is None:
+                            raise RuntimeError(f"[平台产物校验] {artifact_service_name} 缺少可识别的 Python 后端源码")
+                        shutil.rmtree(destination, ignore_errors=True)
+                        shutil.copytree(
+                            backend_requirements.parent, destination,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".venv", "venv"),
+                        )
+                    elif artifact_kind == "python-runtime":
+                        if backend_requirements is None:
+                            raise RuntimeError(f"[平台产物校验] {artifact_service_name} 缺少 requirements.txt")
+                        shutil.rmtree(destination, ignore_errors=True)
+                        destination.mkdir(parents=True, exist_ok=True)
+                        python_match = re.search(r"(?im)^\s*FROM\s+(python:[^\s]+)", artifact_text)
+                        python_image = python_match.group(1) if python_match else "python:3.12-slim"
+                        requirements_rel = backend_requirements.relative_to(artifact_context).as_posix()
+                        destination_rel = destination.relative_to(artifact_context).as_posix()
+                        command = (
+                            f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                            f"-v {shlex.quote(str(artifact_context))}:/workspace -w /workspace "
+                            f"{shlex.quote(python_image)} sh -lc "
+                            + shlex.quote(
+                                f"pip install --no-cache-dir -r {requirements_rel} --target {destination_rel}"
+                            )
+                        )
+                        code, output = tracked_run(
+                            build_ssh, deployment.id, command, stream=stream, timeout=1800,
+                            pid_prefix="yunzhou-python-artifact", stream_channel="api", stream_label="后端 API",
+                        )
+                        if code:
+                            raise RuntimeError("Python 运行依赖产物生成失败：" + output[-2000:])
+                    elif artifact_kind == "frontend-dist":
+                        if frontend_package is None:
+                            raise RuntimeError(f"[平台产物校验] {artifact_service_name} 缺少带 build 脚本的前端 package.json")
+                        frontend_root = frontend_package.parent
+                        if (frontend_root / "pnpm-lock.yaml").is_file():
+                            frontend_command = "corepack enable; pnpm install --frozen-lockfile; pnpm run build"
+                        elif (frontend_root / "yarn.lock").is_file():
+                            frontend_command = "corepack enable; yarn install --frozen-lockfile; yarn build"
+                        elif (frontend_root / "package-lock.json").is_file():
+                            frontend_command = "npm ci --no-audit --no-fund; npm run build"
+                        else:
+                            frontend_command = "npm install --no-audit --no-fund; npm run build"
+                        frontend_rel = frontend_root.relative_to(artifact_context).as_posix()
+                        frontend_workdir = "/workspace/" + frontend_rel.strip("/")
+                        command = (
+                            f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                            f"-v {shlex.quote(str(artifact_context))}:/workspace -w {shlex.quote(frontend_workdir)} "
+                            "node:22-slim sh -lc " + shlex.quote("set -e; " + frontend_command)
+                        )
+                        code, output = tracked_run(
+                            build_ssh, deployment.id, command, stream=stream, timeout=1800,
+                            pid_prefix="yunzhou-frontend-artifact", stream_channel="web", stream_label="前端 Web",
+                        )
+                        if code:
+                            raise RuntimeError("前端运行产物生成失败：" + output[-2000:])
+                        built_dir = next(
+                            (frontend_root / name for name in ("dist", "build", "out") if (frontend_root / name).is_dir()),
+                            None,
+                        )
+                        if built_dir is None:
+                            raise RuntimeError("前端构建完成但未找到 dist/build/out 产物")
+                        shutil.rmtree(destination, ignore_errors=True)
+                        shutil.copytree(built_dir, destination)
+                    else:
+                        raise RuntimeError(f"[平台产物校验] 不支持的运行产物契约：{relative_artifact}")
+                    if not destination.exists() or (destination.is_dir() and not any(destination.iterdir())):
+                        raise RuntimeError(f"[平台产物校验] 运行产物为空：{relative_artifact}")
+                    dockerignore = artifact_context / ".dockerignore"
+                    ignore_text = dockerignore.read_text(encoding="utf-8", errors="ignore") if dockerignore.is_file() else ""
+                    artifact_rule = relative_artifact.rstrip("/")
+                    required_rules = [
+                        "!.yunzhou/",
+                        "!.yunzhou/artifacts/",
+                        f"!{artifact_rule}",
+                        f"!{artifact_rule}/**",
+                    ]
+                    missing_rules = [rule for rule in required_rules if rule not in ignore_text.splitlines()]
+                    if missing_rules:
+                        with dockerignore.open("a", encoding="utf-8") as handle:
+                            if ignore_text and not ignore_text.endswith("\n"):
+                                handle.write("\n")
+                            handle.write("\n".join(missing_rules) + "\n")
+                    log(deployment.id, f"[平台产物] 已生成并校验 {relative_artifact}。\n")
+
+        # The source repository's Dockerfile/Compose files are references.
+        # Only the platform-generated runtime files may enter image packaging.
+        if build_type == "compose":
+            validate_runtime_only_dockerfiles(work, build_file, compose_override)
+            # Role/artifact types are a hard contract, not a best-effort
+            # heuristic. A static frontend can only run on Nginx and a Java
+            # backend can never be published from Nginx. Stop before registry
+            # upload if any late rewrite crosses those identities.
+            final_document = yaml.safe_load(
+                (Path(work) / build_file).read_text(encoding="utf-8", errors="ignore")
+            ) or {}
+            final_roles = _traffic_service_roles(
+                _project_traffic_plan(
+                    project,
+                    (project.source_analysis or {}).get("deployment_plan") or {},
+                )
+            )
+            for final_name, final_service in (final_document.get("services") or {}).items():
+                if not isinstance(final_service, dict) or not final_service.get("build"):
+                    continue
+                final_build = final_service["build"]
+                final_build = {"context": final_build} if isinstance(final_build, str) else dict(final_build)
+                final_context = (Path(work) / str(final_build.get("context") or ".")).resolve()
+                final_file = final_context / str(final_build.get("dockerfile") or "Dockerfile")
+                if not final_file.is_file():
+                    continue
+                final_text = final_file.read_text(encoding="utf-8", errors="ignore")
+                final_lower = str(final_name).lower()
+                final_role = str((final_roles.get(str(final_name)) or ("", False))[0]).lower()
+                expects_frontend = final_role in {"frontend", "web", "ui"} or any(
+                    token in final_lower for token in ("web", "front", "ui")
+                )
+                expects_backend = final_role in {"backend", "api", "server"} or any(
+                    token in final_lower for token in ("api", "backend", "server")
+                )
+                uses_nginx = bool(re.search(r"(?im)^\s*FROM\s+[^\n]*nginx", final_text))
+                uses_java = bool(re.search(r"(?im)^\s*FROM\s+[^\n]*(?:temurin|openjdk)|ENTRYPOINT\s*\[\s*[\"']java", final_text))
+                if expects_frontend and uses_java:
+                    raise RuntimeError(f"[平台封装校验] 前端服务 {final_name} 错误引用 Java 产物，已阻止发布")
+                if expects_backend and uses_nginx and not uses_java:
+                    raise RuntimeError(f"[平台封装校验] 后端服务 {final_name} 错误引用 Nginx 静态产物，已阻止发布")
+            log(deployment.id, "[封装校验] 所有服务均为平台生成的纯运行镜像；未发现重复编译命令。\n")
+        snapshot_deployment_files(deployment.id, work, build_file)
+        log(deployment.id, "[发布文件] 已保存本次最终实际使用的 Dockerfile、Compose、Nginx 与脱敏环境配置快照。\n")
+
+        if build_type == "compose":
+            # Service discovery may replace an early AI plan (for example
+            # warehouse-web/api) with names proven by the actual repository
+            # (wms-ui/api).  The image list created before that rewrite is
+            # stale and must never drive registry push/pull distribution.
+            # Rebuild it from the final effective Compose artifacts so build,
+            # registry, transfer and runtime startup share one identity map.
+            final_images: list[str] = []
+            image_prefix = f"yunzhou/{project.slug}-"
+            for final_compose_name in (build_file, compose_override):
+                if not final_compose_name:
+                    continue
+                final_compose_path = Path(work) / final_compose_name
+                if not final_compose_path.is_file():
+                    continue
+                try:
+                    final_document = yaml.safe_load(
+                        final_compose_path.read_text(encoding="utf-8", errors="ignore")
+                    ) or {}
+                except Exception:
+                    continue
+                for final_service in (final_document.get("services") or {}).values():
+                    if not isinstance(final_service, dict):
+                        continue
+                    final_image = str(final_service.get("image") or "").strip()
+                    if final_image.startswith(image_prefix) and final_image.endswith(f":{release}"):
+                        final_images.append(final_image)
+            final_images = list(dict.fromkeys(final_images))
+            if final_images:
+                if final_images != images:
+                    log(
+                        deployment.id,
+                        "[镜像映射] 已以最终 Compose 校正构建与分发清单："
+                        + "、".join(final_images) + "。\n",
+                    )
+                images = final_images
             files = f"-f {shlex.quote(build_file)}" + (f" -f {shlex.quote(compose_override)}" if compose_override else "")
+            if proxy_compose_override:
+                files += f" -f {shlex.quote(proxy_compose_override)}"
             build_owners: list[str] = []
             for compose_name in (build_file, compose_override):
                 if not compose_name:
@@ -4651,16 +7694,19 @@ def central_build_and_distribute(
                 # this single job, bypassing the outer deployment lock.  Some
                 # Docker/containerd versions then lose ingest leases while
                 # exporting layers.  Keep service image commits serial too.
-                f"docker compose --parallel 1 -p {shlex.quote('yz-build-' + project.slug)} {files} build"
+                f"docker compose --env-file .yunzhou.build.env --parallel 1 -p {shlex.quote('yz-build-' + project.slug)} {files} build"
             )
             build_commands = [
                 (service, compose_prefix + " " + shlex.quote(service))
                 for service in build_owners
-            ] or [("应用镜像", compose_prefix)]
+                if service not in eager_packaged_services
+            ]
+            if not build_owners:
+                build_commands = [("应用镜像", compose_prefix)]
         else:
             command = (
                 f"cd {shlex.quote(builder_dir)} && DOCKER_BUILDKIT=0 DOCKER_DEFAULT_PLATFORM={shlex.quote(platform)} "
-                f"docker build -f {shlex.quote(build_file)} -t {shlex.quote(image_name)} ."
+                f"docker build {proxy_build_args} -f {shlex.quote(build_file)} -t {shlex.quote(image_name)} ."
             )
             build_commands = [("应用镜像", command)]
         # Dependency preparation and classic image packaging may run across
@@ -4671,13 +7717,31 @@ def central_build_and_distribute(
             # classic-Docker image write is serialized per builder node;
             # concurrent commits against this node's shared containerd store
             # have repeatedly lost ingest/snapshot files.
-            locked_command = (
-                "flock -w 1200 /tmp/yunzhou-image-commit.lock sh -lc "
-                + shlex.quote(service_command)
+            service_lock = hashlib.sha256(
+                f"{project.slug}:{service_name}".encode("utf-8")
+            ).hexdigest()[:16]
+            lock_path = f"/tmp/yunzhou-image-{service_lock}.lock"
+            lock_probe, _ = build_ssh.run(
+                f"flock -n {shlex.quote(lock_path)} true",
+                timeout=10,
             )
-            log(
-                deployment.id,
-                f"[平台构建] 服务 {service_index}/{len(build_commands)}：{service_name} 等待镜像封装；依赖编译与公共缓存不受影响。\n",
+            if lock_probe:
+                log(
+                    deployment.id,
+                    f"[构建队列] 服务 {service_index}/{len(build_commands)}：{service_name} 的依赖编译已完成；"
+                    "同一服务的镜像正在写入，当前仅等待该服务的安全封装时段。\n",
+                )
+            else:
+                log(
+                    deployment.id,
+                    f"[镜像封装] 服务 {service_index}/{len(build_commands)}：{service_name}，该服务写入通道空闲，立即开始。\n",
+                )
+            locked_command = (
+                f"flock -w 1200 {shlex.quote(lock_path)} sh -lc "
+                + shlex.quote(
+                    "printf '[镜像封装] 已取得该服务镜像写入时段，开始生成运行镜像。\\n'; "
+                    + service_command
+                )
             )
             code, output = tracked_run(
                 build_ssh, deployment.id, locked_command, stream=stream, timeout=1500,
@@ -4715,6 +7779,13 @@ def central_build_and_distribute(
                     raise RuntimeError(f"{service_name} 等待镜像构建队列超时，平台已释放本次任务，请稍后安全重试。")
                 raise RuntimeError(f"{service_name} 镜像构建失败：" + output[-2000:])
             log(deployment.id, f"[平台构建] {service_name} 镜像封装完成，已释放提交锁。\n")
+        distribution_label = "本机加载" if builder.id == target.id else "镜像分发"
+        log(
+            deployment.id,
+            f"[构建通道] distribute|{distribution_label}|开始|{datetime.now(timezone.utc).isoformat()}\n",
+        )
+        registry_pairs: list[tuple[str, str]] = []
+        registry_ready = True
         for value in images:
             repository, separator, tag = value.rpartition(":")
             if not separator:
@@ -4747,40 +7818,178 @@ def central_build_and_distribute(
                 )
                 time.sleep(3)
             if code:
-                raise RuntimeError("应用镜像写入平台仓库失败：" + registry_output[-1200:])
-            if not verify_registry_tag(safe_repository, tag):
-                raise RuntimeError(
-                    f"镜像推送命令已结束，但平台中央仓库未发现 {safe_repository}:{tag}；"
-                    "已停止发布，避免记录假入库状态。请检查仓库地址解析和存储卷。"
+                registry_ready = False
+                log(
+                    deployment.id,
+                    "[镜像仓库] 写入失败，将使用镜像打包传输兜底："
+                    + ANSI_RE.sub("", registry_output or "未返回详细错误")[-800:] + "\n",
                 )
+                break
+            if not verify_registry_tag(safe_repository, tag):
+                registry_ready = False
+                log(
+                    deployment.id,
+                    f"[镜像仓库] 推送后未能核实 {safe_repository}:{tag}，"
+                    "将使用镜像打包传输兜底。\n",
+                )
+                break
             build_ssh.run(f"docker image rm -f {shlex.quote(registry_reference)} >/dev/null 2>&1 || true", timeout=120)
             log(deployment.id, f"[镜像仓库] 已入库 {safe_repository}:{tag}。\n")
+            registry_pairs.append((value, registry_reference))
             removed_tags = cleanup_registry_versions(db, project, safe_repository)
             if removed_tags:
                 log(deployment.id, f"[镜像仓库] 已按保留策略清理旧版本：{', '.join(removed_tags)}。\n")
-        # Dependency reuse is provided by the explicit public cache mounts.
-        # Do not retain anonymous Docker build layers after a successful job.
-        build_ssh.run("docker image prune -f >/dev/null 2>&1 || true", timeout=120)
+        # Classic Docker's reusable layer cache is represented by untagged
+        # intermediate images. Never prune it at the end of each deployment;
+        # the worker's age/capacity policy performs bounded cleanup later.
+        # Prefer deterministic archive transfer. The registry remains a fully
+        # populated fallback/rollback source, but a normal release must not
+        # depend on target-side registry credentials or short-name parsing.
+        pulled_from_registry = builder.id == target.id
         if builder.id != target.id:
             image_args = " ".join(shlex.quote(value) for value in images)
-            code, output = build_ssh.run(f"docker save {image_args} | gzip -1 > {shlex.quote(archive)}", timeout=1800)
-            if code:
-                raise RuntimeError("平台镜像打包失败：" + output[-1200:])
-            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as handle:
-                local_archive = handle.name
+            local_archive = None
             try:
+                log(
+                    deployment.id,
+                    f"[镜像分发] 默认由构建节点 {builder.name} 打包并传送 "
+                    f"{len(images)} 个运行镜像到 {target.name}。\n",
+                )
+                code, output = build_ssh.run(
+                    f"docker save {image_args} | gzip -1 > {shlex.quote(archive)}",
+                    timeout=1800,
+                )
+                if code:
+                    raise RuntimeError(ANSI_RE.sub("", output or "镜像打包失败")[-1200:])
+                _, archive_size = build_ssh.run(
+                    f"du -h {shlex.quote(archive)} 2>/dev/null | awk '{{print $1}}'",
+                    timeout=30,
+                )
+                archive_size = archive_size.strip() or "未知大小"
+                with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as handle:
+                    local_archive = handle.name
                 build_ssh.download_file(archive, local_archive)
                 with SSHNode(target) as target_ssh:
                     remote_archive = f"/tmp/yunzhou-images-{deployment.id}.tar.gz"
                     target_ssh.upload_file(local_archive, remote_archive)
+                    code, output = target_ssh.run(
+                        f"gzip -dc {shlex.quote(remote_archive)} | docker load; "
+                        f"rm -f {shlex.quote(remote_archive)}",
+                        timeout=1800,
+                    )
+                    if code:
+                        raise RuntimeError(ANSI_RE.sub("", output or "镜像导入失败")[-1200:])
+                    inspect_args = " ".join(shlex.quote(value) for value in images)
+                    code, output = target_ssh.run(
+                        "for image in " + inspect_args + "; do docker image inspect \"$image\" >/dev/null || exit 41; done",
+                        timeout=120,
+                    )
+                    if code:
+                        raise RuntimeError(ANSI_RE.sub("", output or "导入后校验失败")[-800:])
+                pulled_from_registry = True
+                log(
+                    deployment.id,
+                    f"[镜像分发] 打包传输完成（{archive_size}），目标节点已导入并校验全部镜像。\n",
+                )
+            except Exception as direct_exc:
+                log(
+                    deployment.id,
+                    "[镜像分发] 打包传输未完成，自动改用平台镜像仓库备用通道："
+                    + str(direct_exc)[-1000:] + "\n",
+                )
+            finally:
+                if local_archive:
+                    Path(local_archive).unlink(missing_ok=True)
+                build_ssh.run(f"rm -f -- {shlex.quote(archive)}", timeout=120)
+        if (
+            builder.id != target.id
+            and not pulled_from_registry
+            and registry_ready
+            and len(registry_pairs) == len(images)
+        ):
+            log(
+                deployment.id,
+                f"[镜像分发] 备用通道：由部署节点 {target.name} 从平台仓库拉取 "
+                f"{len(registry_pairs)} 个运行镜像。\n",
+            )
+            pull_errors = []
+            with SSHNode(target) as target_ssh:
+                for local_reference, registry_reference in registry_pairs:
+                    pull_code, pull_output = target_ssh.run(
+                        f"docker pull {shlex.quote(registry_reference)} && "
+                        f"docker tag {shlex.quote(registry_reference)} {shlex.quote(local_reference)} && "
+                        f"docker image inspect {shlex.quote(local_reference)} >/dev/null",
+                        timeout=1800,
+                    )
+                    if pull_code:
+                        pull_errors.append(
+                            f"{registry_reference}: {ANSI_RE.sub('', pull_output or '拉取校验失败')[-500:]}"
+                        )
+                        break
+                if not pull_errors:
+                    pulled_from_registry = True
+                    cleanup_refs = " ".join(shlex.quote(reference) for _, reference in registry_pairs)
+                    target_ssh.run(f"docker image rm {cleanup_refs} >/dev/null 2>&1 || true", timeout=120)
+                    log(
+                        deployment.id,
+                        "[镜像分发] 目标节点已从平台仓库拉取并校验全部镜像，无需打包上传。\n",
+                    )
+                else:
+                    log(
+                        deployment.id,
+                        "[镜像分发] 仓库拉取未通过，自动回退为打包传输："
+                        + "；".join(pull_errors) + "\n",
+                    )
+        if builder.id != target.id and not pulled_from_registry:
+            image_args = " ".join(shlex.quote(value) for value in images)
+            log(
+                deployment.id,
+                f"[镜像分发] 构建节点 {builder.name} 与部署节点 {target.name} 不同，"
+                "正在打包运行镜像；大镜像在此步骤可能需要数分钟。\n",
+            )
+            code, output = build_ssh.run(f"docker save {image_args} | gzip -1 > {shlex.quote(archive)}", timeout=1800)
+            if code:
+                raise RuntimeError("平台镜像打包失败：" + output[-1200:])
+            _, archive_size = build_ssh.run(
+                f"du -h {shlex.quote(archive)} 2>/dev/null | awk '{{print $1}}'",
+                timeout=30,
+            )
+            archive_size = archive_size.strip() or "未知大小"
+            log(deployment.id, f"[镜像分发] 打包完成（{archive_size}），正在下载到平台中转区。\n")
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as handle:
+                local_archive = handle.name
+            try:
+                build_ssh.download_file(archive, local_archive)
+                local_size_mb = max(1, round(Path(local_archive).stat().st_size / 1024 / 1024))
+                log(
+                    deployment.id,
+                    f"[镜像分发] 已下载 {local_size_mb} MiB，正在上传到部署节点 {target.name}。\n",
+                )
+                with SSHNode(target) as target_ssh:
+                    remote_archive = f"/tmp/yunzhou-images-{deployment.id}.tar.gz"
+                    target_ssh.upload_file(local_archive, remote_archive)
+                    log(deployment.id, "[镜像分发] 上传完成，正在导入目标节点 Docker 镜像库。\n")
                     code, output = target_ssh.run(f"gzip -dc {shlex.quote(remote_archive)} | docker load; rm -f {shlex.quote(remote_archive)}", timeout=1800)
                     if code:
                         raise RuntimeError("目标服务器导入平台镜像失败：" + output[-1200:])
+                    log(deployment.id, f"[镜像分发] 镜像已导入部署节点 {target.name}，即将启动应用。\n")
             finally:
                 Path(local_archive).unlink(missing_ok=True)
-                build_ssh.run(f"rm -f -- {shlex.quote(archive)}; rm -rf -- {shlex.quote(builder_dir)}")
+                # ``builder_dir`` is the live worker checkout on installations
+                # where the worker and build node share /data/yunzhou.  Removing
+                # it here deletes Compose/runtime files before the start stage.
+                # The execute() finally block owns workspace cleanup; image
+                # distribution only owns its temporary archive.
+                build_ssh.run(f"rm -f -- {shlex.quote(archive)}")
+        elif builder.id != target.id:
+            build_ssh.run(f"rm -f -- {shlex.quote(archive)}")
         else:
-            build_ssh.run(f"rm -rf -- {shlex.quote(builder_dir)}")
+            # Shared checkout; retained until execute() finishes.
+            pass
+        log(
+            deployment.id,
+            f"[构建通道] distribute|{distribution_label}|完成|{datetime.now(timezone.utc).isoformat()}\n",
+        )
     return builder
 
 
@@ -4865,7 +8074,7 @@ def cleanup_incomplete_release_images(
             # config-files label, remove those containers, then remove only
             # their platform-built images. Never touch another release that
             # shares the same Compose project label.
-            f"project_label={shlex.quote('com.docker.compose.project=yz-' + project.slug)}; "
+            f"project_label={shlex.quote('com.docker.compose.project=' + deployment_compose_project_name(deployment, project))}; "
             "owned_images=''; owned_containers=0; "
             "for cid in $(docker ps -aq --filter label=\"$project_label\"); do "
             "cfg=$(docker inspect -f '{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' \"$cid\" 2>/dev/null); "
@@ -4904,6 +8113,10 @@ def execute(deployment_id: str) -> None:
     work = None
     cleanup_root = None
     runtime_bundle = None
+    gateway_snapshot = None
+    gateway_switched = False
+    preempted_shared_containers: list[str] = []
+    verification_paths: list[str] = []
     with SessionLocal() as db:
         dep = db.get(Deployment, deployment_id)
         if not dep:
@@ -4915,8 +8128,19 @@ def execute(deployment_id: str) -> None:
         project = db.get(Project, dep.project_id)
         node = db.get(Node, dep.node_id)
         current_stage = "analyze"
+        def restore_preempted_runtime(reason: str) -> None:
+            if not preempted_shared_containers or not node:
+                return
+            with SSHNode(node) as restore_ssh:
+                container_ids = " ".join(shlex.quote(value) for value in preempted_shared_containers)
+                code, output = restore_ssh.run(f"docker start {container_ids}", timeout=120)
+            if code:
+                log(dep.id, f"[版本回退] 新版本{reason}，但旧应用容器恢复失败：{output[-800:]}\n")
+            else:
+                log(dep.id, f"[版本回退] 新版本{reason}，旧应用容器已恢复；固定卷未变更。\n")
+                preempted_shared_containers.clear()
         try:
-            log(dep.id, "[阶段开始] analyze\n")
+            log_stage(dep.id, "开始", "analyze")
             log(dep.id, "[准备] 正在获取项目源码...\n")
             ensure_active(dep.id)
             work, revision, cleanup_root, source_subpath = stage_source(project, db, dep.id)
@@ -4945,8 +8169,18 @@ def execute(deployment_id: str) -> None:
             for previous in previous_rows:
                 if previous.status == DeployStatus.success:
                     break
-                if previous.status == DeployStatus.failed and previous.error:
-                    failure_evidence.append(previous.error)
+                if previous.status == DeployStatus.failed:
+                    # The compact error column often contains only Docker's
+                    # final non-zero command.  The immediately preceding log
+                    # contains the actionable line (404, TLS issuer, missing
+                    # file, compiler error).  Feed both to deterministic
+                    # repair and AI analysis so a manual retry is not blind.
+                    detail = "\n".join(value for value in (
+                        previous.error or "",
+                        (previous.log_text or "")[-12_000:],
+                    ) if value)
+                    if detail:
+                        failure_evidence.append(detail)
             previous_error = "\n\n".join(failure_evidence)
             if source_subpath:
                 log(dep.id, f"[源码] 已定位仓库项目目录 /{source_subpath}\n")
@@ -4956,26 +8190,56 @@ def execute(deployment_id: str) -> None:
             dependency_analysis = analyze_runtime_dependencies(work)
             log(dep.id, "[依赖分析] " + json.dumps(dependency_analysis, ensure_ascii=False) + "\n")
             ai_plan = None
+            integration_changes: list[str] = []
+            repair_analysis = False
+            repair_plan_changed = False
             if project.build_type == "auto":
                 source_analysis = project.source_analysis or {}
                 saved_plan = source_analysis.get("deployment_plan")
                 analyzed_revision = str(source_analysis.get("revision") or "").strip()
                 current_revision = str(revision or "").strip()
+                repair_analysis = bool(previous_error and str(dep.trigger or "").startswith("ai_autofix_"))
                 if (
                     source_analysis.get("status") == "completed"
                     and isinstance(saved_plan, dict)
                     and saved_plan
                     and analyzed_revision
                     and analyzed_revision == current_revision
+                    and not repair_analysis
                 ):
                     ai_plan, integration_changes = adapt_plan_to_current_integrations(saved_plan, project)
                     log(dep.id, f"[方案] 已复用源码管理中的全量 AI 分析（版本 {current_revision[:12]}），无需重复分析。\n")
                     if integration_changes:
                         log(dep.id, "[方案] " + "；".join(integration_changes) + "。\n")
                 else:
-                    reason = "尚未保存完整 AI 方案" if not saved_plan else "源码版本已变化"
+                    if repair_analysis:
+                        reason = "上一轮部署失败，AI 正在根据真实错误生成修复方案"
+                    else:
+                        reason = "尚未保存完整 AI 方案" if not saved_plan else "源码版本已变化"
                     log(dep.id, f"[方案] {reason}，平台正在根据本次最新源码自动刷新部署方案，无需手动重新分析。\n")
-                    refreshed_plan = analyze_project_deployment(db, project, work)
+                    try:
+                        refreshed_plan = analyze_project_deployment(
+                            db,
+                            project,
+                            work,
+                            failure_context=previous_error if repair_analysis else "",
+                            previous_plan=saved_plan if repair_analysis and isinstance(saved_plan, dict) else None,
+                            # A repair already has a complete prior plan and
+                            # concrete failure evidence. It must not leave the
+                            # release stuck in “读取方案” for the full initial
+                            # repository-analysis timeout.
+                            timeout_seconds=90 if repair_analysis else 360,
+                        )
+                    except Exception as analysis_exc:
+                        if repair_analysis and isinstance(saved_plan, dict) and saved_plan:
+                            refreshed_plan = None
+                            log(
+                                dep.id,
+                                "[方案] AI 修复分析在 90 秒内未完成或暂不可用，"
+                                f"已复用上一版完整方案并继续执行平台确定性修复：{analysis_exc}\n",
+                            )
+                        else:
+                            raise
                     if not isinstance(refreshed_plan, dict) or not refreshed_plan:
                         if isinstance(saved_plan, dict) and saved_plan:
                             ai_plan, integration_changes = adapt_plan_to_current_integrations(saved_plan, project)
@@ -4983,6 +8247,11 @@ def execute(deployment_id: str) -> None:
                         else:
                             raise RuntimeError("平台未能根据最新源码生成部署方案，请稍后重试")
                     else:
+                        if repair_analysis and isinstance(saved_plan, dict):
+                            repair_plan_changed = (
+                                actionable_plan_fingerprint(refreshed_plan)
+                                != actionable_plan_fingerprint(saved_plan)
+                            )
                         ai_plan, integration_changes = adapt_plan_to_current_integrations(refreshed_plan, project)
                         refreshed_state = dict(source_analysis)
                         refreshed_state.update({
@@ -5043,6 +8312,28 @@ def execute(deployment_id: str) -> None:
             preflight_sources = optimize_staged_sources(work)
             repaired_files = apply_safe_build_repairs(work, previous_error, project.deployment_mode)
             preflight_changes = list(dict.fromkeys(preflight_sources + repaired_files))
+            if repaired_files:
+                repair_detail = "已修改发布副本中的 " + "、".join(repaired_files)
+                lowered_error = (previous_error or "").lower()
+                if "find" in lowered_error and "target" in lowered_error and "no such file or directory" in lowered_error:
+                    repair_detail += "；将 Maven 根目录 target 查找改为递归查找各模块 target，并选择实际可执行 JAR"
+                log(dep.id, "[修复变更] " + repair_detail + "。用户源码仓库未被修改。\n")
+            if repair_analysis:
+                repair_actions = []
+                if repair_plan_changed:
+                    repair_actions.append("AI 运行方案已发生有效变化")
+                if integration_changes:
+                    repair_actions.append("部署集成配置已重新协调")
+                if repaired_files:
+                    repair_actions.append("平台确定性修复已修改构建文件")
+                if not repair_actions:
+                    message = (
+                        "本轮分析没有产生可验证的运行方案、集成配置或构建文件变化；"
+                        "为避免重复消耗资源，平台已在构建前停止本次自动修复。"
+                    )
+                    log(dep.id, "[AI自动修复] " + message + "\n")
+                    raise RuntimeError("[自动修复暂停] " + message)
+                log(dep.id, "[AI自动修复] 构建前变化校验通过：" + "；".join(repair_actions) + "。\n")
             # Repairs may replace the final runtime stage (for example a
             # static-server assumption becomes the framework's real preview
             # server). Re-read EXPOSE from the final build artifact instead
@@ -5057,14 +8348,22 @@ def execute(deployment_id: str) -> None:
                 log(dep.id, "[识别] 发布前预检通过：软件源、锁文件和目标平台依赖未发现阻断项\n")
             access_path, access_path_evidence = infer_verified_access_path(work, ai_plan)
             log(dep.id, f"[访问路径] {access_path}（{access_path_evidence}）；将通过真实 HTTP 验证后记为成功经验。\n")
+            detected_frontend_routes = detect_frontend_api_routes(work)
+            verification_paths = [
+                str(route.get("path") or "")
+                for route in (detected_frontend_routes.get("routes") or [])
+                if isinstance(route, dict) and str(route.get("path") or "").startswith("/")
+            ]
+            if verification_paths:
+                log(dep.id, "[接口验证计划] 发布成功前必须核验：" + "、".join(dict.fromkeys(verification_paths)) + "\n")
             topology = analyze_repository_topology(work, build_type, build_file)
             log(dep.id, "[架构分析] " + json.dumps(topology, ensure_ascii=False) + "\n")
             ai_checkpoint(dep.id, "识别项目", json.dumps({"dependencies": dependency_analysis, "topology": topology}, ensure_ascii=False))
             if topology["errors"]:
                 raise RuntimeError("整仓库分析未通过：" + "；".join(topology["errors"]))
-            log(dep.id, "[阶段完成] analyze\n")
+            log_stage(dep.id, "完成", "analyze")
             current_stage = "prepare"
-            log(dep.id, "[阶段开始] prepare\n")
+            log_stage(dep.id, "开始", "prepare")
             if build_type == "compose":
                 managed_integrations = reconcile_managed_integrations(project, work, build_file)
                 if managed_integrations:
@@ -5074,7 +8373,35 @@ def execute(deployment_id: str) -> None:
                 if generated_secrets:
                     db.commit()
                     log(dep.id, "[配置生成] 平台已生成托管服务凭据：" + "、".join(generated_secrets) + "（可在项目配置中查看，值不写入发布日志）\n")
-                missing_variables = required_compose_variables(work, build_file, effective_project_environment(project))
+                effective_env = effective_project_environment(project)
+                integration_errors = external_integration_preflight(project, effective_env)
+                if integration_errors:
+                    evidence = "；".join(integration_errors)
+                    log(dep.id, "[外接服务预检] " + evidence + "\n")
+                    ai_checkpoint(dep.id, "配置预检", evidence)
+                    raise RuntimeError("[需要配置] " + evidence)
+                external_values = environment_values(decrypt(project.env_text_encrypted) or "")
+                if external_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() == "external":
+                    external_host = external_values.get("YUNZHOU_MYSQL_HOST", "").strip()
+                    external_port = external_values.get("YUNZHOU_MYSQL_PORT", "").strip()
+                    with SSHNode(node) as preflight_ssh:
+                        reach_code, reach_output = preflight_ssh.run(
+                            "timeout 8 bash -c " + shlex.quote(
+                                f"exec 3<>/dev/tcp/{external_host}/{external_port}"
+                            ), timeout=15,
+                        )
+                    if reach_code:
+                        evidence = f"外接 MySQL {external_host}:{external_port} 无法从部署服务器连接"
+                        log(dep.id, "[外接数据库预检] " + evidence + "；已在构建前停止，未创建错误版本。\n")
+                        ai_checkpoint(dep.id, "配置预检", evidence)
+                        raise RuntimeError("[需要配置] " + evidence + "。请检查地址、防火墙和数据库监听范围")
+                    log(
+                        dep.id,
+                        "[外接数据库] 已采用项目保存的 MySQL 配置："
+                        f"{external_values.get('YUNZHOU_MYSQL_HOST')}:{external_values.get('YUNZHOU_MYSQL_PORT')}"
+                        f"/{external_values.get('YUNZHOU_MYSQL_DATABASE')}；不会创建项目内置 MySQL。\n",
+                    )
+                missing_variables = required_compose_variables(work, build_file, effective_env)
                 if missing_variables:
                     evidence = json.dumps({"missing_variables": missing_variables, "compose_file": build_file}, ensure_ascii=False)
                     log(dep.id, "[配置预检] AI 已在构建前发现 Compose 必填配置缺失：" + evidence + "\n")
@@ -5099,16 +8426,22 @@ def execute(deployment_id: str) -> None:
             while release in releases_in_minute:
                 release = f"{release_base}-{sequence:02d}"
                 sequence += 1
+            runtime_policy = db.get(DeploymentSettings, "default")
+            runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
+            compose_project = compose_project_name(project.slug, release, runtime_namespace)
             remote_dir = f"{node.work_dir.rstrip('/')}/{project_directory(project)}/{release}"
             if build_type == "dockerfile":
-                container_name = _service_container_name(project.slug, "app", 1)
+                container_name = _service_container_name(project.slug, "app", 1, release, runtime_namespace)
             else:
                 # Compose services receive their own stable service-aware name
                 # in the generated override below.  This placeholder is never
                 # used as a physical Compose container name.
-                container_name = f"yz-{project.slug}"
+                container_name = compose_project
             image_name = f"yunzhou/{project.slug}:{release}"
-            host_port = choose_node_port(db, node, dep.host_port or project.host_port)
+            host_port = choose_node_port(
+                db, node, dep.host_port or project.host_port,
+                exclude_deployment_id=dep.id,
+            )
             # The final generated/selected Dockerfile is the source of truth.
             # A value saved by an older analysis (commonly the default 80)
             # must not override a newly detected EXPOSE such as Vite's 4300.
@@ -5123,14 +8456,63 @@ def execute(deployment_id: str) -> None:
             log(dep.id, f"[源码] 版本 {revision}，发布目录 {remote_dir}\n")
 
             compose_override = None
+            compose_split = None
+            exclusive_app_volume_names: list[str] = []
             built_images = []
             target_platform = node_platform(node)
             if build_type == "compose":
                 compose_override, built_images = prepare_compose_image_override(
                     work, build_file, project, release, target_platform, node,
                     db=db, primary_host_port=host_port, deployment_plan=ai_plan,
+                    deployment_id=dep.id,
                 )
-            runtime_bundle = prepare_runtime_bundle(work, build_type, build_file, compose_override)
+                # Image packaging creates a late Compose override. Apply the
+                # integration contract again at this final materialization
+                # boundary so an override can never reintroduce an internal
+                # MySQL service or omit a source-required managed Redis after
+                # the user's external/managed choice was already resolved.
+                final_integration_changes = reconcile_managed_integrations(project, work, build_file)
+                if compose_override:
+                    final_integration_changes.extend(
+                        reconcile_managed_integrations(project, work, compose_override)
+                    )
+                if final_integration_changes:
+                    db.commit()
+                    log(
+                        dep.id,
+                        "[最终配置裁决] "
+                        + "、".join(dict.fromkeys(final_integration_changes))
+                        + "；已在封装后重新核对。\n",
+                    )
+                compose_split = split_compose_runtime(
+                    work, build_file, project, runtime_namespace, compose_override,
+                )
+                if compose_split:
+                    log(
+                        dep.id,
+                        "[服务拆分] 项目级数据服务："
+                        + "、".join(compose_split["data_services"])
+                        + "；本次版本应用服务："
+                        + "、".join(compose_split["app_services"])
+                        + "。数据库和数据卷不会随应用版本重建。\n",
+                    )
+                app_override_name = (
+                    compose_split.get("app_override_file") if compose_split else compose_override
+                )
+                if app_override_name:
+                    app_override_document = yaml.safe_load(
+                        (Path(work) / app_override_name).read_text(encoding="utf-8", errors="ignore")
+                    ) or {}
+                    for config in (app_override_document.get("volumes") or {}).values():
+                        if isinstance(config, dict) and config.get("name"):
+                            exclusive_app_volume_names.append(str(config["name"]))
+            runtime_bundle = prepare_runtime_bundle(
+                work, build_type, build_file, compose_override,
+                [
+                    compose_split["data_file"], compose_split["app_file"],
+                    *([compose_split["app_override_file"]] if compose_split.get("app_override_file") else []),
+                ] if compose_split else None,
+            )
             readme = (
                 "自助发布平台部署目录说明\n"
                 "====================\n\n"
@@ -5154,9 +8536,9 @@ def execute(deployment_id: str) -> None:
             def build_stream(text):
                 log(dep.id, text)
                 ensure_active(dep.id)
-            log(dep.id, "[阶段完成] prepare\n")
+            log_stage(dep.id, "完成", "prepare")
             current_stage = "build"
-            log(dep.id, "[阶段开始] build\n")
+            log_stage(dep.id, "开始", "build")
             log(dep.id, "[平台构建] 源码只在平台构建服务器编译，目标服务器将接收构建后的镜像与运行配置。\n")
             ai_checkpoint(dep.id, "平台统一构建", f"正在平台构建服务器生成版本 {release} 镜像")
             builder = central_build_and_distribute(
@@ -5164,10 +8546,25 @@ def execute(deployment_id: str) -> None:
                 image_name if build_type == "dockerfile" else None,
                 compose_override, built_images, target_platform, build_stream,
             )
+            # Packaging may replace AI multi-stage Dockerfiles with
+            # runtime-only files and update Compose build entries. Recreate
+            # the upload bundle after those final transformations so the
+            # release directory and "发布文件" view match what was actually
+            # built, rather than the pre-build draft.
+            if runtime_bundle:
+                shutil.rmtree(runtime_bundle, ignore_errors=True)
+            runtime_bundle = prepare_runtime_bundle(
+                work, build_type, build_file, compose_override,
+                [
+                    compose_split["data_file"], compose_split["app_file"],
+                    *([compose_split["app_override_file"]] if compose_split.get("app_override_file") else []),
+                ] if compose_split else None,
+            )
+            (Path(runtime_bundle) / "README-部署说明.txt").write_text(readme, encoding="utf-8")
             log(dep.id, f"[平台构建] 镜像构建完成：{builder.name}；目标节点只负责加载并启动。\n")
-            log(dep.id, "[阶段完成] build\n")
+            log_stage(dep.id, "完成", "build")
             current_stage = "start"
-            log(dep.id, "[阶段开始] start\n")
+            log_stage(dep.id, "开始", "start")
 
             with SSHNode(node) as ssh:
                 log(dep.id, f"[上传] 正在上传 Compose 与运行配置到 {remote_dir}...\n")
@@ -5179,8 +8576,18 @@ def execute(deployment_id: str) -> None:
                     ensure_active(dep.id)
                 ensure_active(dep.id)
                 if build_type == "compose":
-                    compose_files = f"-f {shlex.quote(build_file)}" + (f" -f {shlex.quote(compose_override)}" if compose_override else "")
+                    compose_files = "--env-file .env " + (
+                        f"-f {shlex.quote(compose_split['app_file'])}"
+                        if compose_split else f"-f {shlex.quote(build_file)}"
+                    ) + (
+                        f" -f {shlex.quote(compose_split['app_override_file'])}"
+                        if compose_split and compose_split.get("app_override_file")
+                        else (f" -f {shlex.quote(compose_override)}" if compose_override else "")
+                    )
                     env_text = effective_project_environment(project)
+                    integration_errors = external_integration_preflight(project, env_text)
+                    if integration_errors:
+                        raise RuntimeError("[需要配置] " + "；".join(integration_errors))
                     secret_seed = f"{settings.app_secret}:{project.id}".encode()
                     db_password = hashlib.sha256(secret_seed + b":mysql").hexdigest()[:28]
                     root_password = hashlib.sha256(secret_seed + b":mysql-root").hexdigest()[:32]
@@ -5195,7 +8602,7 @@ def execute(deployment_id: str) -> None:
                         log(dep.id, "[配置] 已保存平台托管连接信息，可在项目配置中查看\n")
                     env_text = effective_project_environment(project)
                     compose_env = (
-                        f"COMPOSE_PROJECT_NAME=yz-{project.slug}\n"
+                        f"COMPOSE_PROJECT_NAME={compose_project}\n"
                         f"YUNZHOU_HOST_PORT={host_port}\n"
                         f"CRM_DB_PASSWORD={db_password}\n"
                         f"CRM_DB_ROOT_PASSWORD={root_password}\n"
@@ -5205,19 +8612,243 @@ def execute(deployment_id: str) -> None:
                     code, out = ssh.run(f"printf %s {shlex.quote(compose_env)} > {shlex.quote(remote_dir + '/.env')}")
                     if code:
                         raise RuntimeError(out)
+                    # Check the generated file itself before any data service is
+                    # touched. This catches ordering/interpolation regressions
+                    # without exposing credentials in logs.
+                    required_external = []
+                    external_values = environment_values(decrypt(project.env_text_encrypted) or "")
+                    if external_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() == "external":
+                        required_external.extend([
+                            "YUNZHOU_MYSQL_HOST", "YUNZHOU_MYSQL_PORT",
+                            "YUNZHOU_MYSQL_DATABASE", "YUNZHOU_MYSQL_USERNAME",
+                            "YUNZHOU_MYSQL_PASSWORD",
+                        ])
+                    if required_external:
+                        checks = " && ".join(
+                            "grep -q " + shlex.quote("^" + key + "=.") + " "
+                            + shlex.quote(remote_dir + "/.env")
+                            for key in required_external
+                        )
+                        check_code, _ = ssh.run(checks)
+                        if check_code:
+                            raise RuntimeError("[平台配置错误] 外接数据库配置未完整写入发布环境，平台已在启动前停止")
+                        log(dep.id, "[外接数据库] 保存配置已完整注入本次发布环境。\n")
+                    if compose_split:
+                        data_project = compose_split["data_project"]
+                        data_file = compose_split["data_file"]
+                        data_args = f"--env-file .env -f {shlex.quote(data_file)}"
+                        check_cmd = (
+                            f"cd {shlex.quote(remote_dir)} && "
+                            f"docker compose -p {shlex.quote(data_project)} {data_args} ps -q"
+                        )
+                        _, data_ids = ssh.run(check_cmd)
+                        if not data_ids.strip():
+                            # One-time migration from historical release-level
+                            # data containers. Stop only containers that mount
+                            # the protected project volumes; never remove the
+                            # volumes themselves.
+                            volume_filters = " ".join(
+                                f"--filter {shlex.quote('volume=' + name)}"
+                                for name in compose_split["volume_names"]
+                            )
+                            if volume_filters:
+                                _, legacy_data = ssh.run(
+                                    f"docker ps -q {volume_filters} | sort -u"
+                                )
+                                if legacy_data.strip():
+                                    log(dep.id, "[数据服务迁移] 正在停止旧版本中的数据容器；固定数据卷保持不变。\n")
+                                    stop_ids = " ".join(shlex.quote(value) for value in legacy_data.split())
+                                    stop_code, stop_out = ssh.run(f"docker stop {stop_ids}", timeout=120)
+                                    if stop_code:
+                                        raise RuntimeError("释放旧数据容器失败：" + stop_out[-800:])
+                            log(dep.id, "[数据服务] 首次建立项目级固定数据服务和内部网络。\n")
+                            data_pull = (
+                                f"cd {shlex.quote(remote_dir)} && "
+                                f"docker compose --progress plain -p {shlex.quote(data_project)} {data_args} pull"
+                            )
+                            pull_code, pull_out = tracked_run(ssh, dep.id, data_pull, stream=append, timeout=900)
+                            if pull_code:
+                                raise RuntimeError("项目级数据服务镜像拉取失败：" + pull_out[-1200:])
+                            data_up = (
+                                f"cd {shlex.quote(remote_dir)} && "
+                                f"docker compose --progress plain -p {shlex.quote(data_project)} {data_args} up -d --no-build"
+                            )
+                            up_code, up_out = tracked_run(ssh, dep.id, data_up, stream=append, timeout=300)
+                            if up_code:
+                                raise RuntimeError("项目级数据服务启动失败：" + up_out[-1200:])
+                        else:
+                            # A release switch must never restart a healthy
+                            # project database merely because Compose rewrote
+                            # harmless metadata or labels. Reuse the stable
+                            # data stack as-is; reconcile only when a container
+                            # is missing, stopped or explicitly unhealthy.
+                            healthy_data_probe = (
+                                f"ids=$(docker ps -aq --filter label=com.docker.compose.project={shlex.quote(data_project)}); "
+                                "[ -n \"$ids\" ] || exit 1; "
+                                "for id in $ids; do "
+                                "state=$(docker inspect -f '{{.State.Status}}' $id 2>/dev/null); "
+                                "health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' $id 2>/dev/null); "
+                                "[ \"$state\" = running ] || exit 1; "
+                                "[ \"$health\" != unhealthy ] || exit 1; "
+                                "done"
+                            )
+                            healthy_code, _ = ssh.run(healthy_data_probe, timeout=30)
+                            if healthy_code == 0:
+                                log(dep.id, "[数据服务] 已复用健康的项目固定数据服务，本次版本切换不重建数据库或数据卷。\n")
+                            else:
+                                reconcile_data = (
+                                    f"cd {shlex.quote(remote_dir)} && "
+                                    f"docker compose --progress plain -p {shlex.quote(data_project)} "
+                                    f"{data_args} up -d --no-build"
+                                )
+                                reconcile_code, reconcile_out = tracked_run(
+                                    ssh, dep.id, reconcile_data, stream=append, timeout=300
+                                )
+                                if reconcile_code:
+                                    raise RuntimeError("项目级数据服务配置校验失败：" + reconcile_out[-1200:])
+                            log(dep.id, "[数据服务] 已核对项目级固定服务配置；配置有变化时仅重建容器，数据卷保持不变。\n")
+                        data_health = (
+                            f"cd {shlex.quote(remote_dir)} && ok=0; "
+                            "for i in $(seq 1 60); do bad=0; "
+                            f"ids=$(docker compose -p {shlex.quote(data_project)} {data_args} ps -q); "
+                            "[ -n \"$ids\" ] || bad=1; for id in $ids; do "
+                            "state=$(docker inspect -f '{{.State.Status}}' $id 2>/dev/null); "
+                            "health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $id 2>/dev/null); "
+                            "[ \"$state\" = running ] || bad=1; "
+                            "[ \"$health\" = none ] || [ \"$health\" = healthy ] || bad=1; done; "
+                            "[ \"$bad\" -eq 0 ] && { ok=1; break; }; sleep 2; done; "
+                            "[ \"$ok\" -eq 1 ]"
+                        )
+                        log(dep.id, "[数据服务检查] 正在核验项目级 MySQL/Redis 的运行状态、健康检查与托管凭据。\n")
+                        health_code, health_out = ssh.run(data_health, timeout=150)
+                        if health_code:
+                            diagnostics_cmd = (
+                                f"cd {shlex.quote(remote_dir)} && "
+                                f"docker compose -p {shlex.quote(data_project)} {data_args} ps -a 2>&1; "
+                                f"ids=$(docker compose -p {shlex.quote(data_project)} {data_args} ps -aq); "
+                                "for id in $ids; do "
+                                "printf '\n--- %s ---\n' \"$(docker inspect -f '{{.Name}} image={{.Config.Image}} state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $id 2>/dev/null)\"; "
+                                "docker inspect -f '{{if .State.Health}}{{json .State.Health.Log}}{{end}}' $id 2>/dev/null; "
+                                "docker logs --tail 100 $id 2>&1; done"
+                            )
+                            _, diagnostics = ssh.run(diagnostics_cmd, timeout=90)
+                            clean_diagnostics = ANSI_RE.sub("", diagnostics or health_out or "").strip()
+                            postgres_seccomp_error = (
+                                re.search(r'postmaster\.pid.*Operation not permitted', clean_diagnostics, re.I | re.S)
+                                and re.search(r'pg_wal/xlogtemp\.\d+.*Operation not permitted', clean_diagnostics, re.I | re.S)
+                            )
+                            repaired_services: list[str] = []
+                            if postgres_seccomp_error:
+                                for service in compose_split["data_services"]:
+                                    service_ids_cmd = (
+                                        f"cd {shlex.quote(remote_dir)} && "
+                                        f"docker compose -p {shlex.quote(data_project)} {data_args} "
+                                        f"ps -aq {shlex.quote(service)}"
+                                    )
+                                    _, service_ids = ssh.run(service_ids_cmd, timeout=30)
+                                    for service_id in service_ids.split():
+                                        _, service_image = ssh.run(
+                                            f"docker inspect -f '{{{{.Config.Image}}}}' {shlex.quote(service_id)} 2>/dev/null",
+                                            timeout=20,
+                                        )
+                                        if re.search(r'(^|/)postgres(?::|@|$)', service_image.strip(), re.I):
+                                            repaired_services.append(service)
+                                            break
+                            if repaired_services:
+                                compat_file = ".yunzhou.data.compat.yml"
+                                compat_text = yaml.safe_dump(
+                                    {
+                                        "services": {
+                                            service: {"security_opt": ["seccomp:unconfined"]}
+                                            for service in sorted(set(repaired_services))
+                                        }
+                                    },
+                                    allow_unicode=True,
+                                    sort_keys=False,
+                                )
+                                compat_path = remote_dir + "/" + compat_file
+                                compat_code, compat_out = ssh.run(
+                                    f"printf %s {shlex.quote(compat_text)} > {shlex.quote(compat_path)}",
+                                    timeout=30,
+                                )
+                                if compat_code:
+                                    raise RuntimeError("写入 PostgreSQL 兼容配置失败：" + compat_out[-800:])
+                                log(
+                                    dep.id,
+                                    "[数据服务自动修复] 已识别目标内核的 PostgreSQL seccomp 兼容故障，"
+                                    "仅重建受影响的数据库容器；数据卷保持不变。\n",
+                                )
+                                compat_args = f"{data_args} -f {shlex.quote(compat_file)}"
+                                repair_services = " ".join(
+                                    shlex.quote(value) for value in sorted(set(repaired_services))
+                                )
+                                repair_cmd = (
+                                    f"cd {shlex.quote(remote_dir)} && "
+                                    f"docker compose --progress plain -p {shlex.quote(data_project)} "
+                                    f"{compat_args} up -d --no-build --force-recreate {repair_services}"
+                                )
+                                repair_code, repair_out = tracked_run(
+                                    ssh,
+                                    dep.id,
+                                    repair_cmd,
+                                    stream=append,
+                                    timeout=300,
+                                )
+                                if repair_code:
+                                    raise RuntimeError(
+                                        "PostgreSQL seccomp 兼容修复失败：" + ANSI_RE.sub("", repair_out)[-1200:]
+                                    )
+                                health_code, health_out = ssh.run(data_health, timeout=150)
+                                if not health_code:
+                                    log(dep.id, "[数据服务自动修复] PostgreSQL 已恢复健康。\n")
+                            if health_code:
+                                _, diagnostics = ssh.run(diagnostics_cmd, timeout=90)
+                                clean_diagnostics = ANSI_RE.sub(
+                                    "", diagnostics or health_out or "未获得容器状态与日志"
+                                ).strip()
+                                raise RuntimeError("项目级数据服务未就绪：\n" + clean_diagnostics[-4000:])
+                        # Older releases may have left a release-scoped MySQL/Redis
+                        # container mounted on the same persistent volume.  Once the
+                        # stable data project is healthy, remove only those duplicate
+                        # data-service containers.  Application containers and the
+                        # persistent volumes themselves are never touched.
+                        volume_filters = " ".join(
+                            f"--filter {shlex.quote('volume=' + name)}"
+                            for name in compose_split["volume_names"]
+                        )
+                        data_service_words = " " + " ".join(compose_split["data_services"]) + " "
+                        if volume_filters and compose_split["data_services"]:
+                            stale_data_cmd = (
+                                f"for cid in $(docker ps -q {volume_filters} | sort -u); do "
+                                "owner=$(docker inspect -f '{{index .Config.Labels \"com.docker.compose.project\"}}' \"$cid\" 2>/dev/null); "
+                                "service=$(docker inspect -f '{{index .Config.Labels \"com.docker.compose.service\"}}' \"$cid\" 2>/dev/null); "
+                                f"[ \"$owner\" = {shlex.quote(data_project)} ] && continue; "
+                                f"case {shlex.quote(data_service_words)} in *\" $service \"*) printf '%s\\n' \"$cid\" ;; esac; "
+                                "done"
+                            )
+                            stale_code, stale_output = ssh.run(stale_data_cmd, timeout=30)
+                            if stale_code:
+                                raise RuntimeError("旧数据容器检查失败：" + stale_output[-800:])
+                            stale_ids = [value for value in stale_output.split() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
+                            if stale_ids:
+                                log(dep.id, "[数据服务清理] 发现旧版本数据容器，正在移除重复实例；固定数据卷保持不变。\n")
+                                stale_words = " ".join(shlex.quote(value) for value in stale_ids)
+                                stale_code, stale_output = ssh.run(
+                                    f"docker stop -t 20 {stale_words} && docker rm {stale_words}",
+                                    timeout=max(60, 40 * len(stale_ids)),
+                                )
+                                if stale_code:
+                                    raise RuntimeError("旧数据容器清理失败：" + stale_output[-800:])
                     compose_images = compose_pull_images(work, build_file)
                     log(dep.id, f"[镜像] Compose 共识别到 {len(compose_images)} 个服务镜像\n")
-                    log(dep.id, "[镜像] 统一交由目标服务器 Docker 拉取；镜像源与代理使用该服务器 daemon.json 和 systemd 配置\n")
-                    ai_checkpoint(dep.id, "拉取服务镜像", "已识别镜像：" + ", ".join(compose_images))
-                    if compose_images:
-                        pull_cmd = (
-                            f"cd {shlex.quote(remote_dir)} && "
-                            f"docker compose -p {shlex.quote('yz-' + project.slug)} "
-                            f"{compose_files} pull --ignore-buildable"
-                        )
-                        pull_code, pull_out = tracked_run(ssh, dep.id, pull_cmd, stream=append, timeout=900)
-                        if pull_code:
-                            raise RuntimeError("Docker Compose 拉取服务镜像失败：" + pull_out[-1200:])
+                    # Platform-built application images were already pulled
+                    # from the private registry and verified by digest during
+                    # distribution.  A second plain `compose pull` interprets
+                    # their short local tags as Docker Hub repositories and
+                    # fails with access denied.  Let `up --pull missing` reuse
+                    # verified local images while still fetching any genuine
+                    # third-party runtime image that is not present locally.
+                    log(dep.id, "[镜像] 平台版本镜像已在分发阶段拉取并校验；启动时仅补齐本地缺失的第三方镜像。\n")
                     # Older single-container releases used the exact
                     # `yz-<slug>` name. A later Compose deployment uses
                     # `yz-<slug>-<service>-1`; leaving the legacy container
@@ -5232,21 +8863,65 @@ def execute(deployment_id: str) -> None:
                     if legacy_state.strip():
                         log(dep.id, f"[迁移清理] 已识别旧版直启容器：{legacy_state.strip()}\n")
                         ssh.run(f"docker rm -f {shlex.quote(legacy_container)} >/dev/null 2>&1 || true")
+                    # A project-level application volume may contain an
+                    # exclusive process lock (for example an embedded agent
+                    # runtime). Two blue/green releases cannot safely mount
+                    # and run that same state simultaneously. Stop only the
+                    # previous containers that actually mount these
+                    # project-namespaced application volumes; database
+                    # volumes were split out above and are never touched.
+                    if exclusive_app_volume_names:
+                        # Stable application volumes are declared external so
+                        # every release attaches the same Docker object without
+                        # Compose ownership warnings. Create it once before the
+                        # first release; `docker volume create` is idempotent.
+                        for stable_volume in sorted(set(exclusive_app_volume_names)):
+                            volume_code, volume_out = ssh.run(
+                                f"docker volume inspect {shlex.quote(stable_volume)} >/dev/null 2>&1 || "
+                                f"docker volume create {shlex.quote(stable_volume)}",
+                                timeout=30,
+                            )
+                            if volume_code:
+                                raise RuntimeError("创建项目固定卷失败：" + volume_out[-800:])
+                        volume_filters = " ".join(
+                            f"--filter {shlex.quote('volume=' + name)}"
+                            for name in sorted(set(exclusive_app_volume_names))
+                        )
+                        _, shared_ids = ssh.run(f"docker ps -q {volume_filters} | sort -u")
+                        preempted_shared_containers = [value for value in shared_ids.split() if value]
+                        if preempted_shared_containers:
+                            log(dep.id, "[版本切换] 应用固定卷包含独占运行状态，先暂停旧应用容器；固定卷和数据容器保持不变。\n")
+                            stop_ids = " ".join(shlex.quote(value) for value in preempted_shared_containers)
+                            stop_code, stop_out = ssh.run(f"docker stop {stop_ids}", timeout=120)
+                            if stop_code:
+                                raise RuntimeError("暂停旧应用容器失败：" + stop_out[-1000:])
                     cmd = (
                         f"cd {shlex.quote(remote_dir)} && "
-                        f"docker compose -p {shlex.quote('yz-' + project.slug)} {compose_files} up -d --no-build --remove-orphans"
+                        f"docker compose --progress plain -p {shlex.quote(compose_project)} {compose_files} "
+                        "up -d --no-build --pull missing --remove-orphans"
                     )
                     log(dep.id, "[启动] 使用平台构建镜像启动 Docker Compose...\n")
                     ai_checkpoint(dep.id, "启动应用服务", f"Compose 文件 {build_file}，使用平台构建镜像启动完整服务拓扑")
                     code, out = tracked_run(ssh, dep.id, cmd, stream=append)
+                    if code and "could not find an available, non-overlapping IPv4 address pool" in out:
+                        # Long-running CentOS 7.6 nodes can exhaust Docker's
+                        # default bridge subnets after many release-scoped
+                        # Compose networks. Prune only networks unused by any
+                        # container, then retry this exact start once.
+                        log(dep.id, "[网络自愈] Docker 默认地址池已满，正在回收未被任何容器使用的遗留网络后重试。\n")
+                        prune_code, prune_out = ssh.run("docker network prune -f", timeout=120)
+                        append("[\u7f51\u7edc\u81ea\u6108] " + (prune_out or "\u672a\u53d1\u73b0\u53ef\u56de\u6536\u7f51\u7edc") + "\n")
+                        if prune_code == 0:
+                            code, retry_out = tracked_run(ssh, dep.id, cmd, stream=append)
+                            out = out + "\n[\u7f51\u7edc\u81ea\u6108\u91cd\u8bd5]\n" + retry_out
                     if code:
                         diagnostic_cmd = (
                             f"cd {shlex.quote(remote_dir)} && "
-                            f"docker compose -p {shlex.quote('yz-' + project.slug)} {compose_files} ps -a; "
+                            f"docker compose -p {shlex.quote(compose_project)} {compose_files} ps -a; "
                             "echo '--- 服务日志 ---'; "
-                            f"docker compose -p {shlex.quote('yz-' + project.slug)} {compose_files} logs --no-color --tail 200; "
+                            f"docker compose -p {shlex.quote(compose_project)} {compose_files} logs --no-color --tail 200; "
                             "echo '--- 健康检查 ---'; "
-                            f"for id in $(docker compose -p {shlex.quote('yz-' + project.slug)} {compose_files} ps -aq); do "
+                            f"for id in $(docker compose -p {shlex.quote(compose_project)} {compose_files} ps -aq); do "
                             "name=$(docker inspect -f '{{.Name}}' $id 2>/dev/null | sed 's#^/##'); "
                             "health=$(docker inspect -f '{{if .State.Health}}{{json .State.Health.Log}}{{end}}' $id 2>/dev/null); "
                             "[ -n \"$health\" ] && printf '\n[%s]\n%s\n' \"$name\" \"$health\"; done"
@@ -5256,46 +8931,52 @@ def execute(deployment_id: str) -> None:
                         log(dep.id, "[AI学习] 本次诊断证据将用于修复重试；未通过真实部署验证前不会记为成功经验。\n")
                         raise RuntimeError((out + "\n" + diagnostic)[-24000:])
                     ensure_active(dep.id)
-                    code, ps = ssh.run(f"cd {shlex.quote(remote_dir)} && docker compose -p {shlex.quote('yz-' + project.slug)} {compose_files} ps --format json")
+                    code, ps = ssh.run(f"cd {shlex.quote(remote_dir)} && docker compose -p {shlex.quote(compose_project)} {compose_files} ps --format json")
                     append("\n[检查] 正在检查 Compose 服务状态...\n" + ps + "\n")
                     ai_checkpoint(dep.id, "启动全部服务", ps)
                     if build_file.startswith(".yunzhou"):
                         readiness_path = access_path if str(access_path).startswith("/") else "/"
                         backend_probe_url = shlex.quote("http://backend:8080" + readiness_path)
                         verify_cmd = (
-                            f"cd {shlex.quote(remote_dir)} && expected=$(docker compose -p {shlex.quote('yz-' + project.slug)} {compose_files} config --services | wc -l); "
-                            "ok=0; for i in $(seq 1 40); do running=$(docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " ps --status running --services | wc -l); "
+                            f"cd {shlex.quote(remote_dir)} && expected=$(docker compose -p {shlex.quote(compose_project)} {compose_files} config --services | wc -l); "
+                            "ok=0; for i in $(seq 1 40); do running=$(docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " ps --status running --services | wc -l); "
                             "[ \"$running\" -eq \"$expected\" ] && ok=1 && break; sleep 3; done; "
-                            "[ \"$ok\" -eq 1 ] || { docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " ps; docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " logs --tail 120; exit 44; }; "
-                            "services=$(docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " config --services); "
+                            "[ \"$ok\" -eq 1 ] || { docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " ps; docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " logs --tail 120; exit 44; }; "
+                            "services=$(docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " config --services); "
                             "if printf '%s\\n' \"$services\" | grep -qx frontend && printf '%s\\n' \"$services\" | grep -qx backend; then "
                             # Do not assume Spring Actuator exists. Probe the
                             # concrete source-derived endpoint and treat any
                             # non-5xx HTTP response as application readiness.
-                            "api=0; for i in $(seq 1 40); do reply=$(docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " exec -T frontend wget -S -O /dev/null " + backend_probe_url + " 2>&1 || true); "
+                            "api=0; for i in $(seq 1 80); do reply=$(docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " exec -T frontend wget -S -O /dev/null http://backend:8080/ 2>&1 || true); "
                             "printf '%s\\n' \"$reply\" | grep -Eq 'HTTP/[0-9.]+ [234][0-9][0-9]' && api=1 && break; sleep 3; done; "
-                            "[ \"$api\" -eq 1 ] || { docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " logs --tail 120 backend; exit 45; }; fi; "
+                            "[ \"$api\" -eq 1 ] || { docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " logs --tail 120 backend; exit 45; }; fi; "
                             # Service names are arbitrary, so also verify every
                             # container in the generated topology. A container
                             # that keeps restarting can briefly appear running
                             # and must never make the deployment look healthy.
-                            # Health checks commonly remain `starting` for tens
-                            # of seconds. Wait up to 90 seconds; fail early only
-                            # for an exited/restarting/unhealthy container.
-                            "stable=0; unstable=0; for attempt in $(seq 1 30); do unstable=0; pending=0; ids=$(docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " ps -aq); "
+                            # A valid service should become healthy promptly.
+                            # Do not hide dependency/configuration failures by
+                            # waiting for several minutes; the diagnostic logs
+                            # below must expose the real startup error.
+                            "stable=0; unstable=0; pending=0; for attempt in $(seq 1 10); do unstable=0; pending=0; ids=$(docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " ps -aq); "
                             "for id in $ids; do state=$(docker inspect -f '{{.State.Status}}' $id 2>/dev/null); restarts=$(docker inspect -f '{{.RestartCount}}' $id 2>/dev/null); health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' $id 2>/dev/null); "
                             "[ \"$state\" = running ] || unstable=1; [ \"${restarts:-0}\" -eq 0 ] || unstable=1; [ \"$health\" = unhealthy ] && unstable=1; [ \"$health\" = starting ] && pending=1; done; "
                             "[ \"$unstable\" -eq 0 ] || break; [ \"$pending\" -eq 0 ] && stable=1 && break; sleep 3; done; "
-                            "[ \"$stable\" -eq 1 ] || { echo '发现服务退出、反复重启、健康检查异常或等待健康超时'; docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " ps -a; docker compose -p " + shlex.quote('yz-' + project.slug) + " " + compose_files + " logs --tail 160; exit 46; }"
+                            "[ \"$unstable\" -eq 0 ] || { echo '发现服务退出、反复重启或健康检查明确失败'; docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " ps -a; docker compose -p " + shlex.quote(compose_project) + " " + compose_files + " logs --tail 160; exit 46; }; "
+                            "[ \"$pending\" -eq 0 ] || echo '健康检查仍在预热，继续使用真实 HTTP 访问验证'"
                         )
-                        verify_code, verify_output = ssh.run(verify_cmd, timeout=150)
+                        # Container presence and backend connectivity remain
+                        # strict. A merely `starting` healthcheck gets a short
+                        # grace period, then the public HTTP probe below is the
+                        # authoritative readiness result.
+                        verify_code, verify_output = ssh.run(verify_cmd, timeout=480)
                         append("[检查] 前端、后端和数据库联合检查" + ("通过\n" if verify_code == 0 else "失败\n" + verify_output + "\n"))
                         if verify_code:
                             raise RuntimeError("多服务启动后联合检查未通过：" + verify_output)
                         # The previous mistaken single-container release is
                         # removed only after the replacement topology started.
                         ssh.run(f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true")
-                    container_name = f"yz-{project.slug}"
+                    container_name = compose_project
                     # Compose may declare a fixed published port and ignore the
                     # platform's suggested YUNZHOU_HOST_PORT. Docker is the
                     # final source of truth for every service route, not just
@@ -5325,6 +9006,33 @@ def execute(deployment_id: str) -> None:
                             service: list(dict.fromkeys(targets))
                             for service, targets in service_targets.items() if targets
                         }
+                        # Docker is authoritative after Compose starts. Persist
+                        # every actually published service port, including
+                        # ports declared by source Compose that did not pass
+                        # through the platform's pre-build allocator.
+                        for service_name, targets in service_targets.items():
+                            for _host, service_port in targets:
+                                reservation = db.scalar(select(DeploymentPortReservation).where(
+                                    DeploymentPortReservation.node_id == node.id,
+                                    DeploymentPortReservation.host_port == service_port,
+                                ))
+                                if reservation:
+                                    reservation.deployment_id = dep.id
+                                    reservation.service_name = service_name
+                                    reservation.status = "active"
+                                    reservation.created_at = datetime.now(timezone.utc)
+                                else:
+                                    db.add(DeploymentPortReservation(
+                                        deployment_id=dep.id,
+                                        node_id=node.id,
+                                        service_name=service_name,
+                                        host_port=service_port,
+                                        status="active",
+                                    ))
+                        db.flush()
+                        # Release reservation/deployment row locks before the
+                        # independent progress logger updates this deployment.
+                        db.commit()
                         traffic_plan = _project_traffic_plan(project, ai_plan)
                         entry_service = str(traffic_plan.get("default_service") or traffic_plan.get("entry_service") or "")
                         if not entry_service:
@@ -5357,6 +9065,13 @@ def execute(deployment_id: str) -> None:
                     domain_config = db.get(ProjectDomainConfig, project.id)
                     domain_defaults = db.get(DeploymentSettings, "default")
                     route_groups = _compose_route_groups(project, service_targets, ai_plan)
+                    verification_paths.extend([
+                        str(path.get("path") or "/")
+                        for group in route_groups
+                        for path in (group.get("paths") or [])
+                        if isinstance(path, dict) and str(path.get("path") or "/") != "/"
+                    ])
+                    gateway_snapshot = snapshot_platform_gateway(db, project.id)
                     access = configure_platform_gateway(
                         db, dep, node, published_port, project.domain,
                         http_port=domain_config.http_port if domain_config else (domain_defaults.default_domain_http_port if domain_defaults else 80),
@@ -5368,6 +9083,7 @@ def execute(deployment_id: str) -> None:
                         route_groups=route_groups or None,
                         strategy=project.load_balance_strategy,
                     ) if published_port else None
+                    gateway_switched = bool(access)
                     service_names = {service.get("name") for service in topology.get("services", [])}
                     has_root_route = any(
                         str(path.get("path") or "/") == "/"
@@ -5377,7 +9093,9 @@ def execute(deployment_id: str) -> None:
                     )
                     if access and build_file == ".yunzhou.compose.yml" and {"frontend", "backend"}.issubset(service_names):
                         access = access.rstrip("/") + "/app/"
-                    elif access and access_path != "/" and not has_root_route:
+                    elif access and access_path != "/" and (
+                        not has_root_route or len(service_targets) == 1
+                    ):
                         access = access.rstrip("/") + access_path
                     if access:
                         log(dep.id, f"[检查] 平台网关映射完成：{access}\n")
@@ -5433,6 +9151,7 @@ def execute(deployment_id: str) -> None:
                         raise RuntimeError("容器启动后状态异常：" + state.strip())
                     domain_config = db.get(ProjectDomainConfig, project.id)
                     domain_defaults = db.get(DeploymentSettings, "default")
+                    gateway_snapshot = snapshot_platform_gateway(db, project.id)
                     access = configure_platform_gateway(
                         db, dep, node, host_port, project.domain,
                         http_port=domain_config.http_port if domain_config else (domain_defaults.default_domain_http_port if domain_defaults else 80),
@@ -5442,18 +9161,31 @@ def execute(deployment_id: str) -> None:
                         certificate=decrypt(domain_config.certificate_encrypted) if domain_config else None,
                         private_key=decrypt(domain_config.private_key_encrypted) if domain_config else None,
                     )
+                    gateway_switched = True
                     if access_path != "/":
                         access = access.rstrip("/") + access_path
                     log(dep.id, f"[检查] 平台网关映射完成：{access}\n")
 
-            log(dep.id, "[阶段完成] start\n")
+            log_stage(dep.id, "完成", "start")
             current_stage = "verify"
-            log(dep.id, "[阶段开始] verify\n")
+            log_stage(dep.id, "开始", "verify")
             ensure_active(dep.id)
             if not access:
                 raise RuntimeError("部署未生成可验证的访问地址")
-            verify_access(db, dep.id, access)
-            log(dep.id, "[阶段完成] verify\n")
+            # Frontend assets only exist after the platform build. Re-scan the
+            # actual dist here so a route discovered during gateway generation
+            # (for example /frapi/) is also a mandatory success probe.
+            postbuild_routes = detect_frontend_api_routes(work)
+            verification_paths.extend(
+                str(route.get("path") or "")
+                for route in (postbuild_routes.get("routes") or [])
+                if isinstance(route, dict) and str(route.get("path") or "").startswith("/")
+            )
+            verification_paths = list(dict.fromkeys(verification_paths))
+            if verification_paths:
+                log(dep.id, "[接口联合验证] " + "、".join(verification_paths) + " 必须同时无 5xx。\n")
+            access = verify_access(db, dep.id, access, verification_paths)
+            log_stage(dep.id, "完成", "verify")
             ensure_active(dep.id)
             dep = db.get(Deployment, deployment_id)
             replaced = db.scalars(
@@ -5474,7 +9206,23 @@ def execute(deployment_id: str) -> None:
             dep.host_port = host_port if build_type == "dockerfile" else published_port
             dep.access_url = access
             dep.finished_at = datetime.now(timezone.utc)
+            for reservation in db.scalars(select(DeploymentPortReservation).where(
+                DeploymentPortReservation.deployment_id == dep.id,
+                DeploymentPortReservation.status == "reserved",
+            )).all():
+                reservation.status = "active"
             db.commit()
+            # The gateway now targets the verified candidate. Only at this
+            # point may the previous runtime be retired. A stop failure is
+            # reported but never rolls traffic back to an unverified release.
+            for old in replaced:
+                try:
+                    old_node = db.get(Node, old.node_id)
+                    if old_node:
+                        stop_deployment(old, project, old_node)
+                        log(dep.id, f"[版本切换] 已停止旧版本 {old.release or old.id[:8]}；固定数据卷继续保留。\n")
+                except Exception as stop_exc:
+                    log(dep.id, f"[版本切换] 入口已切换，但旧版本 {old.release or old.id[:8]} 自动停止未完成：{stop_exc}\n")
             # Every new release must first prove itself as one healthy instance.
             # Retire replicas from the previous release and keep the new release
             # single-instance until the user explicitly scales it from Runtime.
@@ -5502,7 +9250,13 @@ def execute(deployment_id: str) -> None:
             ai_checkpoint(dep.id, "检查服务关系", f"部署成功，访问地址：{access or '未生成'}")
         except DeploymentCancelled:
             dep = db.get(Deployment, deployment_id)
-            log(dep.id, f"[阶段停止] {current_stage}\n")
+            if gateway_switched and gateway_snapshot is not None and project:
+                try:
+                    restore_platform_gateway(db, project.id, gateway_snapshot)
+                    log(dep.id, "[网关回滚] 候选版本已停止，入口已恢复到原在线版本。\n")
+                except Exception as gateway_exc:
+                    log(dep.id, f"[网关回滚失败] {gateway_exc}\n")
+            log_stage(dep.id, "停止", current_stage)
             dep.status = DeployStatus.stopped
             dep.finished_at = datetime.now(timezone.utc)
             db.commit()
@@ -5521,16 +9275,37 @@ def execute(deployment_id: str) -> None:
                 dep.error = f"停止成功，但镜像清理复查失败：{cleanup_exc}"
                 db.commit()
                 log(dep.id, f"[清理失败] {cleanup_exc}\n")
+            try:
+                restore_preempted_runtime("被停止")
+            except Exception as restore_exc:
+                log(dep.id, f"[版本回退失败] {restore_exc}\n")
         except Exception as exc:
+            # A flush/commit error (notably a concurrent port reservation)
+            # leaves SQLAlchemy's transaction unusable until rollback. Always
+            # recover the session before recording the deployment failure so
+            # one task can never terminate the whole worker.
+            db.rollback()
             dep = db.get(Deployment, deployment_id)
+            if gateway_switched and gateway_snapshot is not None and project:
+                try:
+                    restore_platform_gateway(db, project.id, gateway_snapshot)
+                    log(dep.id, "[网关回滚] 候选版本验证失败，入口已恢复到原在线版本。\n")
+                except Exception as gateway_exc:
+                    log(dep.id, f"[网关回滚失败] {gateway_exc}\n")
             if dep.status != DeployStatus.stopped:
-                log(dep.id, f"[阶段失败] {current_stage} | {str(exc)[:500]}\n")
+                log_stage(dep.id, "失败", current_stage, str(exc)[:500])
                 dep.status = DeployStatus.failed
                 dep.error = str(exc)
                 dep.finished_at = datetime.now(timezone.utc)
                 db.commit()
                 log(dep.id, f"\n[失败] {exc}\n")
                 ai_checkpoint(dep.id, "部署失败", str(exc))
+            for reservation in db.scalars(select(DeploymentPortReservation).where(
+                DeploymentPortReservation.deployment_id == dep.id,
+                DeploymentPortReservation.status == "reserved",
+            )).all():
+                reservation.status = "released"
+            db.commit()
             if 'remote_dir' in locals():
                 # Stop/remove failed runtime containers immediately, but do
                 # not touch their image layers while another build may still
@@ -5538,9 +9313,10 @@ def execute(deployment_id: str) -> None:
                 try:
                     release_value = str(locals().get("release") or dep.release or "")
                     with SSHNode(node) as cleanup_ssh:
+                        failed_compose_project = deployment_compose_project_name(dep, project)
                         runtime_cleanup = (
                             "ids=$(docker ps -aq --filter "
-                            + shlex.quote(f"label=com.docker.compose.project=yz-{project.slug}")
+                            + shlex.quote(f"label=com.docker.compose.project={failed_compose_project}")
                             + "); for cid in $ids; do cfg=$(docker inspect -f "
                             + shlex.quote('{{index .Config.Labels "com.docker.compose.project.config_files"}}')
                             + " \"$cid\" 2>/dev/null); case \"$cfg\" in */"
@@ -5558,6 +9334,10 @@ def execute(deployment_id: str) -> None:
                     log(dep.id, "[清理] 已删除失败部署的发布目录\n")
                 except Exception as cleanup_exc:
                     log(dep.id, f"[清理] 失败目录清理失败：{cleanup_exc}\n")
+            try:
+                restore_preempted_runtime("验证失败")
+            except Exception as restore_exc:
+                log(dep.id, f"[版本回退失败] {restore_exc}\n")
             # Image deletion/pruning is durable work for the worker's idle
             # cleanup queue. Running it here can race another classic build
             # and corrupt Docker/containerd snapshot metadata.
@@ -5599,10 +9379,23 @@ def stop_deployment(deployment: Deployment, project: Project, node: Node, *, pre
     with SSHNode(node) as ssh:
         target_stop = stop_tracked_process_groups(ssh, deployment.id)
         if preserve_runtime:
+            # This branch cancels an unfinished candidate while an older
+            # verified release keeps serving traffic. The candidate owns no
+            # runtime, but its port reservations must still be released or
+            # later deployments gradually exhaust the node's port pool.
+            with SessionLocal() as reservation_db:
+                for reservation in reservation_db.scalars(select(DeploymentPortReservation).where(
+                    DeploymentPortReservation.deployment_id == deployment.id,
+                    DeploymentPortReservation.status.in_(["reserved", "active"]),
+                )).all():
+                    reservation.status = "released"
+                reservation_db.commit()
             return f"该记录已被更新版本接管，仅终止本记录的部署进程；当前运行容器已保留（构建节点 {builder_stop}；目标节点 {target_stop}）"
         if deployment.image_name:
             code, out = ssh.run(f"docker rm -f {shlex.quote(deployment.container_name or '')} 2>&1 || true")
         else:
+            compose_project = deployment_compose_project_name(deployment, project)
+            legacy_project = compose_project_name(project.slug, namespace="yz")
             base = f"{node.work_dir.rstrip('/')}/{project_directory(project)}/{deployment.release}"
             legacy_base = f"{node.work_dir.rstrip('/')}/{project.slug}/{deployment.release}"
             _, resolved = ssh.run(
@@ -5614,22 +9407,33 @@ def stop_deployment(deployment: Deployment, project: Project, node: Node, *, pre
             args = compose_file_args(files)
             if files:
                 code, out = ssh.run(
-                f"cd {shlex.quote(actual_dir)} && docker compose -p {shlex.quote('yz-' + project.slug)} {args} down"
+                    f"cd {shlex.quote(actual_dir)} && docker compose -p {shlex.quote(compose_project)} {args} down"
                 )
             else:
                 # A failed cleanup or legacy release may leave labeled Compose
                 # containers after its config directory has disappeared. Stop
                 # the real runtime by ownership label so restart=unless-stopped
                 # cannot keep it alive. Volumes and images remain untouched.
-                compose_label = shlex.quote(f"com.docker.compose.project=yz-{project.slug}")
+                compose_label = shlex.quote(f"com.docker.compose.project={compose_project}")
                 code, out = ssh.run(
                     f"ids=$(docker ps -q --filter label={compose_label}); "
                     "[ -z \"$ids\" ] || docker stop $ids"
                 )
+            # Compatibility cleanup for releases created before project names
+            # included their release. Match the exact config directory so an
+            # unrelated legacy release cannot be stopped accidentally.
+            legacy_release_path = shlex.quote("/" + str(deployment.release or "") + "/")
+            _, legacy_out = ssh.run(
+                "ids=$(docker ps --filter " + shlex.quote(f"label=com.docker.compose.project={legacy_project}") +
+                " --format '{{.ID}}|{{.Label \"com.docker.compose.project.config_files\"}}' | "
+                f"awk -F'|' -v r={legacy_release_path} 'index($2,r) {{print $1}}'); "
+                "[ -z \"$ids\" ] || docker stop $ids"
+            )
+            out = (out or "") + (legacy_out or "")
         if code:
             raise RuntimeError(out)
         container = shlex.quote(deployment.container_name or '')
-        project_name = shlex.quote('yz-' + project.slug)
+        project_name = shlex.quote(deployment_compose_project_name(deployment, project))
         verify = (
             f"running=$(docker ps -q --filter name=^{container}$); "
             f"compose=$(docker ps -q --filter label=com.docker.compose.project={project_name}); "
@@ -5638,7 +9442,120 @@ def stop_deployment(deployment: Deployment, project: Project, node: Node, *, pre
         verify_code, state = ssh.run(verify)
         if verify_code or "process=1" in state or re.search(r"container=\S+", state) or re.search(r"compose=\S+", state):
             raise RuntimeError("停止后复查发现仍有部署进程或容器运行：" + state.strip())
+        with SessionLocal() as reservation_db:
+            for reservation in reservation_db.scalars(select(DeploymentPortReservation).where(
+                DeploymentPortReservation.deployment_id == deployment.id,
+                DeploymentPortReservation.status.in_(["reserved", "active"]),
+            )).all():
+                reservation.status = "released"
+            reservation_db.commit()
         return f"已终止部署进程并关闭容器，复查确认无残留（构建节点 {builder_stop}；目标节点 {target_stop}）"
+
+
+def stop_project_data_services(project: Project, node: Node, db=None) -> str:
+    """Stop a project's shared data containers without deleting their data.
+
+    Release switching deliberately does not call this helper. It is reserved
+    for an explicit project/service stop, where the user expects every runtime
+    container (application, MySQL, Redis, and similar dependencies) to stop.
+    """
+    policy = db.get(DeploymentSettings, "default") if db is not None else None
+    runtime_namespace = (policy.registry_namespace if policy else "yunzhou") or "yunzhou"
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
+    data_project = f"{safe_namespace}-{project.slug}-data"
+    with SSHNode(node) as ssh:
+        label = shlex.quote(f"label=com.docker.compose.project={data_project}")
+        _, existing = ssh.run(f"docker ps -aq --filter {label}", timeout=30)
+        ids = [value for value in existing.split() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
+        if not ids:
+            return "项目共享数据服务未运行"
+        words = " ".join(shlex.quote(value) for value in ids)
+        code, output = ssh.run(f"docker stop -t 30 {words}", timeout=max(60, 45 * len(ids)))
+        if code:
+            raise RuntimeError("项目共享数据服务停止失败：" + output[-800:])
+        verify_code, running = ssh.run(f"docker ps -q --filter {label}", timeout=30)
+        if verify_code or running.strip():
+            raise RuntimeError("停止后复查发现 MySQL/Redis 等项目共享数据服务仍在运行")
+    return f"已停止 {len(ids)} 个项目共享数据容器；数据卷和容器配置均已保留"
+
+
+def start_project_data_services(
+    project: Project,
+    node: Node,
+    directory: str,
+    db=None,
+) -> str:
+    """Start and verify the stable project data stack when a release needs it."""
+    data_file = ".yunzhou.data.yml"
+    policy = db.get(DeploymentSettings, "default") if db is not None else None
+    runtime_namespace = (policy.registry_namespace if policy else "yunzhou") or "yunzhou"
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
+    data_project = f"{safe_namespace}-{project.slug}-data"
+    with SSHNode(node) as ssh:
+        if ssh.run(f"test -f {shlex.quote(directory + '/' + data_file)}", timeout=20)[0] != 0:
+            return "该版本没有独立的项目共享数据服务"
+        label = shlex.quote(f"label=com.docker.compose.project={data_project}")
+        _, all_output = ssh.run(f"docker ps -aq --filter {label}", timeout=20)
+        all_ids = [value for value in all_output.split() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
+        _, running_output = ssh.run(f"docker ps -q --filter {label}", timeout=20)
+        running_ids = [value for value in running_output.split() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
+        if running_ids and len(running_ids) == len(all_ids):
+            words = " ".join(shlex.quote(value) for value in running_ids)
+            check_code, unhealthy = ssh.run(
+                "bad=0; for id in " + words + "; do "
+                "state=$(docker inspect -f '{{.State.Status}}' $id 2>/dev/null); "
+                "health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $id 2>/dev/null); "
+                "[ \"$state\" = running ] || bad=1; "
+                "[ \"$health\" = none ] || [ \"$health\" = healthy ] || bad=1; done; "
+                "exit $bad",
+                timeout=30,
+            )
+            if check_code == 0:
+                # Release rollback/start must not reconcile an already healthy
+                # data stack with a historical Compose file. Even an innocent
+                # `up -d` can recreate MySQL when old service metadata differs.
+                return f"已复用健康的项目共享数据服务（{len(running_ids)} 个容器），未重建或重启"
+        _, service_output = ssh.run(
+            f"cd {shlex.quote(directory)} && "
+            f"docker compose -p {shlex.quote(data_project)} -f {shlex.quote(data_file)} config --services",
+            timeout=30,
+        )
+        expected_services = [value for value in service_output.splitlines() if value.strip()]
+        reuse_stopped = bool(all_ids) and len(all_ids) == len(expected_services)
+        if reuse_stopped:
+            words = " ".join(shlex.quote(value) for value in all_ids)
+            command = f"docker start {words}"
+        else:
+            command = (
+                f"cd {shlex.quote(directory)} && "
+                f"docker compose -p {shlex.quote(data_project)} -f {shlex.quote(data_file)} "
+                "up -d --no-build"
+            )
+        code, output = ssh.run(command, timeout=300)
+        if code:
+            clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+            raise RuntimeError("项目共享数据服务启动失败：" + clean[-800:])
+        health = (
+            f"cd {shlex.quote(directory)} && ok=0; "
+            "for i in $(seq 1 60); do bad=0; "
+            f"ids=$(docker compose -p {shlex.quote(data_project)} -f {shlex.quote(data_file)} ps -q); "
+            "[ -n \"$ids\" ] || bad=1; for id in $ids; do "
+            "state=$(docker inspect -f '{{.State.Status}}' $id 2>/dev/null); "
+            "health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $id 2>/dev/null); "
+            "[ \"$state\" = running ] || bad=1; "
+            "[ \"$health\" = none ] || [ \"$health\" = healthy ] || bad=1; done; "
+            "[ \"$bad\" -eq 0 ] && { ok=1; break; }; sleep 2; done; "
+            "[ \"$ok\" -eq 1 ]"
+        )
+        code, output = ssh.run(health, timeout=150)
+        if code:
+            raise RuntimeError("项目共享数据服务启动后未就绪：" + output[-800:])
+        _, count = ssh.run(
+            "docker ps -q --filter " + shlex.quote(f"label=com.docker.compose.project={data_project}") + " | wc -l",
+            timeout=20,
+        )
+    mode = "原有数据容器已重新启动" if reuse_stopped else "缺失的数据容器已按配置恢复"
+    return f"{mode}并通过检查（{count.strip() or '0'} 个容器）"
 
 
 def delete_deployment_resources(
@@ -5661,6 +9578,8 @@ def delete_deployment_resources(
     release = (deployment.release or "").strip()
     if release and not re.fullmatch(r"[A-Za-z0-9_.-]+", release):
         raise RuntimeError("发布版本号不安全，已拒绝清理")
+    release_compose_project = deployment_compose_project_name(deployment, project)
+    legacy_compose_project = compose_project_name(project.slug, namespace="yz")
     with SSHNode(node) as ssh:
         pid_file = f"/tmp/yunzhou-deploy-{deployment.id}.pid"
         commands = [
@@ -5677,10 +9596,11 @@ def delete_deployment_resources(
             # every residual container to the exact release, so remove only
             # those containers instead of touching a newer runtime.
             commands.append(
-                "docker ps -a --filter " + shlex.quote(f"label=com.docker.compose.project=yz-{project.slug}") +
+                "{ docker ps -a --filter " + shlex.quote(f"label=com.docker.compose.project={release_compose_project}") +
+                " --format '{{.Names}}'; docker ps -a --filter " + shlex.quote(f"label=com.docker.compose.project={legacy_compose_project}") +
                 " --format '{{.Names}}|{{.Label \"com.docker.compose.project.config_files\"}}' | "
                 f"awk -F'|' -v r={shlex.quote('/' + release + '/')} 'index($2,r) {{print $1}}' | "
-                "xargs -r docker rm -f >/dev/null 2>&1 || true"
+                "cut -d'|' -f1; } | sort -u | xargs -r docker rm -f >/dev/null 2>&1 || true"
             )
         release_dirs = []
         if release:
@@ -5694,7 +9614,7 @@ def delete_deployment_resources(
                     files = remote_compose_files(ssh, path)
                     if files:
                         commands.append(
-                            f"cd {shlex.quote(path)} && docker compose -p {shlex.quote('yz-' + project.slug)} "
+                            f"cd {shlex.quote(path)} && docker compose -p {shlex.quote(release_compose_project)} "
                             f"{compose_file_args(files)} down{volume_flag} --remove-orphans"
                         )
             # A release folder is unique to this record. Remove both current and
@@ -5703,13 +9623,30 @@ def delete_deployment_resources(
         if deployment.image_name:
             # Dockerfile deployments are tagged per release and are safe to remove exactly.
             commands.append(f"docker image rm -f {shlex.quote(deployment.image_name)} >/dev/null 2>&1 || true")
+        elif release:
+            # Compose application images are immutable per release too. Delete
+            # only the exact tag owned by this record even when newer records
+            # of the same project remain; the old all-or-nothing rule leaked
+            # every deleted historical tag until the final record vanished.
+            prefixes = (
+                f"yunzhou/{project.slug}-", f"yz-{project.slug}-",
+                f"{project.slug}-",
+            )
+            commands.append(
+                "refs=$(docker images --format '{{.Repository}}|{{.Tag}}' | "
+                f"awk -F'|' -v t={shlex.quote(release)} "
+                + " ".join(f"-v p{index}={shlex.quote(prefix)}" for index, prefix in enumerate(prefixes, start=1))
+                + " '$2==t && (index($1,p1)==1 || index($1,p2)==1 || index($1,p3)==1) {print $1\":\"$2}'); "
+                "[ -z \"$refs\" ] || printf '%s\n' \"$refs\" | xargs -r docker image rm -f >/dev/null 2>&1 || true"
+            )
+            commands.append("docker image prune -f >/dev/null 2>&1 || true")
         if remove_compose_images:
             # Only locally built Compose images use this prefix. Directly pulled
             # images such as nginx/postgres/python are never selected. Compose
             # may use an explicit image name, so prefer its ownership label.
             prefix = f"yz-{project.slug}-"
             central_prefix = f"yunzhou/{project.slug}-"
-            compose_project = f"yz-{project.slug}"
+            compose_project = release_compose_project
             commands.append(
                 "(docker images -q --filter " + shlex.quote(f"label=com.docker.compose.project={compose_project}") + "; "
                 "docker images --format '{{.Repository}}:{{.Tag}}' | "
@@ -5736,9 +9673,19 @@ def delete_deployment_resources(
         checks.extend(f"test ! -e {shlex.quote(path)} || exit 22" for path in release_dirs)
         if deployment.image_name:
             checks.append(f"docker image inspect {shlex.quote(deployment.image_name)} >/dev/null 2>&1 && exit 23 || true")
+        elif release:
+            checks.append(
+                "docker images --format '{{.Repository}}|{{.Tag}}' | "
+                f"awk -F'|' -v t={shlex.quote(release)} "
+                f"-v p1={shlex.quote('yunzhou/' + project.slug + '-')} "
+                f"-v p2={shlex.quote('yz-' + project.slug + '-')} "
+                f"-v p3={shlex.quote(project.slug + '-')} "
+                "'$2==t && (index($1,p1)==1 || index($1,p2)==1 || index($1,p3)==1) {found=1} END {exit !found}' "
+                "&& exit 23 || true"
+            )
         if remove_compose_images:
             checks.append(
-                "{ docker images -q --filter " + shlex.quote(f"label=com.docker.compose.project=yz-{project.slug}") + "; "
+                "{ docker images -q --filter " + shlex.quote(f"label=com.docker.compose.project={release_compose_project}") + "; "
                 "docker images --format '{{.Repository}}' | "
                 f"awk -v p={shlex.quote('yz-' + project.slug + '-')} -v c={shlex.quote('yunzhou/' + project.slug + '-')} "
                 "'index($0,p)==1 || index($0,c)==1 {print}'; } | grep -q . && exit 23 || true"
@@ -5752,6 +9699,8 @@ def delete_deployment_resources(
         removed.append("容器")
     if deployment.image_name:
         removed.append("该版本应用镜像")
+    elif release:
+        removed.append("该版本 Compose 应用镜像")
     elif remove_compose_images:
         removed.append("该项目未被其他版本使用的 Compose 构建镜像")
     if remove_persistent_data:
@@ -5832,6 +9781,7 @@ def restore_release_images(db, deployment: Deployment, project: Project, node: N
 def start_deployment(deployment: Deployment, project: Project, node: Node, db=None) -> str:
     """Start an existing stopped release and verify that Docker really runs it."""
     with SSHNode(node) as ssh:
+        compose_project = deployment_compose_project_name(deployment, project)
         release_dir = f"{node.work_dir.rstrip('/')}/{project_directory(project)}/{deployment.release}"
         legacy_dir = f"{node.work_dir.rstrip('/')}/{project.slug}/{deployment.release}"
         _, resolved = ssh.run(
@@ -5841,6 +9791,15 @@ def start_deployment(deployment: Deployment, project: Project, node: Node, db=No
         actual_dir = resolved.strip()
         if not actual_dir:
             raise RuntimeError("原发布目录不存在，无法重新启用；请重新部署项目")
+        # A stopped release no longer owns the port numbers saved in its
+        # historical Compose file.  Reconcile every published application
+        # port against current reservations and the real node before any
+        # container is started.  This covers both ordinary reactivation and
+        # rollback and prevents Docker's "port is already allocated" error.
+        port_update = prepare_stopped_release_ports(
+            deployment, project, node, actual_dir, db,
+        )
+        data_start = start_project_data_services(project, node, actual_dir, db)
         if deployment.image_name:
             restore_release_images(db, deployment, project, node, ssh, [deployment.image_name])
             port = project.container_port
@@ -5869,7 +9828,7 @@ def start_deployment(deployment: Deployment, project: Project, node: Node, db=No
             if not files:
                 raise RuntimeError("原发布目录中未找到 Compose 配置")
             code, configured_images = ssh.run(
-                f"cd {shlex.quote(actual_dir)} && docker compose -p {shlex.quote('yz-' + project.slug)} "
+                f"cd {shlex.quote(actual_dir)} && docker compose -p {shlex.quote(compose_project)} "
                 f"{compose_file_args(files)} config --images"
             )
             if code:
@@ -5879,13 +9838,13 @@ def start_deployment(deployment: Deployment, project: Project, node: Node, db=No
                 [line.strip() for line in configured_images.splitlines() if line.strip()],
             )
             code, output = ssh.run(
-                f"cd {shlex.quote(actual_dir)} && docker compose -p {shlex.quote('yz-' + project.slug)} "
+                f"cd {shlex.quote(actual_dir)} && docker compose -p {shlex.quote(compose_project)} "
                 f"{compose_file_args(files)} up -d --no-build --remove-orphans"
             )
             if code:
                 clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
                 raise RuntimeError("历史版本容器启动失败：" + clean[-800:])
-            code, running = ssh.run(f"docker ps -q --filter label=com.docker.compose.project={shlex.quote('yz-' + project.slug)}")
+            code, running = ssh.run(f"docker ps -q --filter label=com.docker.compose.project={shlex.quote(compose_project)}")
             if code or not running.strip():
                 raise RuntimeError("Compose 执行完成，但未发现运行中的服务容器")
             # A running container is not yet a ready application (Spring Boot
@@ -5902,7 +9861,15 @@ def start_deployment(deployment: Deployment, project: Project, node: Node, db=No
                 code, _ = ssh.run(probe, timeout=55)
                 if code:
                     raise RuntimeError("容器已启动，但应用在 45 秒内未就绪；请查看容器日志")
+        if db is not None:
+            for reservation in db.scalars(select(DeploymentPortReservation).where(
+                DeploymentPortReservation.deployment_id == deployment.id,
+                DeploymentPortReservation.status == "reserved",
+            )).all():
+                reservation.status = "active"
+            db.commit()
         restored_text = f"；已从平台仓库恢复 {len(restored)} 个旧镜像" if 'restored' in locals() and restored else ""
-        return "服务已启动，并确认容器处于运行状态" + restored_text
+        port_text = f"；{port_update}" if port_update else ""
+        return data_start + port_text + "；应用服务已启动，并确认容器处于运行状态" + restored_text
 
 

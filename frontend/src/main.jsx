@@ -126,16 +126,29 @@ function projectCardState(project, deployments, startingIds = new Set()) {
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   const starting = records.find((item) => startingIds.has(item.id));
   if (starting) return { kind: "working", label: "启动中", action: "启动中", deployment: starting };
-  const active = records.find((item) => item.status === "success");
-  if (active) return { kind: "online", label: "运行中", action: "访问", deployment: active };
   const pending = records.find((item) => ["queued", "running"].includes(item.status));
-  if (pending) return { kind: "working", label: "部署中", action: "查看进度", deployment: pending };
+  const active = records.find((item) => item.status === "success");
+  if (pending && active) return {
+    kind: "online",
+    label: "运行中",
+    secondaryLabel: pending.status === "queued" ? "新版等待" : `新版 ${Number(pending.progress || 0)}%`,
+    action: "访问",
+    deployment: active,
+    pendingDeployment: pending,
+  };
+  if (pending) return {
+    kind: "working",
+    label: pending.status === "queued" ? "等待部署" : `部署中 ${Number(pending.progress || 0)}%`,
+    action: "查看进度",
+    deployment: pending,
+  };
+  if (active) return { kind: "online", label: "运行中", action: "访问", deployment: active };
+  const stopped = records.find((item) => item.status === "stopped" && item.release && item.access_url);
+  if (stopped) return { kind: "stopped", label: "已停止", action: "重新启用", deployment: stopped };
   const latest = records[0];
   if (latest?.status === "failed") {
     return { kind: "error", label: "有异常", action: "查看原因", deployment: latest };
   }
-  const stopped = records.find((item) => item.status === "stopped" && item.release && item.access_url);
-  if (stopped) return { kind: "stopped", label: "已停止", action: "重新启用", deployment: stopped };
   if (latest?.status === "stopped") {
     return { kind: "ready", label: "部署已停止", action: "重新部署" };
   }
@@ -177,6 +190,10 @@ function Login({ onDone, branding }) {
   const [form, setForm] = useState({ username: "admin", password: "" });
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const updateField = (field, value) => {
+    setForm((current) => ({ ...current, [field]: value }));
+    if (err) setErr("");
+  };
   const submit = async (e) => {
     e.preventDefault();
     setBusy(true);
@@ -185,7 +202,7 @@ function Login({ onDone, branding }) {
       await login(form.username, form.password);
       onDone();
     } catch (x) {
-      setErr(x.message);
+      setErr(x.message || "登录失败，请检查账号和密码");
     } finally {
       setBusy(false);
     }
@@ -209,7 +226,9 @@ function Login({ onDone, branding }) {
           用户名
           <input
             value={form.username}
-            onChange={(e) => setForm({ ...form, username: e.target.value })}
+            autoComplete="username"
+            aria-invalid={Boolean(err)}
+            onChange={(e) => updateField("username", e.target.value)}
           />
         </label>
         <label>
@@ -217,12 +236,14 @@ function Login({ onDone, branding }) {
           <input
             type="password"
             value={form.password}
-            onChange={(e) => setForm({ ...form, password: e.target.value })}
+            autoComplete="current-password"
+            aria-invalid={Boolean(err)}
+            onChange={(e) => updateField("password", e.target.value)}
           />
         </label>
-        {err && <div className="alert danger">{err}</div>}
+        {err && <div className="login-error" role="alert">{err}</div>}
         <button className="primary full" disabled={busy}>
-          {busy ? <LoaderCircle className="spin" /> : <KeyRound />}登录
+          {busy ? <LoaderCircle className="spin" /> : <KeyRound />}{busy ? "登录中..." : "登录"}
         </button>
       </form>
     </div>
@@ -232,7 +253,7 @@ function Login({ onDone, branding }) {
 const nav = [
   ["dashboard", "工作台", Gauge],
   ["chat", "AI 发布", MessageSquareText],
-  ["projects", "项目", FolderGit2],
+  ["projects", "项目管理", FolderGit2],
   ["deployments", "部署记录", Activity],
   ["images", "镜像仓库", Boxes],
   ["nodes", "服务器节点", Server],
@@ -242,7 +263,7 @@ const nav = [
 
 const modalStack = [];
 
-function Modal({ title, children, onClose, wide = false, className = "", closeOnMask = true }) {
+function Modal({ title, children, onClose, wide = false, className = "", closeOnMask = false, scrollRef = null, onScroll = null, headerActions = null }) {
   const box = useRef(null),
     scrollTop = useRef(0);
   const modalId = useRef(Symbol("modal"));
@@ -276,9 +297,13 @@ function Modal({ title, children, onClose, wide = false, className = "", closeOn
       onMouseDown={(e) => closeOnMask && e.target === e.currentTarget && onClose()}
     >
       <div
-        ref={box}
+        ref={(node) => {
+          box.current = node;
+          if (scrollRef) scrollRef.current = node;
+        }}
         onScroll={(e) => {
           scrollTop.current = e.currentTarget.scrollTop;
+          onScroll?.(e);
         }}
         className={`modal ${wide ? "wide" : ""} ${className}`.trim()}
         role="dialog"
@@ -286,9 +311,12 @@ function Modal({ title, children, onClose, wide = false, className = "", closeOn
       >
         <div className="modal-head">
           <h3>{title}</h3>
-          <button className="icon" title="关闭（Esc）" onClick={onClose}>
-            <X />
-          </button>
+          <div className="modal-head-actions">
+            {headerActions}
+            <button className="icon" title="关闭（Esc）" onClick={onClose}>
+              <X />
+            </button>
+          </div>
         </div>
         {children}
       </div>
@@ -457,14 +485,14 @@ function BulkDeleteDeploymentDialog({ data, busy, onConfirm, onClose }) {
       <div className="confirm-body">
         <div className="confirm-icon danger"><Trash2 /></div>
         <div>
-          <h4>AI 正在核对每个版本的实际资源</h4>
-          <p>当前线上、排队中和部署中的记录已自动排除；持久化业务数据默认保留。</p>
+          <h4>已完成批量删除预检</h4>
+          <p>当前线上、排队中和部署中的记录已自动排除；删除时核实实际资源，持久化业务数据默认保留。</p>
         </div>
       </div>
       {data.loading ? (
         <div className="center delete-analysis-loading">
           <LoaderCircle className="spin" />
-          <span>正在查询服务器资源并逐条生成 AI 清理分析...</span>
+          <span>正在并行扫描资源并由 AI 核对...</span>
         </div>
       ) : (
         <>
@@ -480,7 +508,7 @@ function BulkDeleteDeploymentDialog({ data, busy, onConfirm, onClose }) {
               <div key={item.id} className={error ? "has-error" : ""}>
                 <b>{item.release || item.id.slice(0, 8)}</b>
                 <span>{error || preview?.ai_summary || "资源范围已核对"}</span>
-                <em>{preview?.ai?.source === "ai" ? "AI 已分析" : error ? "无法删除" : "规则已核对"}</em>
+                <em>{preview?.ai?.source === "ai" ? "AI 已分析" : error ? "无法删除" : "资源已核实"}</em>
               </div>
             ))}
           </div>
@@ -681,6 +709,46 @@ function deploymentDuration(item) {
   return `${terminal ? "耗时" : "已用时"} ${hours ? `${hours}小时` : ""}${minutes ? `${minutes}分` : ""}${rest}秒`;
 }
 
+function analysisDuration(item) {
+  const start = item?.started_at || item?.queued_at;
+  if (!start) return "等待计时";
+  const terminal = ["completed", "failed"].includes(item?.status);
+  const end = terminal && item?.finished_at ? new Date(item.finished_at) : new Date();
+  const seconds = Math.max(0, Math.floor((end - new Date(start)) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return `${terminal ? "分析耗时" : "分析已用时"} ${hours ? `${hours}小时` : ""}${minutes ? `${minutes}分` : ""}${rest}秒`;
+}
+
+function stageDuration(value) {
+  if (value === null || value === undefined) return "";
+  const seconds = Math.max(0, Number(value) || 0);
+  if (seconds < 1) return `${Math.round(seconds * 1000)}毫秒`;
+  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}秒`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  return `${minutes}分${rest}秒`;
+}
+
+function deploymentFileMeta(file) {
+  const path = String(file?.path || "");
+  const name = path.split("/").pop();
+  const rules = [
+    [/\.yunzhou\.ai\.compose\.ya?ml$/i, 10, "主编排"],
+    [/\.yunzhou\.app\.ya?ml$/i, 20, "应用配置"],
+    [/\.yunzhou\.data\.ya?ml$/i, 30, "数据服务"],
+    [/\.yunzhou\.app-images\.ya?ml$/i, 40, "运行镜像"],
+    [/\.yunzhou\.images\.ya?ml$/i, 50, "镜像配置"],
+    [/\.yunzhou\.proxy-build\.ya?ml$/i, 60, "构建代理"],
+    [/dockerfile/i, 70, "构建文件"],
+    [/nginx/i, 80, "Nginx 配置"],
+    [/(^|\/)\.env(?:\.|$)/i, 90, "环境配置"],
+  ];
+  const matched = rules.find(([pattern]) => pattern.test(path));
+  return { priority: matched?.[1] ?? 100, label: matched?.[2] || "关联文件", name };
+}
+
 function shortRelease(value) {
   const text = String(value || "");
   if (/^\d{12}(?:\d{2}|-\d{2})?$/.test(text)) {
@@ -807,7 +875,7 @@ function App() {
           ))}
         </nav>
       </aside>
-      <main>
+      <main className={page === "chat" ? "chat-page-shell" : ""}>
         <Top page={page} me={me} branding={branding} onBrandingChange={setBranding} />
         <section className="content">
           <PageErrorBoundary key={page}>
@@ -1197,6 +1265,8 @@ function ChatMessageContent({ text }) {
   );
 }
 
+const MemoChatMessageContent = React.memo(ChatMessageContent);
+
 function Chat() {
   const greeting = "你好，我是自助发布助手。你可以直接问我项目状态、故障原因，或告诉我发布要求。对话会自动保存。";
   const [projects, setProjects] = useState([]),
@@ -1208,6 +1278,7 @@ function Chat() {
     [defaultAiConfig, setDefaultAiConfig] = useState(""),
     [text, setText] = useState(""),
     [busy, setBusy] = useState(false),
+    [aiElapsed, setAiElapsed] = useState(0),
     [showUpload, setShowUpload] = useState(false),
     [sessions, setSessions] = useState([]),
     [sessionId, setSessionId] = useState(null),
@@ -1217,6 +1288,7 @@ function Chat() {
     [cleanupOpen, setCleanupOpen] = useState(false),
     [cleanupConfirm, setCleanupConfirm] = useState(""),
     [deleteTarget, setDeleteTarget] = useState(null),
+    [selectedDeployment, setSelectedDeployment] = useState(null),
     [messages, setMessages] = useState([
       {
         who: "ai",
@@ -1228,6 +1300,15 @@ function Chat() {
   useEffect(() => {
     requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" }));
   }, [messages, busy, sessionId]);
+  useEffect(() => {
+    if (!busy) {
+      setAiElapsed(0);
+      return undefined;
+    }
+    const started = Date.now();
+    const timer = setInterval(() => setAiElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [busy]);
   const loadSessions = (archived = showArchived) =>
     api(`/chat/sessions?archived=${archived}`).then(setSessions);
   useEffect(() => {
@@ -1268,6 +1349,7 @@ function Chat() {
         who: item.role === "assistant" ? "ai" : "user",
         text: item.content,
         deployment: item.deployment_id,
+        action: item.action,
       })));
     } finally {
       setSessionBusy(false);
@@ -1345,7 +1427,7 @@ function Chat() {
       setIntent(r.intent || null);
       setMessages((x) => [
         ...x,
-        { who: "ai", text: r.reply, deployment: r.deployment_id },
+        { who: "ai", text: r.reply, deployment: r.deployment_id, action: r.action },
       ]);
       loadSessions();
     } catch (e) {
@@ -1353,6 +1435,17 @@ function Chat() {
     } finally {
       setBusy(false);
       requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+  };
+  const openDeployment = async (id) => {
+    try {
+      setSelectedDeployment(await api(`/deployments/${id}`));
+    } catch (error) {
+      setMessages((current) => [...current, {
+        who: "ai",
+        text: `无法打开发布记录：${error.message || "记录可能已被删除"}`,
+        error: true,
+      }]);
     }
   };
   return (
@@ -1371,12 +1464,16 @@ function Chat() {
                   </div>
                 )}
                 <div>
-                  <ChatMessageContent text={m.text} />
+                  <MemoChatMessageContent text={m.text} />
                   {m.deployment && (
-                    <a href="#" onClick={(e) => e.preventDefault()}>
+                    <button type="button" className="chat-deployment-link" onClick={() => openDeployment(m.deployment)}>
                       <Activity />
-                      任务已进入部署队列
-                    </a>
+                      {m.action === "deploy"
+                        ? "任务已进入部署队列"
+                        : m.action === "existing_deployment"
+                          ? "查看进行中的部署任务"
+                          : "查看发布记录"}
+                    </button>
                   )}
                 </div>
               </div>
@@ -1387,7 +1484,11 @@ function Chat() {
                   <Bot />
                 </div>
                 <div>
-                  <LoaderCircle className="spin" /> 正在理解并创建任务...
+                  <LoaderCircle className="spin" /> {aiElapsed < 2
+                    ? "正在整理项目上下文..."
+                    : aiElapsed < 8
+                      ? "AI 正在分析并生成回答..."
+                      : "AI 上游响应较慢，仍在等待..."}{aiElapsed > 0 ? ` · ${aiElapsed}秒` : ""}
                 </div>
               </div>
             )}
@@ -1533,6 +1634,13 @@ function Chat() {
           onConfirm={deleteSession}
         />
       )}
+      {selectedDeployment && (
+        <DeploymentDetail
+          item={selectedDeployment}
+          onChanged={() => openDeployment(selectedDeployment.id)}
+          onClose={() => setSelectedDeployment(null)}
+        />
+      )}
     </>
   );
 }
@@ -1545,25 +1653,35 @@ function Projects({ me }) {
     [showCredential, setShowCredential] = useState(false),
     [selected, setSelected] = useState(null),
     [selectedDeployment, setSelectedDeployment] = useState(null),
+    [detailRevision, setDetailRevision] = useState(0),
     [domainFor, setDomainFor] = useState(null),
     [startingIds, setStartingIds] = useState(() => new Set()),
     [toast, setToast] = useState(null);
-  const load = () => Promise.all([api("/projects"), api("/deployments")]).then(([projects, records]) => {
-    setItems(projects);
-    setDeployments(records);
-  });
+  const listRefreshPendingRef = useRef(false);
+  const load = () => {
+    if (listRefreshPendingRef.current) return Promise.resolve();
+    listRefreshPendingRef.current = true;
+    return Promise.all([api("/projects"), api("/deployments")])
+      .then(([projects, records]) => {
+        setItems(projects);
+        setDeployments(records);
+      })
+      .finally(() => { listRefreshPendingRef.current = false; });
+  };
   useEffect(() => {
     load();
   }, []);
+  const hasActiveCardWork = items.some((item) =>
+    ["queued", "pulling", "analyzing", "preflight", "running"].includes(projectSourceState(item).phase),
+  ) || deployments.some((item) => ["queued", "running"].includes(item.status));
   useEffect(() => {
-    // Source analysis may be queued by the background worker or another page.
-    // Keep cards fresh even when the first response still contains the previous
-    // completed state, otherwise the UI never discovers that work has started.
+    // Keep the project cards synchronized even while a detail modal is open.
+    // Active work is refreshed quickly; idle pages use a slower interval.
     const timer = setInterval(() => {
-      if (!document.hidden && !document.querySelector(".modal")) load();
-    }, 15000);
+      if (!document.hidden) load();
+    }, hasActiveCardWork ? 4000 : 15000);
     return () => clearInterval(timer);
-  }, []);
+  }, [hasActiveCardWork]);
   const notify = (text, type = "success", duration = 3000) => {
     setToast({ text, type });
     setTimeout(() => setToast(null), duration);
@@ -1680,6 +1798,7 @@ function Projects({ me }) {
                 <span className={`project-lifecycle ${state.kind}`}>
                   {state.kind === "working" ? <LoaderCircle className="spin" /> : <i />}
                   {state.label}
+                  {state.secondaryLabel && <small className="project-deploying-badge"><LoaderCircle className="spin" />{state.secondaryLabel}</small>}
                 </span>
                 <button className={state.kind === "online" ? "primary compact" : "ghost compact"} disabled={state.label === "启动中"} onClick={openPrimary}>
                   {state.action}
@@ -1718,8 +1837,16 @@ function Projects({ me }) {
           project={selected}
           canEdit={me.role !== "viewer"}
           notify={notify}
+          refreshRevision={detailRevision}
           onUpdated={(updated) => {
             setSelected(updated);
+            load();
+          }}
+          onDeploymentCreated={(deployment) => {
+            setDeployments((current) => [
+              deployment,
+              ...current.filter((item) => item.id !== deployment.id),
+            ]);
             load();
           }}
           onDeleted={(result) => {
@@ -1737,6 +1864,10 @@ function Projects({ me }) {
         <DeploymentDetail
           item={selectedDeployment}
           onConfigureDomain={setDomainFor}
+          onChanged={() => {
+            setDetailRevision((value) => value + 1);
+            load();
+          }}
           onClose={() => setSelectedDeployment(null)}
         />
       )}{" "}
@@ -2394,7 +2525,29 @@ function CredentialModal({ onClose }) {
 function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
   const [files, setFiles] = useState([]),
     [busy, setBusy] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [editingRuntime, setEditingRuntime] = useState(false),
+    [runtimeRows, setRuntimeRows] = useState([]);
+  const beginRuntimeEdit = () => {
+    setRuntimeRows((analysis?.runtime_services || []).map((row) => ({ ...row })));
+    setEditingRuntime(true);
+  };
+  const saveRuntimeImages = async () => {
+    setBusy(true);
+    try {
+      const updated = await api(`/projects/${project.id}/runtime-images`, {
+        method: "PUT",
+        body: JSON.stringify({ items: runtimeRows.filter((row) => row.editable !== false).map(({ service, image }) => ({ service, image })) }),
+      });
+      setEditingRuntime(false);
+      onDone?.(updated);
+      notify?.("当前项目的运行服务版本已保存，仅后续部署使用");
+    } catch (e) {
+      notify?.(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
   const selectFiles = (e) =>
     setFiles([...e.target.files].map((file) => ({ file, path: file.name })));
   const selectFolder = (e) =>
@@ -2452,7 +2605,10 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
                 <AnalysisSummaryDetails text={analysis.summary} />
               </span>
             </div>
-            {analysis.revision && <code>{analysis.revision.slice(0, 12)}</code>}
+            <div className="source-process-meta">
+              <span>{analysisDuration(analysis)}</span>
+              {analysis.revision && <code>{analysis.revision.slice(0, 12)}</code>}
+            </div>
           </div>
           <div className="source-process-track">
             {["保存项目", project.source_type === "git" ? "拉取源码" : "接收源码", "分析源码", "准备完成"].map((label, index) => {
@@ -2504,6 +2660,30 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
               ))}
             </div>
           ) : <div className="alert info">本次旧分析未保存版本明细，点击“重新分析”后会补全。</div>}
+          {!!(analysis.runtime_services || []).length && (
+            <div className="source-runtime-services">
+              <div className="source-runtime-services-title">
+                <div><b>运行服务</b><span>源码有明确要求就采用；否则使用平台推荐</span></div>
+                {canEdit && !editingRuntime && analysis.runtime_services.some((row) => row.editable !== false) && <button className="ghost compact" onClick={beginRuntimeEdit}>修改版本</button>}
+              </div>
+              <div className="source-runtime-services-grid">
+                {(editingRuntime ? runtimeRows : analysis.runtime_services).map((row, index) => (
+                  <div key={row.service}>
+                    <span>{row.service}</span>
+                    {row.mode === "external" ? (
+                      <code title={row.endpoint}>{row.endpoint || "使用已保存的外接配置"}</code>
+                    ) : editingRuntime ? (
+                      <input value={row.image} onChange={(e) => setRuntimeRows(runtimeRows.map((item, itemIndex) => itemIndex === index ? { ...item, image: e.target.value } : item))} />
+                    ) : <code>{row.image}</code>}
+                    <em className={row.mode === "external" ? "external" : row.source === "源码识别" ? "detected" : "recommended"}>
+                      {row.mode === "external" ? "源码识别 · 外部依赖" : row.source}
+                    </em>
+                  </div>
+                ))}
+              </div>
+              {editingRuntime && <div className="source-runtime-actions"><button className="ghost" onClick={() => setEditingRuntime(false)}>取消</button><button className="primary" disabled={busy} onClick={saveRuntimeImages}>{busy && <LoaderCircle className="spin" />}保存版本</button></div>}
+            </div>
+          )}
         </div>
       )}
       {project.source_type === "upload" ? (
@@ -2567,12 +2747,15 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
   );
 }
 
-function ProjectDeleteDialog({ project, onClose, onDone }) {
+function ProjectDeleteDialog({ project, onClose, onDone, onReset }) {
   const [preview, setPreview] = useState(null),
     [error, setError] = useState(""),
     [selectedVolumes, setSelectedVolumes] = useState([]),
     [confirm, setConfirm] = useState(""),
-    [busy, setBusy] = useState(false);
+    [copiedName, setCopiedName] = useState(false),
+    [keepProject, setKeepProject] = useState(true),
+    [busy, setBusy] = useState(false),
+    [result, setResult] = useState(null);
   useEffect(() => {
     api(`/projects/${project.id}/delete-preview`)
       .then((result) => {
@@ -2585,15 +2768,25 @@ function ProjectDeleteDialog({ project, onClose, onDone }) {
     setBusy(true);
     setError("");
     try {
-      const result = await api(
-        `/projects/${project.id}?delete_volumes=${encodeURIComponent(JSON.stringify(selectedVolumes))}`,
+      const removed = await api(
+        `/projects/${project.id}?keep_project=${keepProject ? "true" : "false"}&delete_volumes=${encodeURIComponent(JSON.stringify(selectedVolumes))}`,
         { method: "DELETE" },
       );
-      onDone?.(result);
+      setResult(removed);
     } catch (e) {
       setError(e.message);
     } finally {
       setBusy(false);
+    }
+  };
+  const copyProjectName = async () => {
+    try {
+      await copyText(project.name);
+      setConfirm(project.name);
+      setCopiedName(true);
+      setTimeout(() => setCopiedName(false), 1800);
+    } catch (e) {
+      setError(e.message);
     }
   };
   const labels = {
@@ -2607,12 +2800,60 @@ function ProjectDeleteDialog({ project, onClose, onDone }) {
     source_origin: "源码来源",
     source: "平台上传源码",
   };
+  if (result) {
+    return (
+      <Modal title={`${result.project_retained ? "项目已重置" : "项目已删除"} · ${project.name}`} onClose={() => result.project_retained ? onReset?.(result) : onDone?.(result)} wide>
+        <div className="panel security-card ai-delete-summary">
+          <ShieldCheck />
+          <div>
+            <h3>清理完成</h3>
+            <p>{result.summary}</p>
+            <small>以下是平台实际执行并复查通过的清理结果。</small>
+          </div>
+        </div>
+        <div className="delete-inventory">
+          {(result.details || []).map((detail, index) => (
+            <div key={index}>
+              <div><b>已完成</b><em>已复查</em></div>
+              <span>{typeof detail === "string" ? detail : detail.summary || JSON.stringify(detail)}</span>
+            </div>
+          ))}
+        </div>
+        <h3>已删除资源清单</h3>
+        <div className="delete-inventory">
+          {["deployments", "containers", "images", "registry_images", "directories", "gateway_files", "source"].map((key) => (
+            <div key={key}>
+              <div><b>{labels[key]}</b><em>{preview?.resources?.[key]?.length || 0} 项</em></div>
+              {(preview?.resources?.[key] || []).length ? (
+                <ul>{preview.resources[key].map((item, index) => (
+                  <li key={index}>{typeof item === "string" ? item : item.name || item.path || item.release || item.id}{item.node ? ` · ${item.node}` : ""}</li>
+                ))}</ul>
+              ) : <span>无</span>}
+            </div>
+          ))}
+          <div>
+            <div><b>已删除数据卷</b><em>{selectedVolumes.length} 项</em></div>
+            {selectedVolumes.length ? <ul>{selectedVolumes.map((name) => <li key={name}>{name}</li>)}</ul> : <span>无（数据已保留）</span>}
+          </div>
+          <div>
+            <div><b>保留数据卷</b><em>{(preview?.resources?.volumes || []).filter((item) => !selectedVolumes.includes(item.name)).length} 项</em></div>
+            {(preview?.resources?.volumes || []).filter((item) => !selectedVolumes.includes(item.name)).length ? (
+              <ul>{preview.resources.volumes.filter((item) => !selectedVolumes.includes(item.name)).map((item) => <li key={item.name}>{item.name} · {item.node}</li>)}</ul>
+            ) : <span>无</span>}
+          </div>
+        </div>
+        <div className="modal-actions">
+          <button className="primary" onClick={() => result.project_retained ? onReset?.(result) : onDone?.(result)}>完成</button>
+        </div>
+      </Modal>
+    );
+  }
   return (
     <Modal title={`删除项目 · ${project.name}`} onClose={onClose} wide>
       {!preview && !error ? (
         <div className="center">
           <LoaderCircle className="spin" />
-          <span>系统 AI 正在查询服务器资源...</span>
+          <span>AI 正在分析项目资源...</span>
         </div>
       ) : (
         <>
@@ -2672,12 +2913,28 @@ function ProjectDeleteDialog({ project, onClose, onDone }) {
               ))}
             </div>
           )}
+          <div className={`delete-mode-card ${keepProject ? "selected" : ""}`}>
+            <label className="delete-mode-option">
+              <input type="checkbox" checked={keepProject} onChange={(event) => setKeepProject(event.target.checked)} />
+              <span className="delete-mode-copy">
+                <b>仅清空运行资源 <em>推荐</em></b>
+                <small>保留项目、源码与连接配置；清理发布记录、容器、镜像和目录后可重新发布。</small>
+              </span>
+            </label>
+          </div>
           {(preview?.counts?.volumes || 0) > 0 ? null : (
             <div className="alert info">
               未发现该项目创建的平台托管数据卷；本次只删除清单中的项目资源。外部数据库和外部中间件不会处理。
             </div>
           )}
-          <Field label={`输入项目名称“${project.name}”确认`}>
+          <Field label="输入项目名称确认" className="delete-confirm-field">
+            <div className="delete-confirm-name">
+              <code>{project.name}</code>
+              <button type="button" className="ghost" onClick={copyProjectName}>
+                {copiedName ? <ShieldCheck /> : <Copy />}
+                {copiedName ? "已复制并填入" : "复制并填入"}
+              </button>
+            </div>
             <input
               value={confirm}
               onChange={(e) => setConfirm(e.target.value)}
@@ -2701,8 +2958,8 @@ function ProjectDeleteDialog({ project, onClose, onDone }) {
             >
               {busy ? <LoaderCircle className="spin" /> : <Trash2 />}
               {busy
-                ? "AI 正在停止服务并逐项清理..."
-                : "确认删除项目及全部关联资源"}
+                ? "正在停止服务并清理项目资源..."
+                : keepProject ? "确认清空并保留项目" : "确认删除项目及全部关联资源"}
             </button>
           </div>
         </>
@@ -2715,10 +2972,12 @@ function ProjectDetail({
   project,
   canEdit,
   onUpdated,
+  onDeploymentCreated,
   onDeleted,
   notify,
   onClose,
   onOpenDeployment,
+  refreshRevision = 0,
 }) {
   const [tab, setTab] = useState("settings"),
     [showDelete, setShowDelete] = useState(false),
@@ -2728,11 +2987,14 @@ function ProjectDetail({
     [deployments, setDeployments] = useState(null),
     [runtime, setRuntime] = useState(null),
     [runtimeRefreshing, setRuntimeRefreshing] = useState(false),
+    [projectLifecycleBusy, setProjectLifecycleBusy] = useState(""),
+    [projectStopConfirm, setProjectStopConfirm] = useState(false),
     [replicaStatus, setReplicaStatus] = useState(null),
     [dataResources, setDataResources] = useState(null),
     [accessConfig, setAccessConfig] = useState(null),
     [gatewaySnapshot, setGatewaySnapshot] = useState(null),
     [gatewaySnapshotLoading, setGatewaySnapshotLoading] = useState(false),
+    [showGatewaySnapshot, setShowGatewaySnapshot] = useState(false),
     [showGatewaySettings, setShowGatewaySettings] = useState(false),
     [showDomainConfig, setShowDomainConfig] = useState(false),
     [deployConfirm, setDeployConfirm] = useState(false),
@@ -2836,16 +3098,18 @@ function ProjectDetail({
   const loadRuntime = (silent = false, force = false) => {
     if (runtimePendingRef.current) return;
     runtimePendingRef.current = true;
-    setRuntimeRefreshing(true);
+    if (!silent) setRuntimeRefreshing(true);
     api(`/projects/${project.id}/runtime${force ? "?refresh=true" : ""}`)
       .then(setRuntime)
       .catch((e) => {
-        setRuntime((current) => current || { environments: [], error: e.message });
-        if (runtime) notify?.(`运行状态刷新失败：${e.message}`, "error");
+        setRuntime((current) => current
+          ? { ...current, refreshing: false, refresh_error: e.message }
+          : { environments: [], error: e.message, refreshing: false });
+        if (!silent) notify?.(`运行状态刷新失败：${e.message}`, "error");
       })
       .finally(() => {
         runtimePendingRef.current = false;
-        setRuntimeRefreshing(false);
+        if (!silent) setRuntimeRefreshing(false);
       });
   };
   const loadReplicas = () =>
@@ -2862,8 +3126,12 @@ function ProjectDetail({
       setGatewaySnapshotLoading(false);
     }
   };
-  const loadDataResources = () => {
-    setDataResources(null);
+  const openGatewaySnapshot = () => {
+    setShowGatewaySnapshot(true);
+    if (!gatewaySnapshot && !gatewaySnapshotLoading) loadGatewaySnapshot();
+  };
+  const loadDataResources = (silent = false) => {
+    if (!silent && !dataResources) setDataResources(null);
     Promise.all([
       api(`/projects/${project.id}/data-resources`),
       canEdit ? api(`/projects/${project.id}/managed-credentials`).catch(() => ({ items: [] })) : Promise.resolve({ items: [] }),
@@ -2871,6 +3139,7 @@ function ProjectDetail({
     ])
       .then(([resources, credentials, exposures]) => setDataResources({
         ...resources,
+        data_exposures: exposures.items || [],
         managed_credentials: (credentials.items || []).map((item) => ({
           ...item,
           exposure: (exposures.items || []).find((entry) => entry.service === item.service) || null,
@@ -2881,28 +3150,25 @@ function ProjectDetail({
   useEffect(() => {
     setNodeError("");
     setNodes(null);
+    setDataResources(null);
+    // Runtime inspection may involve a remote Docker/SSH refresh. Keep it in
+    // flight, but do not make the project shell wait for it before rendering
+    // settings, deployment history and environment data.
+    runtimePendingRef.current = true;
+    const runtimeRequest = api(`/projects/${project.id}/runtime`)
+      .catch(() => ({ environments: [] }))
+      .finally(() => { runtimePendingRef.current = false; });
     Promise.all([
       api("/nodes"),
       api(`/deployments?project_id=${project.id}`),
       canEdit ? api(`/projects/${project.id}/environment`) : Promise.resolve({ env_text: "" }),
-      api(`/projects/${project.id}/runtime`).catch(() => ({ environments: [] })),
     ])
-      .then(([nodeItems, records, environment, runtimeData]) => {
+      .then(([nodeItems, records, environment]) => {
         setNodes(nodeItems);
         setDeployments(records);
-        setRuntime(runtimeData);
         const latestSuccessful = records.find((item) => item.status === "success");
         setHostPort((current) => current || latestSuccessful?.host_port || "");
-        const activeEnvironment = (runtimeData.environments || []).find(
-          (item) => item.deployment_id === latestSuccessful?.id,
-        );
-        const mappedContainerPort = latestSuccessful?.host_port
-          ? (activeEnvironment?.containers || []).map((item) => {
-              const match = String(item.ports || "").match(new RegExp(`:${latestSuccessful.host_port}->(\\d+)`));
-              return match?.[1] ? Number(match[1]) : null;
-            }).find(Boolean)
-          : null;
-        setContainerPort((current) => current || latestSuccessful?.deployment_plan?.container_port || mappedContainerPort || "");
+        setContainerPort((current) => current || latestSuccessful?.deployment_plan?.container_port || "");
         setEnvText(environment.env_text || "");
         setManagedEnvText(environment.managed_env_text || "");
         setIntegrationAnalysis(environment.integration_analysis || null);
@@ -2912,6 +3178,19 @@ function ProjectDetail({
             ? lastNode
             : nodeItems[0]?.id || "",
         );
+        runtimeRequest.then((runtimeData) => {
+          setRuntime(runtimeData);
+          const activeEnvironment = (runtimeData.environments || []).find(
+            (item) => item.deployment_id === latestSuccessful?.id,
+          );
+          const mappedContainerPort = latestSuccessful?.host_port
+            ? (activeEnvironment?.containers || []).map((item) => {
+                const match = String(item.ports || "").match(new RegExp(`:${latestSuccessful.host_port}->(\\d+)`));
+                return match?.[1] ? Number(match[1]) : null;
+              }).find(Boolean)
+            : null;
+          setContainerPort((current) => current || mappedContainerPort || "");
+        });
       })
       .catch((e) => {
         setNodeError(e.message);
@@ -2919,7 +3198,7 @@ function ProjectDetail({
         setDeployments([]);
       });
     loadReplicas();
-  }, [project.id]);
+  }, [project.id, refreshRevision]);
   useEffect(() => {
     if (!["queued", "running"].includes(integrationAnalysis?.status)) return undefined;
     const timer = setInterval(() => {
@@ -2932,6 +3211,22 @@ function ProjectDetail({
     }, 4000);
     return () => clearInterval(timer);
   }, [project.id, integrationAnalysis?.status]);
+  useEffect(() => {
+    if (tab !== "deployments") return undefined;
+    loadDeployments();
+    const timer = setInterval(() => {
+      if (!document.hidden) loadDeployments();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [tab, project.id]);
+  useEffect(() => {
+    // Warm the lightweight snapshot while the user reads runtime cards. The
+    // button remains immediately clickable and opens from cache instead of
+    // blocking on a remote gateway SSH inspection.
+    if (tab === "runtime" && !gatewaySnapshot && !gatewaySnapshotLoading) {
+      loadGatewaySnapshot();
+    }
+  }, [tab, project.id]);
   const save = async () => {
     if (!name.trim()) return;
     if (!validPort(containerPort) || !validPort(hostPort)) {
@@ -3011,6 +3306,11 @@ function ProjectDetail({
         }),
       });
       setMsg(`部署任务已创建：${d.id.slice(0, 8)}`);
+      setDeployments((current) => [
+        d,
+        ...(current || []).filter((item) => item.id !== d.id),
+      ]);
+      onDeploymentCreated?.(d);
       setDeployConfirm(false);
       loadDeployments();
     } catch (e) {
@@ -3034,8 +3334,43 @@ function ProjectDetail({
       setBusy(false);
     }
   };
+  const stopProject = async () => {
+    setProjectLifecycleBusy("stop");
+    setProjectStopConfirm(false);
+    try {
+      await api(`/projects/${project.id}/runtime/stop`, { method: "POST" });
+      notify?.("项目的应用和数据服务已全部停止", "success");
+      await loadDeployments();
+      loadRuntime(false, true);
+      loadDataResources(true);
+      onUpdated?.(project);
+    } catch (e) {
+      notify?.(e.message, "error");
+      loadRuntime(false, true);
+    } finally {
+      setProjectLifecycleBusy("");
+    }
+  };
+  const startProject = async (deploymentId) => {
+    if (!deploymentId) return;
+    setProjectLifecycleBusy("start");
+    try {
+      await api(`/deployments/${deploymentId}/start`, { method: "POST" });
+      notify?.("项目已重新启用", "success");
+      await loadDeployments();
+      loadRuntime(false, true);
+      loadDataResources(true);
+      onUpdated?.(project);
+    } catch (e) {
+      notify?.(e.message, "error");
+      loadRuntime(false, true);
+    } finally {
+      setProjectLifecycleBusy("");
+    }
+  };
   const selectedNode = (nodes || []).find((item) => item.id === node);
   const latestSuccessfulDeployment = (deployments || []).find((item) => item.status === "success");
+  const latestStoppedDeployment = (deployments || []).find((item) => item.status === "stopped" && item.release && item.access_url);
   const allocatedHostPort = hostPort || latestSuccessfulDeployment?.host_port || "";
   const allocatedContainerPort = containerPort || latestSuccessfulDeployment?.deployment_plan?.container_port || "";
   const normalizedDomain = String(domain || "").trim().replace(/^https?:\/\//i, "").replace(/\/$/, "");
@@ -3150,8 +3485,63 @@ function ProjectDetail({
       )}
     </section>
   ) : null;
+  const projectRuntimeContainers = (runtime?.environments || []).flatMap((environment) => environment.containers || []);
+  const projectDataContainerCount = projectRuntimeContainers.filter((container) =>
+    dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`),
+  ).length;
+  const projectApplicationContainerCount = Math.max(0, projectRuntimeContainers.length - projectDataContainerCount);
+  const projectRunningApplicationContainerCount = projectRuntimeContainers.filter((container) => {
+    const isData = dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`);
+    const state = `${container.state || ""} ${container.status || ""}`.toLowerCase();
+    return !isData && (state.includes("running") || state.includes("up") || state.includes("healthy"));
+  }).length;
+  const projectRunningDataContainerCount = projectRuntimeContainers.filter((container) => {
+    const isData = dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`);
+    const state = `${container.state || ""} ${container.status || ""}`.toLowerCase();
+    return isData && (state.includes("running") || state.includes("up") || state.includes("healthy"));
+  }).length;
+  const projectDataLabels = [...new Set(projectRuntimeContainers
+    .filter((container) => dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`))
+    .map((container) => {
+      const identity = `${container.service || ""} ${container.name || ""} ${container.image || ""}`.toLowerCase();
+      if (/mysql|mariadb/.test(identity)) return "MySQL";
+      if (/redis/.test(identity)) return "Redis";
+      if (/postgres/.test(identity)) return "PostgreSQL";
+      if (/mongo/.test(identity)) return "MongoDB";
+      if (/minio/.test(identity)) return "MinIO";
+      return container.service || "数据服务";
+    }))];
+  const projectLifecycleActions = latestSuccessfulDeployment ? (
+    <div className="project-lifecycle-actions">
+      <span className="project-lifecycle-state running"><i />运行中{runtime && <small>应用 {projectApplicationContainerCount} · 数据 {projectDataContainerCount}</small>}</span>
+      {canEdit && <button className="danger-outline" disabled={!!projectLifecycleBusy} onClick={() => setProjectStopConfirm(true)}>
+        {projectLifecycleBusy === "stop" ? <LoaderCircle className="spin" /> : <Square />}
+        {projectLifecycleBusy === "stop" ? "停止中" : "停止项目"}
+      </button>}
+    </div>
+  ) : latestStoppedDeployment && projectRunningDataContainerCount > 0 ? (
+    <div className="project-lifecycle-actions">
+      <span className="project-lifecycle-state partial"><i /><b>应用已停</b><small>数据运行中</small></span>
+      {canEdit && <button className="primary" disabled={!!projectLifecycleBusy} onClick={() => startProject(latestStoppedDeployment.id)}>
+        {projectLifecycleBusy === "start" ? <LoaderCircle className="spin" /> : <Play />}
+        {projectLifecycleBusy === "start" ? "启动中" : "启动应用"}
+      </button>}
+      {canEdit && <button className="danger-outline" disabled={!!projectLifecycleBusy} onClick={() => setProjectStopConfirm(true)}>
+        {projectLifecycleBusy === "stop" ? <LoaderCircle className="spin" /> : <Square />}
+        {projectLifecycleBusy === "stop" ? "停止中" : "停止项目"}
+      </button>}
+    </div>
+  ) : latestStoppedDeployment ? (
+    <div className="project-lifecycle-actions">
+      <span className="project-lifecycle-state stopped"><i />已停止</span>
+      {canEdit && <button className="primary" disabled={!!projectLifecycleBusy} onClick={() => startProject(latestStoppedDeployment.id)}>
+        {projectLifecycleBusy === "start" ? <LoaderCircle className="spin" /> : <Play />}
+        {projectLifecycleBusy === "start" ? "启动中" : "启动项目"}
+      </button>}
+    </div>
+  ) : null;
   return (
-    <Modal className="project-detail-modal" title={project.name} onClose={onClose} wide>
+    <Modal className="project-detail-modal" title={project.name} headerActions={projectLifecycleActions} onClose={onClose} wide>
       <div className="project-tabs">
         <button
           className={tab === "settings" ? "active" : ""}
@@ -3164,22 +3554,23 @@ function ProjectDetail({
           className={tab === "runtime" ? "active" : ""}
           onClick={() => {
             setTab("runtime");
-            loadRuntime();
-            loadReplicas();
+            if (!runtime) loadRuntime(true);
+            if (!replicaStatus) loadReplicas();
           }}
         >
           <Boxes />
-          运行服务
+          运行服务 {projectRunningApplicationContainerCount > 0 && <em>{projectRunningApplicationContainerCount}</em>}
         </button>
         <button
           className={tab === "data" ? "active" : ""}
           onClick={() => {
             setTab("data");
-            loadDataResources();
+            if (!dataResources) loadDataResources();
+            if (!runtime) loadRuntime(true);
           }}
         >
           <ShieldCheck />
-          数据资源
+          数据资源 {projectRunningDataContainerCount > 0 && <em>{projectRunningDataContainerCount}</em>}
         </button>
         <button
           className={tab === "source" ? "active" : ""}
@@ -3199,10 +3590,18 @@ function ProjectDetail({
       {tab === "settings" ? (
         <>
           <div className="project-config-intro">
-            <b>项目配置</b>
-            <span>
-              这里保存长期设置；每次发布实际使用的端口和状态请到“发布记录”查看。
-            </span>
+            <div>
+              <b>项目配置</b>
+              <span>
+                这里保存长期设置；每次发布实际使用的端口和状态请到“发布记录”查看。
+              </span>
+            </div>
+            {canEdit && (
+              <button className="ghost" disabled={integrationLoading} onClick={() => analyzeIntegrations(deploymentMode, true)}>
+                {integrationLoading ? <LoaderCircle className="spin" /> : <Bot />}
+                {integrationLoading ? "正在分析..." : "重新分析项目"}
+              </button>
+            )}
           </div>
           <div className="project-settings-grid project-settings-primary">
             <Field label="项目名称">
@@ -3301,10 +3700,6 @@ function ProjectDetail({
                 <div className="preserve-config-panel">
                   <div className="preserve-config-head">
                     <div><Settings /><span><b>现有服务连接配置</b><small>部署前先让 AI 根据源码生成所需配置项</small></span></div>
-                    <button className="ghost" disabled={integrationLoading} onClick={() => analyzeIntegrations(deploymentMode, true)}>
-                      {integrationLoading ? <LoaderCircle className="spin" /> : <Bot />}
-                      {integrationLoading ? "正在分析源码..." : integrationAnalysis ? "重新分析" : "AI 分析所需配置"}
-                    </button>
                   </div>
                   {["queued", "running"].includes(integrationAnalysis?.status) ? (
                     <div className="integration-analysis-empty">
@@ -3493,13 +3888,15 @@ function ProjectDetail({
             runtime={runtime}
             refreshing={runtimeRefreshing}
             onRefresh={() => loadRuntime(false, true)}
-            onGateway={loadGatewaySnapshot}
-            gatewayLoading={gatewaySnapshotLoading}
+            onGateway={openGatewaySnapshot}
+            gatewayLoading={false}
+            onOpenData={() => setTab("data")}
             notify={notify}
             onOpen={(id) => {
               const found = deployments?.find((x) => x.id === id);
               if (found) onOpenDeployment?.(found);
             }}
+            scope="application"
           />
         </>
       ) : tab === "data" ? (
@@ -3507,6 +3904,13 @@ function ProjectDetail({
           project={project}
           canEdit={canEdit}
           data={dataResources}
+          runtime={runtime}
+          runtimeRefreshing={runtimeRefreshing}
+          onRuntimeRefresh={() => loadRuntime(false, true)}
+          onOpenDeployment={(id) => {
+            const found = deployments?.find((x) => x.id === id);
+            if (found) onOpenDeployment?.(found);
+          }}
           onRefresh={loadDataResources}
           notify={notify}
         />
@@ -3536,11 +3940,27 @@ function ProjectDetail({
                   <small>
                     {d.node_name} · {time(d.created_at)} · {deploymentDuration(d)}
                   </small>
+                  {d.rollback_transition?.kind === "rollback_target" && (
+                    <small className="release-transition rollback-target">
+                      <RefreshCw />由版本 {d.rollback_transition.from_release} 回滚至此
+                    </small>
+                  )}
+                  {d.rollback_transition?.kind === "rollback_source" && (
+                    <small className="release-transition rollback-source">
+                      <RefreshCw />已切换到版本 {d.rollback_transition.to_release}
+                    </small>
+                  )}
                 </div>
                 <div>
                   <Badge status={d.status} />
                   <span>
-                    {d.host_port ? `实际端口 ${d.host_port}` : "端口识别中"}
+                    {d.status === "success"
+                      ? (d.host_port ? `实际端口 ${d.host_port}` : "端口识别中")
+                      : d.status === "stopped"
+                        ? "启动时自动分配"
+                        : d.status === "failed"
+                          ? "未占用端口"
+                          : "端口分配中"}
                   </span>
                   {canEdit && d.rollback_allowed && (
                     <button className="ghost rollback-button" onClick={(event) => { event.stopPropagation(); setRollbackConfirm(d); }}>
@@ -3561,8 +3981,24 @@ function ProjectDetail({
           project={project}
           onClose={() => setShowDelete(false)}
           onDone={onDeleted}
+          onReset={() => {
+            setShowDelete(false);
+            onUpdated?.(project);
+          }}
         />
       )}{" "}
+      {projectStopConfirm && (
+        <ConfirmDialog
+          title="停止项目"
+          text={`确定停止“${project.name}”的全部运行服务？`}
+          description={`将停止 ${projectApplicationContainerCount} 个应用容器${projectDataLabels.length ? `以及 ${projectDataLabels.join("、")}` : ""}。数据卷、上传文件、源码和发布记录不会删除。`}
+          confirmText="确认停止项目"
+          danger
+          busy={projectLifecycleBusy === "stop"}
+          onClose={() => projectLifecycleBusy !== "stop" && setProjectStopConfirm(false)}
+          onConfirm={stopProject}
+        />
+      )}
       {deployConfirm && (
         <ConfirmDialog
           title="确认创建部署"
@@ -3578,7 +4014,7 @@ function ProjectDetail({
         <ConfirmDialog
           title="确认回滚版本"
           text={`确定回滚到版本 ${rollbackConfirm.release}？`}
-          description="平台将直接复用该版本已验证的镜像和配置，不重新构建；切换后会进行健康检查，失败时自动恢复当前线上版本。失败的发布记录不能用于回滚。"
+          description="平台会先校验并启动目标版本；健康检查和网关切换成功后，才停止当前线上应用。MySQL、Redis 与数据卷保持不动。任何步骤失败都会清理候选版本并保留当前线上版本。"
           confirmText="确认回滚"
           busy={busy}
           onClose={() => !busy && setRollbackConfirm(null)}
@@ -3601,7 +4037,7 @@ function ProjectDetail({
           }}
         />
       )}
-      {gatewaySnapshot && <GatewayGeneratedConfigModal preview={gatewaySnapshot} loading={gatewaySnapshotLoading} onClose={() => setGatewaySnapshot(null)} onRefresh={loadGatewaySnapshot} onSettings={canEdit ? () => setShowGatewaySettings(true) : null} notify={notify} />}
+      {showGatewaySnapshot && <GatewayGeneratedConfigModal preview={gatewaySnapshot || { routes: [], message: "正在后台读取网关配置..." }} loading={gatewaySnapshotLoading} onClose={() => setShowGatewaySnapshot(false)} onRefresh={loadGatewaySnapshot} onSettings={canEdit ? () => setShowGatewaySettings(true) : null} notify={notify} />}
       {showGatewaySettings && <GatewayPolicyModal projectId={project.id} onClose={() => setShowGatewaySettings(false)} onSaved={(preview) => { setGatewaySnapshot(preview); setShowGatewaySettings(false); notify?.("网关配置已生效", "success"); }} notify={notify} />}
     </Modal>
   );
@@ -3657,7 +4093,9 @@ function ServiceScaleControl({ projectId, container, containers, servicePools, e
   );
 }
 
-function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, onGateway, gatewayLoading, onOpen, notify }) {
+const dataContainerPattern = /mysql|mariadb|postgres|redis|mongo|oracle|sqlserver|elasticsearch|opensearch|minio|rabbitmq|kafka|zookeeper|activemq|nacos|consul|etcd/i;
+
+function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, onGateway, gatewayLoading, onOpenData, onOpen, notify, scope = "application" }) {
   const [restarting, setRestarting] = useState("");
   const [logTarget, setLogTarget] = useState(null);
   const [containerLogs, setContainerLogs] = useState("");
@@ -3775,16 +4213,17 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
       if (requestId === fileRequestRef.current) setFilesLoading(false);
     }
   };
-  const changeContainerTab = (tab) => {
+  const changeContainerTab = async (tab) => {
     setContainerTab(tab);
-    if (tab === "terminal" && !containerFiles.length) loadContainerFiles("/");
     if (tab === "terminal") {
       // This UI is a command box rather than a full xterm emulator. Use the
       // audited command endpoint so minimal Alpine/BusyBox shells cannot leak
       // PTY control sequences into commands or corrupt the rendered output.
       terminalSocketRef.current?.close();
       terminalSocketRef.current = null;
-      setTerminalConnected(true);
+      setTerminalConnected(false);
+      const ready = containerFiles.length ? true : await loadContainerFiles("/", { terminal: true });
+      setTerminalConnected(Boolean(ready));
       setTimeout(focusTerminalIfHovered, 0);
     }
   };
@@ -4015,25 +4454,55 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
     );
   if (!runtime.environments?.length)
     return <Empty icon={Boxes} text="这个项目还没有运行环境" />;
+  const allRuntimeContainers = runtime.environments.flatMap((environment) => environment.containers || []);
+  const allDataContainers = allRuntimeContainers.filter((container) =>
+    dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`),
+  );
+  const allApplicationContainers = allRuntimeContainers.filter((container) => !allDataContainers.includes(container));
+  const visibleEnvironments = runtime.environments
+    .map((env) => ({
+      ...env,
+      containers: (env.containers || []).filter((container) => {
+        const isData = dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`);
+        return scope === "data" ? isData : !isData;
+      }),
+    }))
+    .filter((env) => scope !== "data" || env.containers.length);
+  if (!visibleEnvironments.length)
+    return <Empty icon={Boxes} text={scope === "data" ? "当前版本没有数据库或中间件容器" : "当前版本没有应用容器"} />;
   return (
-    <div className="project-runtime">
+    <div className={`project-runtime ${scope === "data" ? "data-runtime" : "application-runtime"}`}>
       <div className="runtime-toolbar">
         <div>
-          <b>当前运行环境</b>
-          <span>每台服务器显示最近一次有效发布</span>
+          <b>{scope === "data" ? "数据容器" : "应用容器"}</b>
+          <span>{scope === "data" ? "数据库、中间件及其他非应用容器集中管理" : "前端、后端及业务进程"}</span>
         </div>
         <div className="runtime-toolbar-actions">
-          <button className="ghost" disabled={gatewayLoading} onClick={onGateway}>
+          {scope !== "data" && <button className="ghost" disabled={gatewayLoading} onClick={onGateway}>
             {gatewayLoading ? <LoaderCircle className="spin" /> : <Code2 />}
             平台网关
-          </button>
+          </button>}
           <button className="ghost" disabled={refreshing} onClick={onRefresh}>
             <RefreshCw className={refreshing ? "spin" : ""} />
             {refreshing ? "刷新中" : "刷新状态"}
           </button>
         </div>
       </div>
-      {runtime.environments.map((env) => (
+      {scope !== "data" && (
+        <div className="runtime-composition">
+          <span><Boxes /><b>共 {allRuntimeContainers.length} 个容器</b></span>
+          <span>应用 {allApplicationContainers.length}</span>
+          <span>数据资源 {allDataContainers.length}</span>
+          {allDataContainers.length > 0 && <button className="ghost" onClick={onOpenData}>管理数据资源 <ChevronRight /></button>}
+        </div>
+      )}
+      {runtime.refresh_error && (
+        <div className="alert warning runtime-refresh-error">
+          实时状态读取失败，当前展示基础信息。
+          <button className="ghost" onClick={onRefresh}><RefreshCw />重新读取</button>
+        </div>
+      )}
+      {visibleEnvironments.map((env) => (
         <div className="panel runtime-environment" key={env.deployment_id}>
           <div className="runtime-environment-head">
             <div>
@@ -4050,16 +4519,14 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
               {restarting === env.deployment_id ? (
                 <span className="badge info"><LoaderCircle className="spin" />启动中</span>
               ) : <Badge status={env.status} />}
-              <button
+              {scope !== "data" && env.containers?.length > 0 && <button
                 className="ghost"
                 disabled={!!restarting}
-                onClick={() => env.containers?.length
-                  ? setRestartConfirm({ deploymentId: env.deployment_id, containerName: "", label: `${env.node?.name || "当前服务器"}的全部服务`, risky: true })
-                  : startStopped(env.deployment_id)}
+                onClick={() => setRestartConfirm({ deploymentId: env.deployment_id, containerName: "", label: `${env.node?.name || "当前服务器"}的全部应用服务`, risky: true })}
               >
                 {restarting === env.deployment_id ? <LoaderCircle className="spin" /> : <RefreshCw />}
-                {restarting === env.deployment_id ? "启动中" : env.containers?.length ? "重启服务" : "重新启用"}
-              </button>
+                {restarting === env.deployment_id ? "重启中" : "重启应用"}
+              </button>}
               <button
                 className="ghost"
                 onClick={() => onOpen(env.deployment_id)}
@@ -4071,10 +4538,12 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
           </div>
           <div className="runtime-summary">
             <span>
-              内网实例端口<b>{env.host_port || "识别中"}</b>
+              内网实例端口
+              <b>{["success", "running"].includes(env.status) ? (env.host_port || "识别中") : "启动时自动分配"}</b>
             </span>
             <span>
-              访问地址<b>{env.access_url || "部署完成后生成"}</b>
+              访问地址
+              <b>{["success", "running"].includes(env.status) ? (env.access_url || "部署完成后生成") : "应用已停止"}</b>
             </span>
             <span>
               运行服务<b>{env.containers?.length || 0} 个</b>
@@ -4097,7 +4566,7 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
                       <small>{c.image || "容器"}</small>
                     </div>
                     <div className="service-title-tools">
-                      <ServiceScaleControl
+                      {scope !== "data" && <ServiceScaleControl
                         projectId={projectId}
                         container={c}
                         containers={env.containers}
@@ -4105,7 +4574,7 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
                         enabled={canEdit && env.status === "success"}
                         notify={notify}
                         onDone={() => onRefresh?.(true)}
-                      />
+                      />}
                       <i
                         className={
                           String(c.state).toLowerCase().includes("running") ||
@@ -4190,6 +4659,16 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
             <div className="container-log-toolbar">
               <div className="container-log-options">
                 <button className={`ghost log-refresh-toggle ${autoLogs ? "active" : ""}`} onClick={() => setAutoLogs((value) => !value)}>{autoLogs ? <Square /> : <Play />}{autoLogs ? "暂停刷新" : "自动刷新"}</button>
+                <button
+                  className={`ghost log-follow-toggle ${followLogs ? "active" : ""}`}
+                  onClick={() => {
+                    const next = !followLogs;
+                    setFollowLogs(next);
+                    if (next) requestAnimationFrame(() => {
+                      if (runtimeLogRef.current) runtimeLogRef.current.scrollTop = runtimeLogRef.current.scrollHeight;
+                    });
+                  }}
+                >{followLogs ? "保持最新" : "跟随已暂停"}</button>
               </div>
               <label className="container-log-search"><Search /><input value={logQuery} onChange={(event) => setLogQuery(event.target.value)} placeholder="搜索当前日志" />{logQuery && <span>{logMatchCount} 条</span>}</label>
               <div>
@@ -4199,7 +4678,14 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
                 <button className="ghost" disabled={!!restarting} onClick={() => setRestartConfirm({ deploymentId: logTarget.deploymentId, containerName: logTarget.container.name, label: `容器“${logTarget.container.name}”`, risky: /mysql|redis|postgres|mongo/i.test(`${logTarget.container.service} ${logTarget.container.name} ${logTarget.container.image}`) })}><RefreshCw />重启此容器</button>
               </div>
             </div>
-            <pre ref={runtimeLogRef} className={`logs runtime-container-log ${logScreenCleared ? "is-cleared" : ""}`}>{logScreenCleared ? "屏幕已清空，正在等待新日志…" : logsLoading && !containerLogs ? "正在读取容器日志..." : <HighlightedLogs text={containerLogs} query={logQuery} />}</pre>
+            <pre
+              ref={runtimeLogRef}
+              onScroll={(event) => {
+                const element = event.currentTarget;
+                setFollowLogs(element.scrollHeight - element.scrollTop - element.clientHeight < 36);
+              }}
+              className={`logs runtime-container-log ${logScreenCleared ? "is-cleared" : ""}`}
+            >{logScreenCleared ? "屏幕已清空，正在等待新日志…" : logsLoading && !containerLogs ? "正在读取容器日志..." : <HighlightedLogs text={containerLogs} query={logQuery} />}</pre>
           </>}
           {containerTab === "terminal" && <div className="container-workbench">
             <div className="container-terminal-panel" onMouseEnter={() => { terminalHoveredRef.current = true; terminalInputRef.current?.focus(); }} onMouseLeave={() => { terminalHoveredRef.current = false; terminalInputRef.current?.blur(); }} onClick={() => { terminalHoveredRef.current = true; terminalInputRef.current?.focus(); }}>
@@ -4269,7 +4755,7 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
   );
 }
 
-function ProjectDataResources({ project, canEdit, data, onRefresh, notify }) {
+function ProjectDataResources({ project, canEdit, data, runtime, runtimeRefreshing, onRuntimeRefresh, onOpenDeployment, onRefresh, notify }) {
   if (!data)
     return (
       <div className="center">
@@ -4287,6 +4773,48 @@ function ProjectDataResources({ project, canEdit, data, onRefresh, notify }) {
         </button>
       </div>
     );
+  const runtimeDataContainers = (runtime?.environments || [])
+    .flatMap((environment) => environment.containers || [])
+    .filter((container) => dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`));
+  const runtimeServiceKeys = new Set();
+  runtimeDataContainers.forEach((container) => {
+    const identity = `${container.service || ""} ${container.name || ""} ${container.image || ""}`.toLowerCase();
+    const service = String(container.service || "").toLowerCase();
+    if (service) runtimeServiceKeys.add(service);
+    if (/mysql|mariadb/.test(identity)) runtimeServiceKeys.add("mysql");
+    if (/redis/.test(identity)) runtimeServiceKeys.add("redis");
+    if (/postgres/.test(identity)) runtimeServiceKeys.add("postgres");
+    if (/mongo/.test(identity)) runtimeServiceKeys.add("mongodb");
+  });
+  // Credentials describe services that the platform may be able to create.
+  // Only expose them when the current runtime really contains that data service,
+  // otherwise source-code analysis can make an unused MySQL card look "live".
+  const credentialItems = (data.managed_credentials || []).filter((item) => {
+    const service = String(item.service || "").toLowerCase();
+    return runtimeServiceKeys.has(service)
+      || runtimeDataContainers.some((container) => `${container.service || ""} ${container.name || ""} ${container.image || ""}`.toLowerCase().includes(service));
+  });
+  const knownRuntimeServices = {
+    mysql: { label: "MySQL", port: "3306", database: "" },
+    redis: { label: "Redis", port: "6379", database: "0" },
+  };
+  runtimeDataContainers.forEach((container) => {
+    const service = String(container.service || "").toLowerCase();
+    const meta = knownRuntimeServices[service];
+    if (!meta || credentialItems.some((item) => item.service === service)) return;
+    credentialItems.push({
+      service,
+      label: meta.label,
+      scope: "项目内部网络",
+      host: service,
+      port: meta.port,
+      database: meta.database,
+      username: "",
+      password: "",
+      runtime_only: true,
+      exposure: (data.data_exposures || []).find((entry) => entry.service === service) || null,
+    });
+  });
   return (
     <div className="project-data-resources">
       <div className="panel data-ai-summary">
@@ -4301,17 +4829,22 @@ function ProjectDataResources({ project, canEdit, data, onRefresh, notify }) {
           重新分析
         </button>
       </div>
-      {!!data.managed_credentials?.length && (
-        <div className="panel managed-credential-panel">
-          <div className="panel-head">
+      {!!credentialItems.length && (
+        <details className="panel managed-credential-panel">
+          <summary className="managed-credential-summary">
+            <div className="managed-credential-summary-icon"><ShieldCheck /></div>
             <div>
-              <h3>系统生成凭据</h3>
-              <p>仅显示平台为本项目创建的服务；外部数据库凭据不会出现在这里</p>
+              <h3>连接凭据</h3>
+              <p>默认隐藏敏感信息，仅显示当前实际运行的数据服务</p>
             </div>
-            <span className="badge info">管理员可见</span>
-          </div>
+            <div className="managed-credential-summary-services">
+              {credentialItems.map((item) => <span key={item.service}>{item.label}</span>)}
+            </div>
+            <span className="badge info">{credentialItems.length} 项 · 管理员可见</span>
+            <span className="managed-credential-toggle">展开查看 <ChevronRight /></span>
+          </summary>
           <div className="managed-credential-grid">
-            {data.managed_credentials.map((item) => (
+            {credentialItems.map((item) => (
               <ManagedCredentialCard
                 key={item.service}
                 item={item}
@@ -4321,74 +4854,39 @@ function ProjectDataResources({ project, canEdit, data, onRefresh, notify }) {
               />
             ))}
           </div>
+        </details>
+      )}
+      {runtimeDataContainers.length ? (
+        <ProjectRuntime
+          projectId={project.id}
+          canEdit={canEdit}
+          runtime={runtime}
+          refreshing={runtimeRefreshing}
+          onRefresh={onRuntimeRefresh}
+          onGateway={() => {}}
+          gatewayLoading={false}
+          onOpen={onOpenDeployment}
+          notify={notify}
+          scope="data"
+        />
+      ) : (
+        <div className="data-runtime-empty">
+          <Boxes />
+          <div><b>没有运行中的数据容器</b><span>当前项目未创建 MySQL、Redis 等平台托管服务</span></div>
+          <button className="ghost" disabled={runtimeRefreshing} onClick={onRuntimeRefresh}>
+            <RefreshCw className={runtimeRefreshing ? "spin" : ""} />刷新状态
+          </button>
         </div>
       )}
-      <div className="data-resource-grid">
-        <div className="panel data-db-card">
-          <div className="data-card-title">
-            <ShieldCheck />
-            <div>
-              <b>数据库</b>
-              <span>{data.database.type}</span>
-            </div>
-            <em className={data.database.connection_configured ? "ok" : "wait"}>
-              {data.database.connection_configured ? "已发现配置" : "未配置"}
-            </em>
-          </div>
-          <div className="detail-list">
-            <div>
-              <span>数据库类型</span>
-              <b>{data.database.type}</b>
-            </div>
-            <div>
-              <span>连接密码</span>
-              <b>
-                {data.database.password_configured
-                  ? "已加密/已配置，不显示明文"
-                  : "未发现配置"}
-              </b>
-            </div>
-            <div>
-              <span>实际连接检查</span>
-              <b>{data.database.live_checked ? "已通过" : "尚未执行"}</b>
-            </div>
-          </div>
-          <div className="data-safe-note">
-            外部服务密码不会显示；平台生成的凭据仅管理员可在上方查看和复制。
-          </div>
-        </div>
-        <div className="panel data-service-card">
-          <div className="data-card-title">
-            <Boxes />
-            <div>
-              <b>相关服务</b>
-              <span>仅生效配置才视为必需</span>
-            </div>
-          </div>
-          {data.services.map((x) => (
-            <div className="data-service-row" key={x.name}>
-              <span>{x.name}</span>
-              <em className={x.state}>
-                {x.state === "configured"
-                  ? "发现配置"
-                  : x.state === "candidate"
-                    ? "候选，暂不部署"
-                    : "未发现"}
-              </em>
-            </div>
-          ))}
-        </div>
-      </div>
-      {canEdit && <ProjectSqlConsole project={project} notify={notify} />}
-      <div className="panel migration-panel">
-        <div className="panel-head">
-          <div>
-            <h3>表结构与迁移脚本</h3>
-            <p>执行前必须连接数据库并完成备份</p>
-          </div>
-          <span className="badge info">{data.migrations.length} 个文件</span>
-        </div>
-        {data.migrations.length ? (
+      {canEdit && runtimeServiceKeys.has("mysql") && <ProjectSqlConsole project={project} notify={notify} />}
+      {runtimeServiceKeys.has("mysql") && (data.migrations.length ? (
+        <details className="panel migration-panel compact-tool-panel">
+          <summary className="compact-tool-summary">
+            <Code2 />
+            <div><h3>表结构与迁移脚本</h3><p>执行前必须连接数据库并完成备份</p></div>
+            <span className="badge info">{data.migrations.length} 个文件</span>
+            <span className="compact-tool-toggle">展开查看 <ChevronRight /></span>
+          </summary>
           <div className="migration-list">
             {data.migrations.map((x) => (
               <div key={x.path}>
@@ -4405,14 +4903,13 @@ function ProjectDataResources({ project, canEdit, data, onRefresh, notify }) {
               </div>
             ))}
           </div>
-        ) : (
-          <div className="runtime-empty">没有发现 SQL 文件</div>
-        )}
-        <div className="data-next-step">
-          <Bot />
-          <span>{data.next_step}</span>
+          <div className="data-next-step"><Bot /><span>{data.next_step}</span></div>
+        </details>
+      ) : (
+        <div className="panel migration-empty-inline">
+          <Code2 /><div><b>未发现迁移脚本</b><span>当前源码中没有 SQL 文件，无需执行迁移</span></div><span className="badge info">0 个文件</span>
         </div>
-      </div>
+      ))}
     </div>
   );
 }
@@ -4450,23 +4947,26 @@ function ProjectSqlConsole({ project, notify }) {
   };
   const columns = result?.columns || [];
   return (
-    <section className="panel project-sql-console">
-      <div className="panel-head">
-        <div><h3><Database /> SQL 控制台</h3><p>查询可直接执行；增删改必须确认并记录审计</p></div>
+    <details className="panel project-sql-console compact-tool-panel">
+      <summary className="compact-tool-summary">
+        <Database />
+        <div><h3>SQL 控制台</h3><p>仅用于当前 MySQL；写操作必须二次确认并记录审计</p></div>
         <span className="badge info">{dataLabel(project)}</span>
-      </div>
-      <textarea
-        value={sql}
-        onChange={(event) => { setSql(event.target.value); setPending(null); }}
-        placeholder="输入单条 SELECT、SHOW、INSERT、UPDATE 或 DELETE SQL"
-        spellCheck={false}
-      />
-      <div className="sql-console-actions">
-        <small>一次只执行一条 SQL；表结构修改请使用迁移流程。</small>
-        <button className="primary" disabled={busy || !sql.trim()} onClick={() => run()}>
-          {busy ? <LoaderCircle className="spin" /> : <Play />} 执行 SQL
-        </button>
-      </div>
+        <span className="compact-tool-toggle">打开控制台 <ChevronRight /></span>
+      </summary>
+      <div className="sql-console-body">
+        <textarea
+          value={sql}
+          onChange={(event) => { setSql(event.target.value); setPending(null); }}
+          placeholder="输入单条 SELECT、SHOW、INSERT、UPDATE 或 DELETE SQL"
+          spellCheck={false}
+        />
+        <div className="sql-console-actions">
+          <small>一次只执行一条 SQL；表结构修改请使用迁移流程。</small>
+          <button className="primary" disabled={busy || !sql.trim()} onClick={() => run()}>
+            {busy ? <LoaderCircle className="spin" /> : <Play />} 执行 SQL
+          </button>
+        </div>
       {pending && (
         <div className={`sql-confirm-card ${pending.high_risk ? "danger" : "warning"}`}>
           <ShieldCheck />
@@ -4486,8 +4986,9 @@ function ProjectSqlConsole({ project, notify }) {
           <div className="query-table-wrap"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{result.rows.map((row, rowIndex) => <tr key={rowIndex}>{columns.map((_, index) => <td key={index} title={row[index] || ""}>{row[index] || "—"}</td>)}</tr>)}</tbody></table></div>
         </div>
       )}
-      {result?.kind === "data_change" && <div className="sql-change-success"><ShieldCheck /><div><b>执行成功</b><span>{result.result}</span></div></div>}
-    </section>
+        {result?.kind === "data_change" && <div className="sql-change-success"><ShieldCheck /><div><b>执行成功</b><span>{result.result}</span></div></div>}
+      </div>
+    </details>
   );
 }
 
@@ -4556,13 +5057,19 @@ function ManagedCredentialCard({ item, projectId, notify, onChanged }) {
           </div>
         </div>
       ))}
-      <div className="managed-credential-row">
-        <span>密码</span><code title={visible ? item.password : "密码已隐藏"}>{visible ? item.password : "••••••••••••"}</code>
-        <div className="managed-credential-actions password-actions">
-          <button className="ghost" onClick={() => setVisible((value) => !value)}>{visible ? "隐藏" : "显示"}</button>
-          <button className="ghost" onClick={() => copyValue("password", item.password)}><Copy />{copied === "password" ? "已复制" : "复制"}</button>
+      {item.password ? (
+        <div className="managed-credential-row">
+          <span>密码</span><code title={visible ? item.password : "密码已隐藏"}>{visible ? item.password : "••••••••••••"}</code>
+          <div className="managed-credential-actions password-actions">
+            <button className="ghost" onClick={() => setVisible((value) => !value)}>{visible ? "隐藏" : "显示"}</button>
+            <button className="ghost" onClick={() => copyValue("password", item.password)}><Copy />{copied === "password" ? "已复制" : "复制"}</button>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="managed-credential-row credential-no-password">
+          <span>认证</span><code>未设置密码（仅内部访问）</code><div />
+        </div>
+      )}
       {item.exposure?.enabled && item.exposure?.connection_address && !editingExposure && (
         <div className="managed-exposure-summary">
           <div className="managed-exposure-live">
@@ -4601,6 +5108,53 @@ function ManagedCredentialCard({ item, projectId, notify, onChanged }) {
       )}
     </section>
   );
+}
+
+function ServicePortPopover({ hostPort, ports }) {
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  const buttonRef = useRef(null);
+  const panelRef = useRef(null);
+  const uniquePorts = Array.from(
+    new Map((ports || []).filter((item) => item?.port).map((item) => [`${item.service || "service"}-${item.port}`, item])).values(),
+  );
+  const hasEntryService = uniquePorts.some((item) => Number(item.port) === Number(hostPort));
+  const allPorts = (
+    hasEntryService ? uniquePorts : [{ service: "服务", port: hostPort }, ...uniquePorts]
+  ).map((item) => ({ ...item, entry: Number(item.port) === Number(hostPort) }));
+  useLayoutEffect(() => {
+    if (!open || !buttonRef.current) return undefined;
+    const place = () => {
+      const rect = buttonRef.current.getBoundingClientRect();
+      setPosition({
+        top: Math.min(window.innerHeight - 12, rect.bottom + 6),
+        left: Math.max(12, Math.min(window.innerWidth - 188, rect.left)),
+      });
+    };
+    const closeOutside = (event) => {
+      if (!buttonRef.current?.contains(event.target) && !panelRef.current?.contains(event.target)) setOpen(false);
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    document.addEventListener("pointerdown", closeOutside);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+      document.removeEventListener("pointerdown", closeOutside);
+    };
+  }, [open]);
+  return <>
+    <button ref={buttonRef} type="button" className="service-port-trigger" title="查看服务端口" aria-label={`查看 ${allPorts.length} 个服务端口`} onClick={(event) => { event.stopPropagation(); setOpen((value) => !value); }}>
+      <Network />{allPorts.length > 1 && <span>{allPorts.length}</span>}
+    </button>
+    {open && createPortal(
+      <div ref={panelRef} className="service-port-popover" style={position} onClick={(event) => event.stopPropagation()}>
+        {allPorts.map((item) => <span key={`${item.service}-${item.port}`}><b>{item.service}{item.entry && <small>入口</small>}</b><em>{item.port}</em></span>)}
+      </div>,
+      document.body,
+    )}
+  </>;
 }
 
 function DeploymentTable({ items, onSelect, onDelete, onDomain, selectedIds, onToggle, onToggleAll }) {
@@ -4647,10 +5201,6 @@ function DeploymentTable({ items, onSelect, onDelete, onDomain, selectedIds, onT
         <tbody>
           {items.map((x) => {
             const canDelete = ["failed", "stopped"].includes(x.status);
-            const failureReason = String(x.error || "")
-              .replace(/\\x1b\[[0-9;?]*[A-Za-z]/gi, " ")
-              .replace(/\s+/g, " ")
-              .trim();
             return (
               <tr key={x.id} onClick={() => onSelect?.(x)}>
                 {selectable && (
@@ -4692,29 +5242,22 @@ function DeploymentTable({ items, onSelect, onDelete, onDomain, selectedIds, onT
                       <div className="mini-progress"><i style={{ width: `${x.progress || 0}%` }} /></div>
                       <small>{x.progress || 0}%</small>
                     </>}
-                    {x.status === "failed" && (
-                      <small className="deployment-failure-reason" title={failureReason || "打开部署详情查看完整失败日志"}>
-                        {failureReason || "打开详情查看失败原因"}
-                      </small>
-                    )}
                   </div>
                 </td>
                 <td className="deployment-address-col">
-                  {x.internal_instances?.length > 1 && !["failed", "stopped"].includes(x.status) ? (
-                    <div className="instance-addresses">
-                      <b>Service 后端 · {x.internal_instances.length} 个容器</b>
-                      <small>{x.internal_instances.map((instance) => instance.port).join("、")}</small>
-                    </div>
-                  ) : x.node_access_url &&
+                  {x.node_access_url &&
                   !["failed", "stopped"].includes(x.status) ? (
-                    <a
-                      href={x.node_access_url}
-                      title={x.node_access_url}
-                      target="_blank"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      {x.node_access_url}
-                    </a>
+                    <div className="deployment-address-stack">
+                      <a
+                        href={x.node_access_url}
+                        title={x.node_access_url}
+                        target="_blank"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {x.node_access_url}
+                      </a>
+                      {x.host_port && <ServicePortPopover hostPort={x.host_port} ports={x.service_ports || []} />}
+                    </div>
                   ) : (
                     <span className="address-muted">
                       {x.status === "stopped"
@@ -4881,14 +5424,16 @@ function GatewayGeneratedConfigModal({ preview, loading, onClose, onRefresh, onS
     ["路由生成", preview.mode === "custom" ? "自定义路由" : "平台自动生成"],
     ["网关状态", preview.generated ? "运行中" : preview.message || "尚未生成"],
   ];
-  return <Modal className="gateway-snapshot-modal" title="平台网关生效配置（只读）" onClose={onClose}>
+  return <Modal className="gateway-snapshot-modal" title="平台网关配置" onClose={onClose}>
     <div className="gateway-snapshot-rows">{rows.map(([label, value]) => <div key={label}><span>{label}</span><b>{value}</b></div>)}</div>
-    <div className="gateway-snapshot-code-head"><b>Nginx 只读配置</b><span />
+    <div className="gateway-config-guidance">
+      <ShieldCheck /><span>{preview.config ? "配置由平台自动维护，发布时会重新生成。需要调整转发规则，请使用“网关设置”，不要直接修改服务器文件。" : (preview.message || "部署成功后，平台会自动生成并应用 Nginx 配置。")}</span>
+    </div>
+    <div className="gateway-snapshot-code-head"><b>{preview.config ? "自动生成的 Nginx 配置" : "配置操作"}</b><span />
       {onSettings && <button className="ghost" onClick={onSettings}><Settings />网关设置</button>}
       <button className="ghost" disabled={loading} onClick={onRefresh}>{loading ? <LoaderCircle className="spin" /> : <RefreshCw />}刷新</button>
-      <button className="ghost" disabled={!preview.config} onClick={() => navigator.clipboard?.writeText(preview.config).then(() => notify?.("配置已复制"))}><Copy />复制配置</button>
     </div>
-    {preview.config ? <pre className="gateway-snapshot-code">{preview.config}</pre> : <div className="alert info">{preview.message}</div>}
+    {preview.config && <pre className="gateway-snapshot-code">{preview.config}</pre>}
   </Modal>;
 }
 
@@ -4898,6 +5443,23 @@ function GatewayPolicyModal({ projectId, onClose, onSaved, notify }) {
     api(`/projects/${projectId}/domain-config`).then(setForm).catch((e) => setError(e.message));
   }, [projectId]);
   const set = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const selectMode = (mode) => setForm((current) => ({
+    ...current,
+    gateway_mode: mode,
+    custom_routes: mode === "custom" && !(current.custom_routes || []).length
+      ? (current.auto_routes || []).map((route) => ({ ...route }))
+      : current.custom_routes,
+  }));
+  const restoreDetectedRoutes = () => setForm((current) => ({
+    ...current,
+    custom_routes: (current.auto_routes || []).map((route) => ({ ...route })),
+  }));
+  const routeTargetText = (route) => {
+    const targets = form?.gateway_service_targets?.[route.service] || [];
+    const path = route.path || "/";
+    const forwarded = route.strip_prefix && path !== "/" ? "/（已去掉前缀）" : `${path}（保留前缀）`;
+    return `代理到 ${targets.length ? targets.map((target) => `http://${target}`).join("、") : (route.service || "尚未选择服务")} · 后端收到 ${forwarded}`;
+  };
   const save = async () => {
     setBusy(true); setError("");
     try {
@@ -4914,13 +5476,13 @@ function GatewayPolicyModal({ projectId, onClose, onSaved, notify }) {
     } catch (e) { setError(e.message); notify?.(e.message, "error"); }
     finally { setBusy(false); }
   };
-  return <Modal className="gateway-policy-modal" title="平台网关设置" onClose={onClose}>
+  return <Modal className="gateway-policy-modal" title="平台网关设置" onClose={onClose} closeOnMask={false}>
     {!form ? <div className="center"><LoaderCircle className="spin" /></div> : <div className="gateway-policy-body">
-      <div className="alert info">平台会根据实际运行的前端、后端及接口前缀自动生成路由；仅在自动识别不符合项目实际情况时使用自定义路由。</div>
+      <div className="alert info">平台会根据实际运行的前端、后端及接口前缀自动生成默认路由。自定义方案会单独保存，切回自动模式也不会丢失。</div>
       <Field label="路由生成方式">
         <div className="seg">
-          <button className={form.gateway_mode !== "custom" ? "on" : ""} onClick={() => set("gateway_mode", "auto")}>平台自动生成（推荐）</button>
-          <button disabled={!form.gateway_services?.length} className={form.gateway_mode === "custom" ? "on" : ""} onClick={() => set("gateway_mode", "custom")}>自定义路由</button>
+          <button className={form.gateway_mode !== "custom" ? "on" : ""} onClick={() => selectMode("auto")}>平台自动生成（推荐）</button>
+          <button className={form.gateway_mode === "custom" ? "on" : ""} onClick={() => selectMode("custom")}>自定义路由</button>
         </div>
       </Field>
       <div className="gateway-policy-limits">
@@ -4928,13 +5490,17 @@ function GatewayPolicyModal({ projectId, onClose, onSaved, notify }) {
         <Field label="上传大小（MB）"><PortInput min="1" max="2048" value={form.client_max_body_mb} onChange={(value) => set("client_max_body_mb", value)} /></Field>
       </div>
       {form.gateway_mode === "custom" && <div className="gateway-route-editor">
-        {(form.custom_routes || []).map((route, index) => <div className="gateway-route-row" key={index}>
-          <input value={route.path || ""} placeholder="/api" onChange={(event) => set("custom_routes", form.custom_routes.map((item, row) => row === index ? { ...item, path: event.target.value } : item))} />
-          <select value={route.service || ""} onChange={(event) => set("custom_routes", form.custom_routes.map((item, row) => row === index ? { ...item, service: event.target.value } : item))}>
-            <option value="">选择目标服务</option>{(form.gateway_services || []).map((service) => <option key={service} value={service}>{service}</option>)}
-          </select>
-          <label><input type="checkbox" checked={Boolean(route.strip_prefix)} onChange={(event) => set("custom_routes", form.custom_routes.map((item, row) => row === index ? { ...item, strip_prefix: event.target.checked } : item))} />去掉路径前缀</label>
-          <button className="ghost danger-text" onClick={() => set("custom_routes", form.custom_routes.filter((_, row) => row !== index))}><Trash2 /></button>
+        <div className="gateway-route-editor-head"><span>自定义方案（重新发布会继续使用）</span><button className="ghost" disabled={!(form.auto_routes || []).length} onClick={restoreDetectedRoutes}><RefreshCw />恢复自动识别结果</button></div>
+        {(form.custom_routes || []).map((route, index) => <div className="gateway-route-item" key={index}>
+          <div className="gateway-route-row">
+            <input value={route.path || ""} placeholder="访问路径，如 /prod-api/" onChange={(event) => set("custom_routes", form.custom_routes.map((item, row) => row === index ? { ...item, path: event.target.value } : item))} />
+            <select value={route.service || ""} onChange={(event) => set("custom_routes", form.custom_routes.map((item, row) => row === index ? { ...item, service: event.target.value } : item))}>
+              <option value="">选择代理目标服务</option>{(form.gateway_services || []).map((service) => <option key={service} value={service}>{service}</option>)}
+            </select>
+            <label title="例如 /prod-api/ 转发到后端时，勾选后后端收到 /；不勾选则后端仍收到 /prod-api/"><input type="checkbox" checked={Boolean(route.strip_prefix)} onChange={(event) => set("custom_routes", form.custom_routes.map((item, row) => row === index ? { ...item, strip_prefix: event.target.checked } : item))} />转发时去掉此前缀</label>
+            <button className="ghost danger-text" onClick={() => set("custom_routes", form.custom_routes.filter((_, row) => row !== index))}><Trash2 /></button>
+          </div>
+          <div className="gateway-route-target"><span>{route.path || "/"}</span><b>→</b><span>{routeTargetText(route)}</span></div>
         </div>)}
         <button className="ghost" onClick={() => set("custom_routes", [...(form.custom_routes || []), { path: "/", service: form.gateway_services?.[0] || "", strip_prefix: false }])}><Plus />添加路由</button>
       </div>}
@@ -5055,6 +5621,7 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
       className="domain-config-modal"
       title={`配置访问域名 · ${deployment.project_name}`}
       onClose={onClose}
+      closeOnMask={false}
       wide
     >
       {loading ? (
@@ -5217,7 +5784,10 @@ function Deployments() {
     [bulkBusy, setBulkBusy] = useState(false),
     [bulkDialog, setBulkDialog] = useState(null),
     [toast, setToast] = useState(null);
-  const load = () => api("/deployments").then(setItems);
+  const load = () => api("/deployments").then((next) => {
+    setItems(next);
+    return next;
+  });
   const notify = (text, type = "success") => {
     setToast({ text, type });
     setTimeout(() => setToast(null), 5000);
@@ -5256,15 +5826,16 @@ function Deployments() {
     );
     if (!targets.length) return;
     setBulkDialog({ targets, analyses: [], loading: true });
-    const analyses = await Promise.all(
-      targets.map(async (item) => {
-        try {
-          return { item, preview: await api(`/deployments/${item.id}/delete-preview`) };
-        } catch (error) {
-          return { item, error: error.message };
-        }
-      }),
-    );
+    // Inspect all selected releases concurrently, then let AI review the
+    // actual server inventory.  This keeps the safety analysis without the
+    // old one-record-at-a-time wait.
+    const analyses = await Promise.all(targets.map(async (item) => {
+      try {
+        return { item, preview: await api(`/deployments/${item.id}/delete-preview`) };
+      } catch (error) {
+        return { item, error: error.message };
+      }
+    }));
     setBulkDialog({ targets, analyses, loading: false });
   };
   const bulkDelete = async () => {
@@ -5272,14 +5843,20 @@ function Deployments() {
     setBulkBusy(true);
     let deleted = 0;
     const errors = [];
-    for (const item of targets) {
-      try {
-        await api(`/deployments/${item.id}`, { method: "DELETE" });
-        deleted += 1;
-      } catch (error) {
-        errors.push(`${item.release || item.id.slice(0, 8)}：${error.message}`);
+    const groups = Object.values(targets.reduce((result, item) => {
+      (result[item.project_id] ||= []).push(item);
+      return result;
+    }, {}));
+    await Promise.all(groups.map(async (group) => {
+      for (const item of group) {
+        try {
+          await api(`/deployments/${item.id}`, { method: "DELETE" });
+          deleted += 1;
+        } catch (error) {
+          errors.push(`${item.release || item.id.slice(0, 8)}：${error.message}`);
+        }
       }
-    }
+    }));
     setSelectedIds(new Set());
     setBulkDialog(null);
     setBulkBusy(false);
@@ -5292,11 +5869,23 @@ function Deployments() {
     );
   };
   useEffect(() => {
-    load();
-    const id = setInterval(() => {
-      if (!document.hidden && !document.querySelector(".modal")) load();
-    }, 10000);
-    return () => clearInterval(id);
+    let cancelled = false;
+    let timer = null;
+    const poll = async () => {
+      let delay = 20000;
+      if (!document.hidden) {
+        try {
+          const next = await load();
+          if (next.some((item) => ["queued", "running"].includes(item.status))) delay = 5000;
+        } catch (_error) {}
+      }
+      if (!cancelled) timer = setTimeout(poll, delay);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, []);
   const groups = Object.values(
     items.reduce((result, item) => {
@@ -5347,7 +5936,10 @@ function Deployments() {
           item={selected}
           onConfigureDomain={setDomainFor}
           onChanged={load}
-          onClose={() => setSelected(null)}
+          onClose={() => {
+            setSelected(null);
+            load();
+          }}
         />
       )}{" "}
       {domainFor && (
@@ -5388,16 +5980,41 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
     [selected, setSelected] = useState(null),
     [serviceLogs, setServiceLogs] = useState(""),
     [loadingLogs, setLoadingLogs] = useState(false),
+    [serviceAutoLogs, setServiceAutoLogs] = useState(true),
+    [followServiceLogs, setFollowServiceLogs] = useState(true),
     [stopping, setStopping] = useState(false),
+    [stopConfirm, setStopConfirm] = useState(false),
     [actionError, setActionError] = useState(null),
     [recoveryAnalysis, setRecoveryAnalysis] = useState(null),
     [recoveryLoading, setRecoveryLoading] = useState(false),
     [stageKey, setStageKey] = useState(null),
+    [buildChannel, setBuildChannel] = useState("all"),
     [gatewayConfig, setGatewayConfig] = useState(null),
     [copiedConfig, setCopiedConfig] = useState(""),
     [launchConfig, setLaunchConfig] = useState(null),
-    [scaleNotice, setScaleNotice] = useState("");
-  const refreshDetailRuntime = (force = true) => api(`/deployments/${item.id}/runtime${force ? "?refresh=true" : ""}`).then(setRuntime);
+    [launchFilePath, setLaunchFilePath] = useState(""),
+    [revealLaunchSecrets, setRevealLaunchSecrets] = useState(false),
+    [scaleNotice, setScaleNotice] = useState(""),
+    [stageLoading, setStageLoading] = useState(false),
+    [followStageLog, setFollowStageLog] = useState(true),
+    [followDetailScroll, setFollowDetailScroll] = useState(true),
+    [runtimeSection, setRuntimeSection] = useState("services"),
+    [detailTab, setDetailTab] = useState("pipeline");
+  const stageLogRef = useRef(null);
+  const detailScrollRef = useRef(null);
+  const serviceLogRef = useRef(null);
+  const runtimeRefreshPendingRef = useRef(false);
+  const parentSyncRef = useRef(`${item.status}|${item.access_url || ""}|${item.release || ""}`);
+  const refreshDetailRuntime = (force = true) => {
+    if (runtimeRefreshPendingRef.current) return Promise.resolve(null);
+    runtimeRefreshPendingRef.current = true;
+    return api(`/deployments/${item.id}/runtime${force ? "?refresh=true" : ""}`)
+      .then((next) => {
+        setRuntime(next);
+        return next;
+      })
+      .finally(() => { runtimeRefreshPendingRef.current = false; });
+  };
   const copyConfigText = async (key, value) => {
     try {
       await copyText(value);
@@ -5409,17 +6026,43 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
     }
   };
   useEffect(() => {
-    const load = () =>
-      api(
-        `/deployments/${item.id}${stageKey ? `?stage=${stageKey}` : ""}`,
-      ).then(setData);
+    let cancelled = false;
+    let timer = null;
+    const load = async () => {
+      try {
+        const next = await api(
+          `/deployments/${item.id}${stageKey ? `?stage=${stageKey}` : ""}`,
+        );
+        if (cancelled) return;
+        setData(next);
+        setStageLoading(false);
+        const syncKey = `${next.status}|${next.access_url || ""}|${next.release || ""}`;
+        if (syncKey !== parentSyncRef.current) {
+          parentSyncRef.current = syncKey;
+          onChanged?.();
+        }
+        // A stopped/successful historical record can be started, stopped or
+        // selected as a rollback target from another view. Keep the open
+        // detail modal synchronized instead of requiring close-and-reopen.
+        timer = setTimeout(load, ["queued", "running"].includes(next.status) ? 3000 : 5000);
+      } catch (_error) {
+        if (!cancelled) timer = setTimeout(load, 5000);
+        setStageLoading(false);
+      }
+    };
     load();
-    const id = setInterval(load, 3000);
-    return () => clearInterval(id);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [item.id, stageKey]);
   useEffect(() => {
+    setBuildChannel("all");
+    setFollowStageLog(true);
+  }, [stageKey]);
+  useEffect(() => {
     if (["running", "success", "stopped"].includes(data.status))
-      refreshDetailRuntime(false)
+      refreshDetailRuntime(true)
         .catch(() => {});
   }, [item.id, data.status, data.release]);
   useEffect(() => {
@@ -5435,14 +6078,19 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
     return () => clearTimeout(timer);
   }, [item.id, data.status, data.access_url, !!runtime]);
   useEffect(() => {
-    if (!runtime || !["success", "stopped"].includes(data.status)) return undefined;
+    if (!data.release || data.status === "queued") return undefined;
     const timer = setTimeout(() => {
-      api(`/deployments/${item.id}/launch-config`)
-        .then(setLaunchConfig)
+      api(`/deployments/${item.id}/launch-config${revealLaunchSecrets ? "?reveal_secrets=true" : ""}`)
+        .then((result) => {
+          setLaunchConfig(result);
+          setLaunchFilePath((current) => current && result.files?.some((file) => file.path === current)
+            ? current
+            : (result.files?.find((file) => file.used)?.path || result.files?.[0]?.path || ""));
+        })
         .catch(() => setLaunchConfig(null));
-    }, 800);
+    }, 300);
     return () => clearTimeout(timer);
-  }, [item.id, data.status, data.release, !!runtime]);
+  }, [item.id, data.status, data.release, revealLaunchSecrets]);
   useEffect(() => {
     if (data.status !== "stopped") return;
     setRecoveryLoading(true);
@@ -5458,13 +6106,13 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
         .then(setAiFollowup)
         .catch(() => {});
     load();
+    if (data.status !== "running") return undefined;
     const id = setInterval(load, 15000);
     return () => clearInterval(id);
   }, [item.id, data.status, data.current_step]);
-  const drill = async (service) => {
-    setSelected(service);
-    setLoadingLogs(true);
-    setServiceLogs("");
+  const loadServiceLogs = async (service, quiet = false) => {
+    if (!service) return;
+    if (!quiet) setLoadingLogs(true);
     try {
       const r = await api(
         `/deployments/${item.id}/containers/${encodeURIComponent(service.name)}/logs`,
@@ -5473,15 +6121,35 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
     } catch (e) {
       setServiceLogs(e.message);
     } finally {
-      setLoadingLogs(false);
+      if (!quiet) setLoadingLogs(false);
     }
   };
+  const drill = (service) => {
+    setSelected(service);
+    setServiceLogs("");
+    setServiceAutoLogs(true);
+    setFollowServiceLogs(true);
+    loadServiceLogs(service);
+  };
+  useEffect(() => {
+    if (!selected || !serviceAutoLogs) return undefined;
+    const timer = setInterval(() => loadServiceLogs(selected, true), 5000);
+    return () => clearInterval(timer);
+  }, [selected?.name, serviceAutoLogs]);
+  useEffect(() => {
+    if (!followServiceLogs) return;
+    requestAnimationFrame(() => {
+      if (serviceLogRef.current) serviceLogRef.current.scrollTop = serviceLogRef.current.scrollHeight;
+    });
+  }, [serviceLogs, followServiceLogs]);
   const stop = async () => {
     setStopping(true);
+    setStopConfirm(false);
     setActionError(null);
     try {
       await api(`/deployments/${item.id}/stop`, { method: "POST" });
       setData(await api(`/deployments/${item.id}`));
+      await refreshDetailRuntime(true).catch(() => {});
       onChanged?.();
     } catch (e) {
       setActionError({
@@ -5508,6 +6176,7 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
     try {
         await api(`/deployments/${item.id}/start`, { method: "POST" });
         setData(await api(`/deployments/${item.id}`));
+        await refreshDetailRuntime(true).catch(() => {});
         onChanged?.();
     } catch (e) {
       setActionError({
@@ -5537,37 +6206,136 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
       setServiceLogs(error.message);
     }
   };
-  const steps = data.pipeline_steps || [],
+  const fallbackSteps = [
+    ["analyze", "读取方案"], ["prepare", "准备环境"], ["build", "构建应用"],
+    ["start", "启动服务"], ["verify", "验证访问"],
+  ].map(([key, title], index) => ({
+    key, title,
+    status: data.status === "failed" && index === 0 ? "failed" : data.status === "stopped" && index === 0 ? "stopped" : "waiting",
+    log: index === 0 ? (data.error || "该记录暂未返回阶段明细，请下载完整日志查看。") : "",
+    build_streams: [], duration_seconds: null,
+  }));
+  const steps = data.pipeline_steps?.length ? data.pipeline_steps : fallbackSteps,
     liveStage = steps.find((step) => step.status === "running"),
     failedStage = steps.find((step) => step.status === "failed"),
+    selectedStage = steps.find((step) => step.key === stageKey),
+    loggedStage = [...steps].reverse().find((step) => step.log),
+    lastFinishedStage = [...steps].reverse().find((step) => step.status !== "waiting"),
     activeStage =
-      // Follow the live stage by default, but respect an explicit click so a
-      // user can inspect completed steps while the release keeps moving.
-      steps.find((x) => x.key === stageKey && !(data.status === "failed" && x.status === "waiting")) ||
+      // An explicit click is authoritative, including after a later stage
+      // failed. Previously the failed stage always won this selection, so
+      // clicking an earlier completed card kept showing the failed build card
+      // (whose log payload is intentionally the only one returned per API
+      // request) and made historical stage logs appear to have disappeared.
+      selectedStage ||
+      // With no explicit selection, a terminal failure should open directly
+      // on the failed stage.
       (data.status === "failed" && failedStage) ||
+      // Follow the live stage by default while the release keeps moving.
       (data.status === "running" && liveStage) ||
-      steps.find((x) => x.key === liveStage?.key) ||
-      steps.find((x) => x.status !== "waiting") ||
+      // The compact detail API returns log text only for the current/default
+      // stage. Select that stage on the first render; choosing the first
+      // successful card used to pair an empty card with another stage's log
+      // and incorrectly displayed “等待该步骤开始…”.
+      loggedStage ||
+      failedStage ||
+      lastFinishedStage ||
       steps[0];
+  const buildStreams = activeStage?.key === "build" ? (activeStage.build_streams || []) : [];
+  const selectedBuildStream = buildStreams.find((stream) => stream.key === buildChannel);
+  const displayedStageLog = buildChannel === "all" || !selectedBuildStream
+    ? activeStage?.log
+    : selectedBuildStream.log;
+  const followingLatest = followStageLog && followDetailScroll;
+  useEffect(() => {
+    if (!followingLatest) return;
+    requestAnimationFrame(() => {
+      if (stageLogRef.current) stageLogRef.current.scrollTop = stageLogRef.current.scrollHeight;
+      if (detailScrollRef.current) detailScrollRef.current.scrollTop = detailScrollRef.current.scrollHeight;
+    });
+  }, [displayedStageLog, stageLoading, followingLatest]);
+  useEffect(() => {
+    if (!followingLatest || detailTab !== "pipeline") return;
+    requestAnimationFrame(() => {
+      if (stageLogRef.current) stageLogRef.current.scrollTop = stageLogRef.current.scrollHeight;
+      if (detailScrollRef.current) detailScrollRef.current.scrollTop = detailScrollRef.current.scrollHeight;
+    });
+  }, [activeStage?.key, detailTab, followingLatest]);
+  const runtimeRefreshEnabled = ["running", "success", "stopped"].includes(data.status);
+  const runtimeTabVisible = runtime?.live_runtime !== false && (runtime?.containers || []).length > 0;
+  useEffect(() => {
+    if (detailTab !== "runtime" || !runtimeRefreshEnabled) return undefined;
+    refreshDetailRuntime(true).catch(() => {});
+    const timer = setInterval(() => refreshDetailRuntime(true).catch(() => {}), 5000);
+    return () => clearInterval(timer);
+  }, [item.id, detailTab, runtimeRefreshEnabled]);
+  const deploymentRuntimeContainers = runtime?.containers || [];
+  const deploymentDataContainers = deploymentRuntimeContainers.filter((container) =>
+    dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`),
+  );
+  const deploymentApplicationContainers = deploymentRuntimeContainers.filter((container) =>
+    !dataContainerPattern.test(`${container.service || ""} ${container.name || ""} ${container.image || ""}`),
+  );
+  const deploymentDataContainerCount = deploymentDataContainers.length;
+  const deploymentApplicationContainerCount = deploymentApplicationContainers.length;
+  const visibleLaunchFiles = (launchConfig?.files || []).filter((file) => file.used);
+  const filesTabVisible = visibleLaunchFiles.length > 0;
+  const diagnosisTabVisible = data.status === "failed" || Boolean(
+    aiFollowup?.summary || aiFollowup?.diagnosis || aiFollowup?.root_cause,
+  );
+  const diagnosticFixPlan = [...new Set((aiFollowup?.fix_plan || []).map((step) => String(step).trim()).filter(Boolean))];
+  const diagnosticAdvice = String(aiFollowup?.advice || "").trim();
+  const adviceRepeatedInPlan = diagnosticFixPlan.length === 1 && diagnosticFixPlan[0] === diagnosticAdvice;
+  const detailIdentity = data.status === "success"
+    ? { label: "当前运行版本", tone: "active", hint: "正在对外提供服务" }
+    : ["queued", "running"].includes(data.status)
+      ? { label: "发布任务", tone: "candidate", hint: "正在准备新版本" }
+      : data.status === "failed"
+        ? { label: "失败记录", tone: "failed", hint: "本次发布未完成" }
+        : { label: "已停止版本", tone: "stopped", hint: data.release ? "可检查后重新启用" : "发布任务已停止" };
+  useEffect(() => {
+    if (detailTab === "runtime" && !runtimeTabVisible) setDetailTab("pipeline");
+    if (detailTab === "files" && !filesTabVisible) setDetailTab("pipeline");
+    if (detailTab === "diagnosis" && !diagnosisTabVisible) setDetailTab("pipeline");
+  }, [detailTab, runtimeTabVisible, filesTabVisible, diagnosisTabVisible]);
   return (
     <Modal
       className="deployment-detail-modal"
-      title={`部署详情 · ${data.project_name || data.id.slice(0, 8)}`}
+      title={`${data.project_name || data.id.slice(0, 8)} · ${detailIdentity.label}`}
       onClose={onClose}
+      scrollRef={detailScrollRef}
+      onScroll={(event) => {
+        const element = event.currentTarget;
+        setFollowDetailScroll(element.scrollHeight - element.scrollTop - element.clientHeight < 36);
+      }}
       wide
     >
       <div className="deploy-summary">
         <div>
+          <span className={`deployment-detail-identity ${detailIdentity.tone}`}>
+            {detailIdentity.label}
+          </span>
           <Badge status={data.status} />
+          {data.release && <span className="deploy-id">版本 {shortRelease(data.release)}</span>}
           <span className="deploy-id">任务 {data.id.slice(0, 8)}</span>
           <span className="deploy-id">{deploymentDuration(data)}</span>
+          {data.rollback_transition?.kind === "rollback_target" && (
+            <span className="deployment-rollback-context">
+              <RefreshCw />由版本 {data.rollback_transition.from_release} 回滚至此
+            </span>
+          )}
+          {data.rollback_transition?.kind === "rollback_source" && (
+            <span className="deployment-rollback-context is-source">
+              <RefreshCw />已回滚到版本 {data.rollback_transition.to_release}
+            </span>
+          )}
         </div>
         <div className="deploy-actions">
           <button className="ghost" onClick={onClose}>← 返回发布记录</button>
-          <button className="ghost" onClick={() => onConfigureDomain?.(data)}>
+          {data.status === "success" && <button className="ghost" onClick={() => onConfigureDomain?.(data)}>
             <Settings />
             {data.project_domain ? "编辑域名" : "配置域名"}
-          </button>
+          </button>}
           {data.status === "success" && data.access_url && (
             <a
               className="primary button"
@@ -5588,10 +6356,10 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
             <button
               className="danger-button"
               disabled={stopping}
-              onClick={stop}
+              onClick={() => setStopConfirm(true)}
             >
               {stopping ? <LoaderCircle className="spin" /> : <Square />}
-              {data.status === "success" ? "停止服务" : "停止部署"}
+              {data.status === "success" ? "停止应用" : "停止部署"}
             </button>
           )}
         </div>
@@ -5693,20 +6461,6 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
           <b>{data.release || "—"}</b>
         </div>
       </div>
-      {data.login_info?.auth_mode === "first_register" && data.login_info.login_url && (
-        <div className="registration-notice">
-          <div>
-            <KeyRound />
-            <span>
-              <b>首次使用需要注册</b>
-              <small>{data.login_info.note || "此应用没有默认账号密码，请自行创建账号。"}</small>
-            </span>
-          </div>
-          <a className="primary" href={data.login_info.login_url} target="_blank">
-            前往注册 <ExternalLink />
-          </a>
-        </div>
-      )}
       {data.login_info?.auth_mode === "default_credentials" &&
         (data.login_info.username || data.login_info.password) && (
         <div className="login-info-card">
@@ -5753,12 +6507,82 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
           )}
         </div>
       )}
-      {gatewayConfig && (
-        <details className="advanced gateway-config">
-          <summary>
-            <Settings />
-            平台网关生效快照（只读）
-          </summary>
+      <div className="deployment-detail-tabs">
+        <button className={detailTab === "pipeline" ? "active" : ""} onClick={() => setDetailTab("pipeline")}>
+          <Activity />发布过程
+        </button>
+        {runtimeTabVisible && (
+          <button className={detailTab === "runtime" ? "active" : ""} onClick={() => setDetailTab("runtime")}>
+            <Boxes />运行服务
+            {!!deploymentApplicationContainerCount && <em>{deploymentApplicationContainerCount}</em>}
+          </button>
+        )}
+        {filesTabVisible && (
+          <button className={detailTab === "files" ? "active" : ""} onClick={() => setDetailTab("files")}>
+            <Code2 />发布文件<em>{visibleLaunchFiles.length}</em>
+          </button>
+        )}
+        {diagnosisTabVisible && (
+          <button className={detailTab === "diagnosis" ? "active" : ""} onClick={() => setDetailTab("diagnosis")}>
+            <Bot />AI 诊断
+            {data.status === "failed" && <i />}
+          </button>
+        )}
+      </div>
+      {detailTab === "files" && (
+        <div className="advanced gateway-config launch-config runtime-config-section">
+          {launchConfig ? <>
+            <div className="detail-list">
+              <div><span>发布目录</span><b>{launchConfig.release_dir}</b></div>
+              <div><span>实际入口</span><b>{launchConfig.file}</b></div>
+              <div><span>启动方式</span><b>{launchConfig.type === "compose" ? "Docker Compose" : "Dockerfile / Docker Run"}</b></div>
+            </div>
+            <div className="stage-log-head"><b>本次发布涉及的文件</b><span />
+              {launchConfig.can_reveal_secrets && <button className="ghost" onClick={() => setRevealLaunchSecrets((value) => !value)}>{launchConfig.secrets_revealed ? "隐藏敏感值" : "显示敏感值"}</button>}
+              <small>{launchConfig.secrets_revealed ? "敏感值已显示 · 只读" : "敏感值已隐藏 · 只读"}</small>
+            </div>
+            <div className="runtime-section-tabs deployment-file-tabs">
+              {[...visibleLaunchFiles]
+                .sort((left, right) => {
+                  if (Boolean(left.used) !== Boolean(right.used)) return left.used ? -1 : 1;
+                  return deploymentFileMeta(left).priority - deploymentFileMeta(right).priority
+                    || String(left.path).localeCompare(String(right.path));
+                })
+                .map((file) => (
+                <button className={launchFilePath === file.path ? "active" : ""} key={file.path} onClick={() => setLaunchFilePath(file.path)}>
+                  {file.used ? "✓ " : ""}{deploymentFileMeta(file).label} · {deploymentFileMeta(file).name}
+                </button>
+              ))}
+            </div>
+            {(() => {
+              const selectedFile = visibleLaunchFiles.find((file) => file.path === launchFilePath);
+              if (!selectedFile) return <div className="runtime-empty">当前阶段尚未生成可查看的发布文件</div>;
+              return <>
+                <div className="stage-log-head">
+                  <b>{selectedFile.path}{selectedFile.used ? " · 本次实际使用" : " · 源码/关联配置"}</b>
+                  <button className="ghost" onClick={() => copyConfigText("release-file", selectedFile.content)}><Copy />{copiedConfig === "release-file" ? "已复制" : "复制"}</button>
+                </div>
+                <pre className="logs stage-log">{selectedFile.content}</pre>
+                <small>SHA-256：{selectedFile.sha256}</small>
+              </>;
+            })()}
+          </> : <div className="runtime-empty"><LoaderCircle className="spin" />正在读取本次发布文件...</div>}
+        </div>
+      )}
+      {detailTab === "runtime" && <>
+      <div className="runtime-section-tabs" role="tablist" aria-label="运行服务详情">
+        <button className={runtimeSection === "services" ? "active" : ""} onClick={() => setRuntimeSection("services")}>
+          <Boxes />应用容器{!!deploymentApplicationContainerCount && <em>{deploymentApplicationContainerCount}</em>}
+        </button>
+        <button className={runtimeSection === "launch" ? "active" : ""} onClick={() => setRuntimeSection("launch")}>
+          <Terminal />启动配置
+        </button>
+        <button className={runtimeSection === "gateway" ? "active" : ""} onClick={() => setRuntimeSection("gateway")}>
+          <Settings />网关配置
+        </button>
+      </div>
+      {runtimeSection === "gateway" && gatewayConfig && (
+        <div className="advanced gateway-config runtime-config-section">
           <div className="detail-list">
             <div>
               <span>网关节点</span>
@@ -5810,64 +6634,51 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
                   : gatewayConfig.container_status}
               </b>
             </div>
-            <div>
-              <span>Linux 防火墙</span>
-              <b>
-                {gatewayConfig.firewall_status === "unrestricted"
-                  ? "未限制（INPUT ACCEPT）"
-                  : "由系统防火墙规则管理"}
-              </b>
-            </div>
           </div>
           <div className="stage-log-head">
-            <b>Nginx 只读配置</b>
-            {gatewayConfig.configured && (
-              <button
-                className="ghost"
-                onClick={() => copyConfigText("gateway", gatewayConfig.config)}
-              >
-                <Copy />
-                {copiedConfig === "gateway" ? "已复制" : copiedConfig === "error" ? "复制失败" : "复制配置"}
-              </button>
-            )}
+            <b>自动生成的 Nginx 配置</b>
           </div>
           <pre className="logs stage-log">
             {gatewayConfig.config ||
               "当前发布直接使用服务器端口访问，尚未生成 Nginx 配置。点击顶部“配置域名”，保存后系统会创建并应用独立的 Nginx 配置。"}
           </pre>
-        </details>
+        </div>
       )}
-      {launchConfig && (
-        <details className="advanced gateway-config launch-config">
-          <summary><Terminal />启动与编排配置</summary>
+      {runtimeSection === "gateway" && !gatewayConfig && (
+        <div className="runtime-empty"><LoaderCircle className="spin" />正在读取网关配置...</div>
+      )}
+      {runtimeSection === "launch" && launchConfig && (
+        <div className="advanced gateway-config launch-config runtime-config-section">
           <div className="detail-list">
             <div><span>运行方式</span><b>{launchConfig.type === "compose" ? "Docker Compose" : "Dockerfile / Docker Run"}</b></div>
             <div><span>配置文件</span><b>{launchConfig.file}</b></div>
             <div><span>发布目录</span><b>{launchConfig.release_dir}</b></div>
           </div>
           <div className="stage-log-head"><b>实际启动命令</b><button className="ghost" onClick={() => copyConfigText("command", launchConfig.command)}><Copy />{copiedConfig === "command" ? "已复制" : "复制"}</button></div>
-          <pre className="logs stage-log">{launchConfig.command}</pre>
+          <pre className="logs stage-log launch-command-line">{launchConfig.command}</pre>
           <div className="stage-log-head"><b>编排文件（只读）</b><button className="ghost" onClick={() => copyConfigText("compose", launchConfig.content)}><Copy />{copiedConfig === "compose" ? "已复制" : "复制"}</button></div>
           <pre className="logs stage-log">{launchConfig.content}</pre>
           {launchConfig.environment && <><div className="stage-log-head"><b>运行环境摘要（敏感值已隐藏）</b></div><pre className="logs stage-log">{launchConfig.environment}</pre></>}
-        </details>
+        </div>
       )}
+      {runtimeSection === "launch" && !launchConfig && (
+        <div className="runtime-empty"><LoaderCircle className="spin" />正在读取启动配置...</div>
+      )}
+      {runtimeSection === "services" && <>
       <div className="runtime-head">
         <div>
           <h4>本版本运行快照</h4>
-          <p>可查看容器详情与日志；实例伸缩请到项目的“运行服务”中操作</p>
+          <p>这里只显示本版本的应用容器；MySQL、Redis 等共享服务统一在项目“数据资源”中管理</p>
         </div>
         <div className="runtime-totals">
           {!!runtime?.application_instances && <span className="ready-count">应用实例 {runtime.ready_application_instances}/{runtime.application_instances}</span>}
-          <span>{runtime?.containers?.length || 0} 个容器</span>
-          <span>CPU {runtime?.resources?.cpu || "0%"}</span>
-          <span>内存 {runtime?.resources?.memory_usage || "0 B"}</span>
+          <span>应用容器 {deploymentApplicationContainerCount}</span>
         </div>
       </div>
       {scaleNotice && <div className="alert info service-scale-notice">{scaleNotice}</div>}
-      {runtime?.containers?.length ? (
+      {deploymentApplicationContainers.length ? (
         <div className="service-grid">
-          {runtime.containers.map((c) => {
+          {deploymentApplicationContainers.map((c) => {
             const deps = runtime.dependencies?.[c.service] || [];
             return (
               <div
@@ -5938,29 +6749,25 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
         <div className="runtime-empty">
           {runtime?.live_runtime === false ? (
             <>{runtime.runtime_message || "这是历史发布记录，不显示当前版本的运行容器。"}</>
+          ) : deploymentDataContainerCount > 0 ? (
+            <>本版本当前没有运行中的应用容器。项目共享的 MySQL、Redis 请到“数据资源”查看。</>
           ) : data.status === "success" ? (
             <>
               <LoaderCircle className="spin" />
               正在读取服务器上的运行服务...
             </>
           ) : (
-            <>服务将在部署完成后显示</>
+            <>暂无运行服务</>
           )}
         </div>
       )}
       {selected && (
-        <div className="service-drill">
-          <div className="service-drill-head">
-            <div>
-              <h4>{selected.name}</h4>
-              <p>
-                {selected.name} · {selected.image}
-              </p>
-            </div>
-            <button className="icon" onClick={() => setSelected(null)}>
-              <X />
-            </button>
-          </div>
+        <Modal
+          className="deployment-service-log-modal"
+          title={`${selected.name} · 当前日志`}
+          onClose={() => { setSelected(null); setServiceAutoLogs(false); }}
+          wide
+        >
           <div className="service-inspect">
             <span>
               容器 ID<b>{selected.id || "—"}</b>
@@ -5991,13 +6798,39 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
               网络 I/O<b>{selected.resources?.network_io || "—"}</b>
             </span>
           </div>
-          <h4>容器日志</h4>
-          <pre className="logs service-log">
+          <div className="service-log-toolbar">
+            <button className={`ghost log-refresh-toggle ${serviceAutoLogs ? "active" : ""}`} onClick={() => setServiceAutoLogs((value) => !value)}>
+              {serviceAutoLogs ? <Square /> : <Play />}{serviceAutoLogs ? "暂停刷新" : "自动刷新"}
+            </button>
+            <button
+              className={`ghost log-follow-toggle ${followServiceLogs ? "active" : ""}`}
+              onClick={() => {
+                const next = !followServiceLogs;
+                setFollowServiceLogs(next);
+                if (next) requestAnimationFrame(() => {
+                  if (serviceLogRef.current) serviceLogRef.current.scrollTop = serviceLogRef.current.scrollHeight;
+                });
+              }}
+            >{followServiceLogs ? "保持最新" : "跟随已暂停"}</button>
+            <button className="ghost" disabled={loadingLogs} onClick={() => loadServiceLogs(selected)}>
+              {loadingLogs ? <LoaderCircle className="spin" /> : <RefreshCw />}立即刷新
+            </button>
+          </div>
+          <pre
+            ref={serviceLogRef}
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              setFollowServiceLogs(element.scrollHeight - element.scrollTop - element.clientHeight < 36);
+            }}
+            className="logs service-log"
+          >
             {loadingLogs ? "正在读取日志..." : serviceLogs}
           </pre>
-        </div>
+        </Modal>
       )}
-      {(aiFollowup || data.status === "failed") && (
+      </>}
+      </>}
+      {detailTab === "diagnosis" && (
         <div className={`panel ai-followup-compact ${data.status === "failed" ? "failed" : "running"}`}>
           <Bot />
           <div className="ai-followup-main">
@@ -6009,21 +6842,51 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
               )}
             </div>
             <p>{aiFollowup?.summary || "正在读取日志并判断当前状态..."}</p>
-            {aiFollowup?.advice && (
+            {(diagnosticAdvice || diagnosticFixPlan.length) && (
               <details className="ai-diagnostic-details">
-                <summary>查看诊断建议</summary>
-                <div>{aiFollowup.advice}</div>
+                <summary>查看修复方案</summary>
+                {diagnosticAdvice && !adviceRepeatedInPlan && <div>{diagnosticAdvice}</div>}
+                {diagnosticFixPlan.length > 0 && (
+                  <ol>
+                    {diagnosticFixPlan.map((step, index) => <li key={`${index}-${step}`}>{step}</li>)}
+                  </ol>
+                )}
               </details>
+            )}
+            {aiFollowup?.next_step && (
+              <div className="ai-diagnostic-next"><b>下一步处理：</b>{aiFollowup.next_step}</div>
             )}
           </div>
         </div>
       )}
+      {detailTab === "pipeline" && <div className="pipeline-workbench">
+      {data.auto_repair && (
+        <section className={`auto-repair-card ${data.status}`}>
+          <div className="auto-repair-card-title">
+            <div><Bot /><b>AI 自动修复{data.auto_repair.attempt ? ` · 第 ${data.auto_repair.attempt} 次` : ""}</b></div>
+            <span>{data.status === "success" ? "验证通过" : data.status === "failed" ? "验证失败" : "正在验证"}</span>
+          </div>
+          <div className="auto-repair-grid">
+            <div><small>具体问题</small><p>{data.auto_repair.problem}</p></div>
+            <div><small>当前验证</small><p>{data.auto_repair.verification}</p></div>
+          </div>
+          <div className="auto-repair-changes">
+            <small>平台实际修改</small>
+            {data.auto_repair.changes?.length ? (
+              <ul>{data.auto_repair.changes.map((change, index) => <li key={`${index}-${change}`}>{change}</li>)}</ul>
+            ) : (
+              <p>尚未确认构建文件发生有效变化；确认前平台不会重复执行相同构建。</p>
+            )}
+          </div>
+        </section>
+      )}
       <div className="pipeline-head">
         <div>
           <h4>发布流水线</h4>
-          <p>点击步骤查看该阶段日志，页面只加载当前步骤以保持流畅</p>
+          <p>按阶段查看状态、日志和发布结果</p>
         </div>
       </div>
+      <div className="pipeline-workbench-body">
       <div className="pipeline-steps">
         {steps.map((step, index) => (
           <button
@@ -6031,7 +6894,10 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
             className={
               (activeStage?.key === step.key ? "active " : "") + step.status
             }
-            onClick={() => setStageKey(step.key)}
+            onClick={() => {
+              if (step.key !== stageKey) setStageLoading(true);
+              setStageKey(step.key);
+            }}
           >
             <span>
               {step.status === "success" ? (
@@ -6050,7 +6916,7 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
               <b>{step.title}</b>
               <small>
                 {step.status === "success"
-                  ? "已完成"
+                  ? (step.skipped ? "无需构建" : "已完成")
                   : step.status === "running"
                     ? "执行中"
                     : step.status === "failed"
@@ -6058,20 +6924,58 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
                       : step.status === "stopped"
                         ? "已停止"
                         : "等待中"}
+                {!step.skipped && step.duration_seconds !== null && step.duration_seconds !== undefined
+                  ? ` · ${stageDuration(step.duration_seconds)}`
+                  : ""}
               </small>
             </div>
           </button>
         ))}
       </div>
+      <div className="pipeline-log-pane">
       <div className="stage-log-head">
-        <b>{activeStage?.title || "部署日志"}</b>
+        <div className="stage-log-title">
+          <b>{activeStage?.title || "部署日志"}</b>
+          {activeStage?.skipped
+            ? <span>处理方式：复用预构建镜像</span>
+            : activeStage?.duration_seconds !== null && activeStage?.duration_seconds !== undefined && (
+              <span>持续时间：{stageDuration(activeStage.duration_seconds)}</span>
+            )}
+        </div>
         <div className="stage-log-tools">
-          <span>页面仅显示当前阶段，避免大量日志造成卡顿</span>
+          <button
+            className={`ghost log-follow-toggle ${followingLatest ? "active" : ""}`}
+            onClick={() => {
+              const next = !followingLatest;
+              setFollowStageLog(next);
+              setFollowDetailScroll(next);
+              if (next) requestAnimationFrame(() => {
+                if (stageLogRef.current) {
+                  stageLogRef.current.scrollTop = stageLogRef.current.scrollHeight;
+                }
+                if (detailScrollRef.current) detailScrollRef.current.scrollTop = detailScrollRef.current.scrollHeight;
+              });
+            }}
+          >{followingLatest ? "保持最新" : "跟随已暂停"}</button>
           <button className="ghost" onClick={downloadFullLog}>
             <FileArchive />下载完整日志
           </button>
         </div>
       </div>
+      {buildStreams.length > 1 && (
+        <div className="build-log-tabs" role="tablist" aria-label="构建服务日志">
+          <button className={`build-log-all ${buildChannel === "all" ? "active" : ""}`} onClick={() => setBuildChannel("all")}><b>全部</b></button>
+          {buildStreams.map((stream) => (
+            <button key={stream.key} className={buildChannel === stream.key ? `active ${stream.status}` : stream.status} onClick={() => setBuildChannel(stream.key)}>
+              <span>{stream.status === "running" ? <LoaderCircle className="spin" /> : stream.status === "failed" ? "×" : stream.status === "stopped" ? <Square /> : "✓"}</span>
+              <div>
+                <b>{stream.label}</b>
+                {stream.duration_seconds !== null && stream.duration_seconds !== undefined && <small>{stageDuration(stream.duration_seconds)}</small>}
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
       {activeStage?.key === "pull" && data.image_items?.length > 0 && (
         <div className="image-pull-list">
           {data.image_items.map((image) => (
@@ -6091,9 +6995,35 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
           ))}
         </div>
       )}
-      <pre className="logs stage-log">
-        {activeStage?.log || "等待该步骤开始..."}
+      <pre
+        ref={stageLogRef}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          setFollowStageLog(element.scrollHeight - element.scrollTop - element.clientHeight < 36);
+        }}
+        className="logs stage-log"
+      >
+        {stageLoading
+          ? "正在读取该阶段日志..."
+          : displayedStageLog || (activeStage?.status === "waiting" ? "等待该步骤开始..." : "该阶段没有产生日志")}
       </pre>
+      </div>
+      </div>
+      </div>}
+      {stopConfirm && (
+        <ConfirmDialog
+          title={data.status === "success" ? "停止应用" : "停止部署任务"}
+          text={data.status === "success" ? "确定停止当前版本的应用？" : "确定停止这次部署任务？"}
+          description={data.status === "success"
+            ? `将停止${deploymentApplicationContainerCount ? ` ${deploymentApplicationContainerCount} 个` : "当前版本的"}应用容器；MySQL、Redis 等数据资源继续运行，数据不会受到影响。`
+            : "将终止当前发布流程并清理本次任务产生的应用容器；现有线上版本和数据资源保持不变。"}
+          confirmText={data.status === "success" ? "确认停止应用" : "确认停止部署"}
+          danger
+          busy={stopping}
+          onClose={() => !stopping && setStopConfirm(false)}
+          onConfirm={stop}
+        />
+      )}
     </Modal>
   );
 }
@@ -6102,6 +7032,7 @@ function ImageRepository({ me }) {
   const [data, setData] = useState({ repositories: [], repository_count: 0, tag_count: 0, endpoint: "yunzhou.hub:5000" }),
     [loading, setLoading] = useState(true),
     [query, setQuery] = useState(""),
+    [selectedProject, setSelectedProject] = useState(null),
     [selected, setSelected] = useState(null),
     [selectedRepositories, setSelectedRepositories] = useState(() => new Set()),
     [bulkDelete, setBulkDelete] = useState(null),
@@ -6114,10 +7045,10 @@ function ImageRepository({ me }) {
     setToast({ text, type });
     setTimeout(() => setToast(null), 5000);
   };
-  const load = async (silent = false) => {
+  const load = async (silent = false, force = false) => {
     if (!silent) setLoading(true);
     try {
-      const next = await api("/images");
+      const next = await api(`/images${force ? "?refresh=true" : ""}`);
       setData(next);
       setSelectedRepositories((previous) => new Set([...previous].filter((name) => next.repositories.some((item) => item.name === name))));
       if (selected) setSelected(next.repositories.find((item) => item.name === selected.name) || null);
@@ -6128,7 +7059,7 @@ function ImageRepository({ me }) {
     }
   };
   useEffect(() => {
-    load();
+    load(true);
     const timer = setInterval(() => load(true), 15000);
     return () => clearInterval(timer);
   }, []);
@@ -6150,7 +7081,23 @@ function ImageRepository({ me }) {
       setBusy("");
     }
   };
-  const repositories = data.repositories.filter((item) => item.name.toLowerCase().includes(query.toLowerCase()));
+  const repositories = data.repositories.filter((item) =>
+    `${item.name} ${item.project_slug || ""} ${item.project_name || ""} ${item.service_name || ""}`
+      .toLowerCase().includes(query.toLowerCase()),
+  );
+  const projectGroups = Object.values(repositories.reduce((groups, item) => {
+    const key = item.project_slug || item.name;
+    if (!groups[key]) groups[key] = {
+      key,
+      slug: item.project_slug || item.name,
+      name: item.project_name || "未关联项目",
+      repositories: [],
+      tag_count: 0,
+    };
+    groups[key].repositories.push(item);
+    groups[key].tag_count += item.tag_count;
+    return groups;
+  }, {}));
   const allFilteredSelected = repositories.length > 0 && repositories.every((item) => selectedRepositories.has(item.name));
   const toggleRepository = (name) => setSelectedRepositories((previous) => {
     const next = new Set(previous);
@@ -6228,10 +7175,10 @@ function ImageRepository({ me }) {
       <Toast toast={toast} />
       <div className="toolbar registry-heading">
         <div><h2>镜像仓库</h2><p>集中保存平台构建产物，不包含服务器本地镜像</p></div>
-        <button className="ghost" onClick={() => load()}><RefreshCw />刷新</button>
+        <button className="ghost" disabled={loading} onClick={() => load(false, true)}><RefreshCw className={loading ? "spin" : ""} />刷新</button>
       </div>
       <div className="registry-stats">
-        <div><Boxes /><span><b>{data.repository_count}</b><small>镜像仓库</small></span></div>
+        <div><Boxes /><span><b>{data.project_count ?? projectGroups.length}</b><small>项目目录</small></span></div>
         <div><Tag /><span><b>{data.tag_count}</b><small>版本标签</small></span></div>
         <div><ShieldCheck /><span><b>运行中</b><small>平台私有仓库</small></span></div>
       </div>
@@ -6241,15 +7188,35 @@ function ImageRepository({ me }) {
         {me.role === "admin" && selectedRepositories.size > 0 && <button className="danger-button registry-bulk-action" disabled={bulkBusy} onClick={previewBulkDelete}>{bulkBusy ? <LoaderCircle className="spin" /> : <Trash2 />}删除所选（{selectedRepositories.size}）</button>}
       </div>
       <div className="registry-list">
-        {repositories.map((item) => <div key={item.name} className={`registry-row ${me.role === "admin" ? "selectable" : ""} ${selectedRepositories.has(item.name) ? "selected" : ""}`} role="button" tabIndex="0" onClick={() => setSelected(item)} onKeyDown={(event) => { if (event.key === "Enter") setSelected(item); }}>
-          {me.role === "admin" && <input className="registry-row-checkbox" type="checkbox" checked={selectedRepositories.has(item.name)} onClick={(event) => event.stopPropagation()} onChange={() => toggleRepository(item.name)} />}
+        {projectGroups.map((group) => <div key={group.key} className={`registry-row ${me.role === "admin" ? "selectable" : ""} ${group.repositories.every((item) => selectedRepositories.has(item.name)) ? "selected" : ""}`} role="button" tabIndex="0" onClick={() => setSelectedProject(group)} onKeyDown={(event) => { if (event.key === "Enter") setSelectedProject(group); }}>
+          {me.role === "admin" && <input className="registry-row-checkbox" type="checkbox" checked={group.repositories.every((item) => selectedRepositories.has(item.name))} onClick={(event) => event.stopPropagation()} onChange={() => {
+            const allSelected = group.repositories.every((item) => selectedRepositories.has(item.name));
+            setSelectedRepositories((previous) => {
+              const next = new Set(previous);
+              group.repositories.forEach((item) => allSelected ? next.delete(item.name) : next.add(item.name));
+              return next;
+            });
+          }} />}
           <span className="registry-icon"><Boxes /></span>
-          <span className="registry-name"><b>{item.name}</b><small>私有 · 平台构建产物</small></span>
-          <span className="registry-count">{item.tag_count} 个版本</span><ChevronRight />
+          <span className="registry-name"><b>{group.slug}</b><small>{group.name}</small></span>
+          <span className="registry-count">{group.repositories.length} 个服务 · {group.tag_count} 个版本</span><ChevronRight />
         </div>)}
-        {!loading && !repositories.length && <Empty icon={Boxes} text="仓库还是空的，项目构建成功后镜像会自动入库" />}
+        {!loading && !projectGroups.length && <Empty icon={Boxes} text="仓库还是空的，项目构建成功后镜像会自动入库" />}
         {loading && <div className="center"><LoaderCircle className="spin" /></div>}
       </div>
+      {selectedProject && <Modal onClose={() => setSelectedProject(null)} title={selectedProject.slug} wide>
+        <div className="registry-detail-intro">
+          <div className="registry-icon"><Boxes /></div>
+          <div><b>{selectedProject.name}</b><p>{selectedProject.repositories.length} 个服务镜像，共 {selectedProject.tag_count} 个版本。</p></div>
+        </div>
+        <div className="registry-list">
+          {selectedProject.repositories.map((item) => <div key={item.name} className="registry-row" role="button" tabIndex="0" onClick={() => { setSelectedProject(null); setSelected(item); }} onKeyDown={(event) => { if (event.key === "Enter") { setSelectedProject(null); setSelected(item); } }}>
+            <span className="registry-icon"><Boxes /></span>
+            <span className="registry-name"><b>{item.service_name || "app"}</b><small>{item.name}</small></span>
+            <span className="registry-count">{item.tag_count} 个版本</span><ChevronRight />
+          </div>)}
+        </div>
+      </Modal>}
       {selected && <Modal onClose={() => setSelected(null)} title={selected.name} wide>
         <div className="registry-detail-intro">
           <div className="registry-icon"><Boxes /></div>
@@ -6764,6 +7731,18 @@ function UsersPage() {
     setTimeout(() => setToast(null), 3000);
     load();
   };
+  const unlock = async (event, user) => {
+    event.stopPropagation();
+    try {
+      await api(`/users/${user.id}/unlock`, { method: "POST" });
+      setToast({ text: `${user.display_name || user.username} 已解除锁定`, type: "success" });
+      setTimeout(() => setToast(null), 3000);
+      load();
+    } catch (error) {
+      setToast({ text: error.message, type: "error" });
+      setTimeout(() => setToast(null), 3000);
+    }
+  };
   useEffect(() => {
     load();
   }, []);
@@ -6802,14 +7781,20 @@ function UsersPage() {
                   <td>{roleText[x.role]}</td>
                   <td>
                     <span
-                      className={"badge " + (x.active ? "success" : "muted")}
+                      className={"badge " + (!x.active ? "muted" : (x.locked_until && new Date(x.locked_until) > new Date()) ? "danger" : "success")}
                     >
                       <i />
-                      {x.active ? "正常" : "停用"}
+                      {!x.active ? "停用" : (x.locked_until && new Date(x.locked_until) > new Date()) ? "已锁定" : x.failed_login_attempts ? `失败 ${x.failed_login_attempts} 次` : "正常"}
                     </span>
                   </td>
                   <td>{time(x.created_at)}</td>
                   <td>
+                    {(x.failed_login_attempts > 0 || (x.locked_until && new Date(x.locked_until) > new Date())) && (
+                      <button className="ghost user-edit" onClick={(event) => unlock(event, x)}>
+                        <KeyRound />
+                        解除锁定
+                      </button>
+                    )}
                     <button
                       className="ghost user-edit"
                       onClick={(e) => {
@@ -6988,13 +7973,14 @@ function SettingsPage() {
         </aside>
         <div className="settings-content">
           {tab === "appearance" && <AppearanceSettings notify={notify} />}
-          {tab === "ai" && <AiSettingsPanel />}
+          {tab === "ai" && <AiSettingsPanel onOpenExperience={() => setTab("experience")} />}
           {tab === "network" && <ProxySettings notify={notify} />}{" "}
           {tab === "deployment" && <DeploymentSettingsPanel notify={notify} />}{" "}
           {tab === "backup" && <BackupSettings notify={notify} />}{" "}
           {tab === "certificates" && <CertificateSettings notify={notify} />}{" "}
           {tab === "retained" && <RetainedDataSettings notify={notify} />}{" "}
           {tab === "security" && <SecuritySettings />}{" "}
+          {tab === "experience" && <ExperienceSettings notify={notify} />}{" "}
           {tab === "audit" && <AuditSettings />}{" "}
           {tab === "system" && <SystemInfo />}
         </div>
@@ -7163,7 +8149,7 @@ function BackupSettings({ notify }) {
     setBusy(true);
     try {
       await api("/settings/backups", { method: "POST" });
-      notify("数据库和项目源码已完成备份，依赖与缓存已自动排除");
+      notify("最小备份已创建：平台数据与项目记录已保存");
       load();
     } catch (e) {
       notify(e.message, "error");
@@ -7228,7 +8214,7 @@ function BackupSettings({ notify }) {
       <div className="toolbar">
         <div>
           <h2>数据备份</h2>
-          <p>备份平台数据库、加密配置和项目源码</p>
+          <p>小体积备份平台数据、项目记录和加密配置</p>
         </div>
         <button className="primary" disabled={busy} onClick={create}>
           {busy ? <LoaderCircle className="spin" /> : <FileArchive />}
@@ -7307,15 +8293,15 @@ function BackupSettings({ notify }) {
           </p>
           <div>
             <b>会备份</b>
-            <span>平台数据库、上传源码、项目配置、加密后的凭据记录</span>
+            <span>平台数据库、项目/Git 记录、分析结果、配置和加密凭据</span>
           </div>
           <div>
             <b>自动排除</b>
-            <span>依赖目录、Git 历史、缓存、日志和构建产物</span>
+            <span>完整源码、依赖目录、Git 历史、缓存、日志和构建产物</span>
           </div>
           <div>
             <b>暂不包含</b>
-            <span>Docker 镜像、容器数据卷、部署服务器运行目录</span>
+            <span>Docker 镜像、数据卷、外部数据库和部署服务器运行目录</span>
           </div>
         </div>
       </div>
@@ -7325,8 +8311,7 @@ function BackupSettings({ notify }) {
           <b>恢复说明</b>
           <p>
             服务器密码、Git 凭据、AI Key 等保持加密状态。恢复时必须保留当前
-            ENCRYPTION_KEY。项目依赖不会备份，可根据
-            package-lock、requirements、pom.xml 等依赖清单重新安装。
+            ENCRYPTION_KEY。Git 项目会按仓库记录重新拉取；上传项目需要重新上传原包。
           </p>
         </div>
       </div>
@@ -7351,7 +8336,7 @@ function BackupSettings({ notify }) {
                   <tr key={x.name}>
                     <td>
                       <b>{x.name}</b>
-                      <small>数据库 + 项目源码（已排除依赖和缓存）</small>
+                      <small>平台数据 + 项目记录（最小备份）</small>
                     </td>
                     <td>{time(x.created_at)}</td>
                     <td>{size(x.size)}</td>
@@ -7763,6 +8748,8 @@ function AuditSettings() {
     ai_query_database: "AI 查询数据库",
     ai_update_database: "AI 更新数据库",
     ai_apply_migration: "AI 执行表结构",
+    update_ai_experience: "调整 AI 经验",
+    export_ai_experiences: "导出 AI 经验",
     update_audit_retention: "修改审计保留策略",
   };
   const targetLabels = {
@@ -7869,6 +8856,86 @@ function AuditSettings() {
     </>
   );
 }
+
+function ExperienceSettings({ notify }) {
+  const [data, setData] = useState(null);
+  const [query, setQuery] = useState("");
+  const [state, setState] = useState("");
+  const [selected, setSelected] = useState(null);
+  const stateLabels = { candidate: "候选", verified: "已验证", deprecated: "已停用", quarantined: "已隔离" };
+  const stageLabels = { analysis: "源码分析", deployment: "构建部署", verification: "启动验证", gateway: "网关访问", data: "数据服务" };
+  const categoryLabels = {
+    unknown: "平台内部异常（不参与学习）",
+    healthcheck: "健康检查",
+    startup: "启动异常",
+    network: "网络连接",
+    gateway: "网关路由",
+    build: "构建异常",
+    dependency: "依赖安装",
+    database: "数据服务",
+  };
+  const categoryLabel = (value) => categoryLabels[String(value || "").toLowerCase()]
+    || String(value || "自动分类").replaceAll("_", " · ");
+  const load = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (query.trim()) params.set("q", query.trim());
+      if (state) params.set("state", state);
+      setData(await api(`/ai-experiences${params.toString() ? `?${params}` : ""}`));
+    } catch (error) {
+      notify(error.message, "error");
+      setData({ summary: {}, items: [] });
+    }
+  };
+  useEffect(() => { load(); }, [state]);
+  const exportAll = async () => {
+    try {
+      const response = await fetch("/api/ai-experiences/export", { headers: { Authorization: `Bearer ${token()}` } });
+      if (!response.ok) throw new Error("经验导出失败");
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(await response.blob());
+      link.download = "deployment-experiences.json";
+      link.click();
+      URL.revokeObjectURL(link.href);
+      notify("经验包已导出");
+    } catch (error) { notify(error.message, "error"); }
+  };
+  const summary = data?.summary || {};
+  return (
+    <>
+      <div className="toolbar">
+        <div><h2>AI 学习详情</h2><p>系统自动采集、验证、降级和隔离；这里仅用于高级审计</p></div>
+        <div className="toolbar-actions"><button className="ghost" onClick={load}><RefreshCw />刷新</button><button className="primary" onClick={exportAll}><Download />导出经验包</button></div>
+      </div>
+      <div className="experience-summary">
+        <div><span>全部经验</span><b>{summary.total ?? "—"}</b></div>
+        <div className="success"><span>已验证</span><b>{summary.verified ?? "—"}</b></div>
+        <div><span>候选反例</span><b>{summary.candidate ?? "—"}</b></div>
+        <div className="warning"><span>停用 / 隔离</span><b>{summary.disabled ?? "—"}</b></div>
+      </div>
+      <div className="panel experience-controls">
+        <div className="audit-search"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => event.key === "Enter" && load()} placeholder="搜索错误、修复方法、技术栈或阶段" /><button className="ghost" onClick={load}>搜索</button></div>
+        <select value={state} onChange={(event) => setState(event.target.value)}><option value="">全部状态</option><option value="verified">已验证</option><option value="candidate">候选</option><option value="deprecated">已停用</option><option value="quarantined">已隔离</option></select>
+      </div>
+      {!data ? <div className="center"><LoaderCircle className="spin" /></div> : (
+        <div className="experience-list">
+          {data.items.map((item) => (
+            <article key={item.id} className={`panel experience-card ${!item.enabled ? "disabled" : ""}`}>
+              <button className="experience-main" onClick={() => setSelected(item)}>
+                <div className="experience-title"><b>{categoryLabel(item.category)}</b><span className={`experience-state ${item.state}`}>{stateLabels[item.state] || item.state}</span><span>{stageLabels[item.stage] || item.stage}</span></div>
+                <p>{item.error_sample || "未记录错误样本"}</p>
+                <div className="experience-meta"><span>可信度 {item.confidence}%</span><span>出现 {item.occurrences} 次</span><span>成功 {item.successful_repairs}</span><span>失败 {item.failed_repairs}</span><span>被引用 {item.use_count || 0}</span></div>
+                {!!item.scope_tags?.length && <div className="experience-tags">{item.scope_tags.map((tag) => <em key={tag}>{tag}</em>)}</div>}
+              </button>
+            </article>
+          ))}
+          {!data.items.length && <div className="panel empty">没有符合条件的经验</div>}
+        </div>
+      )}
+      {selected && <Modal title="AI 经验详情" onClose={() => setSelected(null)} wide><div className="experience-detail"><div className="experience-detail-head"><b>{categoryLabel(selected.category)}</b><span className={`experience-state ${selected.state}`}>{stateLabels[selected.state] || selected.state}</span></div><section><span>错误特征</span><pre>{selected.error_sample || "—"}</pre></section><section><span>修复与验证结论</span><pre>{selected.repair_summary || "尚未形成已验证修复结论"}</pre></section><div className="experience-meta"><span>阶段：{stageLabels[selected.stage] || selected.stage}</span><span>可信度：{selected.confidence}%</span><span>最后验证：{selected.last_verified_at ? time(selected.last_verified_at) : "未验证"}</span><span>最后引用：{selected.last_used_at ? time(selected.last_used_at) : "未引用"}</span></div></div></Modal>}
+    </>
+  );
+}
 function DeploymentSettingsPanel({ notify }) {
   const [form, setForm] = useState(null),
     [saving, setSaving] = useState(false),
@@ -7942,7 +9009,7 @@ function DeploymentSettingsPanel({ notify }) {
                 <input value={form.registry_endpoint ?? "yunzhou.hub:5000"}
                   onChange={(e) => setForm({ ...form, registry_endpoint: e.target.value })} />
               </Field>
-              <Field label="镜像命名空间" hint="镜像名称：命名空间/项目-服务:版本">
+              <Field label="资源命名空间" hint="统一命名镜像、容器、网络和数据卷">
                 <input value={form.registry_namespace ?? "yunzhou"}
                   onChange={(e) => setForm({ ...form, registry_namespace: e.target.value.toLowerCase() })} />
               </Field>
@@ -7965,6 +9032,33 @@ function DeploymentSettingsPanel({ notify }) {
               <button className="primary" disabled={registrySaving || !form.registry_auto_cleanup} onClick={() => saveRegistry(true)}>
                 {registrySaving ? <LoaderCircle className="spin" /> : <Trash2 />}保存并立即清理
               </button>
+            </div>
+          </section>
+          <section className="settings-section cache-settings-section">
+            <header>
+              <div className="settings-section-icon violet"><Server /></div>
+              <div>
+                <h3>运行服务推荐版本</h3>
+                <p>源码没有明确版本时使用；外置服务和已经运行的项目不受影响。</p>
+              </div>
+            </header>
+            <div className="form-grid settings-fields">
+              <Field label="Nginx" hint="静态站点与项目内网关">
+                <input value={form.default_nginx_image ?? "nginx:1.30.3-alpine"}
+                  onChange={(e) => setForm({ ...form, default_nginx_image: e.target.value })} />
+              </Field>
+              <Field label="Redis" hint="源码未指定版本时使用">
+                <input value={form.default_redis_image ?? "redis:7.4-alpine"}
+                  onChange={(e) => setForm({ ...form, default_redis_image: e.target.value })} />
+              </Field>
+              <Field label="MySQL" hint="仅用于新建的托管数据库">
+                <input value={form.default_mysql_image ?? "mysql:8.4"}
+                  onChange={(e) => setForm({ ...form, default_mysql_image: e.target.value })} />
+              </Field>
+              <Field label="PostgreSQL" hint="仅用于新建的托管数据库">
+                <input value={form.default_postgres_image ?? "postgres:16"}
+                  onChange={(e) => setForm({ ...form, default_postgres_image: e.target.value })} />
+              </Field>
             </div>
           </section>
           <section className="settings-section cache-settings-section">
@@ -8042,6 +9136,17 @@ function DeploymentSettingsPanel({ notify }) {
                   ...form,
                   per_node_concurrency: Number(e.target.value),
                 })
+              }
+            />
+          </Field>
+          <Field label="源码分析并发数" hint="同时拉取并分析的项目数，建议 2 个">
+            <input
+              type="number"
+              min="1"
+              max="8"
+              value={form.analysis_concurrency ?? 2}
+              onChange={(e) =>
+                setForm({ ...form, analysis_concurrency: Number(e.target.value) })
               }
             />
           </Field>
@@ -8199,7 +9304,7 @@ function SystemInfo() {
   );
 }
 
-function AiSettingsPanel() {
+function AiSettingsPanel({ onOpenExperience }) {
   const blank = {
     provider_name: "",
     base_url: "https://api.openai.com/v1",
@@ -8212,6 +9317,7 @@ function AiSettingsPanel() {
     [editing, setEditing] = useState(null),
     [show, setShow] = useState(false),
     [toast, setToast] = useState(null),
+    [learning, setLearning] = useState(null),
     [deleting, setDeleting] = useState(null);
   const load = () => {
     setLoadError("");
@@ -8221,6 +9327,7 @@ function AiSettingsPanel() {
   };
   useEffect(() => {
     load();
+    api("/ai-experiences").then((result) => setLearning(result.summary)).catch(() => setLearning({}));
   }, []);
   const notify = (text, type = "success") => {
     setToast({ text, type });
@@ -8347,6 +9454,19 @@ function AiSettingsPanel() {
           )}
         </>
       )}
+      <div className="panel ai-learning-card">
+        <div className="ai-learning-icon"><Bot /></div>
+        <div className="ai-learning-copy">
+          <h3>自动经验学习</h3>
+          <p>平台会根据真实发布结果自动验证、降级和隔离经验，无需日常人工维护。</p>
+        </div>
+        <div className="ai-learning-stats">
+          <span><b>{learning?.verified ?? "—"}</b>已验证</span>
+          <span><b>{learning?.candidate ?? "—"}</b>观察中</span>
+          <span><b>{learning?.disabled ?? "—"}</b>已隔离</span>
+        </div>
+        <button className="ghost" onClick={onOpenExperience}>查看学习详情 <ChevronRight /></button>
+      </div>
       <div className="panel security-card multi-ai-security">
         <ShieldCheck />
         <div>

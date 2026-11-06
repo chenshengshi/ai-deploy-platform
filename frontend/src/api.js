@@ -13,7 +13,12 @@ export async function api(path, options = {}) {
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const response = await fetch(base + path, {...options, headers})
-      if (response.status === 401) { logout(); throw new Error('登录已过期，请重新登录') }
+      // A 401 returned by the login endpoint is an ordinary validation error.
+      // Only clear the current session when an authenticated request expires.
+      if (response.status === 401 && token() && path !== '/auth/login') {
+        logout()
+        throw new Error('登录已过期，请重新登录')
+      }
       if ([502,503,504].includes(response.status) && attempt + 1 < attempts) {
         await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)))
         continue

@@ -26,9 +26,9 @@ import httpx
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
 from jose import JWTError, jwt
@@ -37,8 +37,9 @@ from .ai import analyze_backup_scope, analyze_delete_scope, analyze_project_depl
 from .auth import current_user, hash_password, require, token_for, verify_password
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
-from .deployer import cleanup_registry_versions, choose_port, configure_platform_gateway, delete_deployment_resources, detect_frontend_api_routes, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, stage_source, start_deployment, stop_deployment, verify_access
-from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
+from .deployer import cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, environment_values, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
+from .experience import contains_corruption, portable_experience, prepare_new_experience
+from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
 from .proxy import get_proxy_config, proxy_for, proxy_with_auth, redact_proxy
 from .schemas import (
     AiConfigIn,
@@ -86,6 +87,54 @@ app.add_middleware(
 )
 
 
+def _request_user(request: Request, db: Session) -> User | None:
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return None
+    try:
+        payload = jwt.decode(authorization.split(" ", 1)[1].strip(), settings.app_secret, algorithms=["HS256"])
+    except JWTError:
+        return None
+    user = db.get(User, payload.get("sub"))
+    return user if user and user.active else None
+
+
+def _user_can_access_project(db: Session, user: User, project_id: str) -> bool:
+    if user.role == Role.admin:
+        return True
+    owner_id = db.scalar(select(Project.owner_id).where(Project.id == project_id))
+    return owner_id == user.id
+
+
+def _user_can_access_deployment(db: Session, user: User, deployment_id: str) -> bool:
+    if user.role == Role.admin:
+        return True
+    owner_id = db.scalar(
+        select(Project.owner_id)
+        .join(Deployment, Deployment.project_id == Project.id)
+        .where(Deployment.id == deployment_id)
+    )
+    return owner_id == user.id
+
+
+@app.middleware("http")
+async def enforce_project_ownership(request: Request, call_next):
+    """Apply object ownership to every project/deployment HTTP endpoint."""
+    project_match = re.match(r"^/api/projects/([^/]+)(?:/|$)", request.url.path)
+    deployment_match = re.match(r"^/api/deployments/([^/]+)(?:/|$)", request.url.path)
+    if project_match or deployment_match:
+        with SessionLocal() as db:
+            user = _request_user(request, db)
+            allowed = True
+            if user and project_match:
+                allowed = _user_can_access_project(db, user, project_match.group(1))
+            elif user and deployment_match:
+                allowed = _user_can_access_deployment(db, user, deployment_match.group(1))
+            if user and not allowed:
+                return JSONResponse(status_code=404, content={"detail": "资源不存在"})
+    return await call_next(request)
+
+
 # Runtime discovery opens an SSH session and asks Docker for Compose state and
 # a one-shot resource sample. The project and deployment screens often request
 # the same deployment at the same time, so without a shared single-flight cache
@@ -96,6 +145,60 @@ _RUNTIME_CACHE_TTL = 4.0
 _runtime_cache: dict[tuple, tuple[float, dict]] = {}
 _runtime_cache_locks: dict[tuple, threading.Lock] = {}
 _runtime_cache_guard = threading.Lock()
+
+
+# Add a lightweight source-address limit on top of the existing per-account
+# lockout. This slows username rotation without another service dependency.
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_FAILURES_PER_IP = 10
+_login_failures_by_ip: dict[str, list[float]] = {}
+_login_failure_guard = threading.Lock()
+
+
+def _login_source_ip(request: Request) -> str:
+    # The bundled Nginx proxy replaces this header with the connecting address.
+    forwarded = request.headers.get("x-real-ip", "").strip()
+    if forwarded:
+        try:
+            return str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            pass
+    return request.client.host if request.client else "unknown"
+
+
+def _active_login_failures(source_ip: str, now: float) -> list[float]:
+    cutoff = now - _LOGIN_WINDOW_SECONDS
+    return [stamp for stamp in _login_failures_by_ip.get(source_ip, []) if stamp > cutoff]
+
+
+def enforce_login_source_limit(source_ip: str) -> None:
+    now = time.monotonic()
+    with _login_failure_guard:
+        failures = _active_login_failures(source_ip, now)
+        if failures:
+            _login_failures_by_ip[source_ip] = failures
+        else:
+            _login_failures_by_ip.pop(source_ip, None)
+        if len(failures) >= _LOGIN_MAX_FAILURES_PER_IP:
+            retry_after = max(1, int(_LOGIN_WINDOW_SECONDS - (now - failures[0])))
+            raise HTTPException(
+                status_code=429,
+                detail="登录尝试过于频繁，请稍后重试",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+
+def record_login_failure(source_ip: str) -> None:
+    now = time.monotonic()
+    with _login_failure_guard:
+        failures = _active_login_failures(source_ip, now)
+        failures.append(now)
+        _login_failures_by_ip[source_ip] = failures
+
+
+def clear_login_failures(source_ip: str) -> None:
+    with _login_failure_guard:
+        _login_failures_by_ip.pop(source_ip, None)
 
 
 def _runtime_cache_key(item: Deployment) -> tuple:
@@ -335,10 +438,12 @@ def startup():
         connection.execute(text("ALTER TABLE project_domain_configs ADD COLUMN IF NOT EXISTS client_max_body_mb INTEGER NOT NULL DEFAULT 50"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS image_retention_count INTEGER NOT NULL DEFAULT 5"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS data_exposure_json TEXT NOT NULL DEFAULT '{}'"))
+        connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS runtime_image_overrides_json TEXT NOT NULL DEFAULT '{}'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_retention_count INTEGER NOT NULL DEFAULT 5"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_auto_cleanup BOOLEAN NOT NULL DEFAULT TRUE"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_endpoint VARCHAR(255) NOT NULL DEFAULT 'yunzhou.hub:5000'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_namespace VARCHAR(100) NOT NULL DEFAULT 'yunzhou'"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS analysis_concurrency INTEGER NOT NULL DEFAULT 2"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS build_cache_root VARCHAR(500) NOT NULL DEFAULT '/data/yunzhou/builder/cache'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS maven_cache_dir VARCHAR(255) NOT NULL DEFAULT '/root/.m2'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS gradle_cache_dir VARCHAR(255) NOT NULL DEFAULT '/home/gradle/.gradle'"))
@@ -346,8 +451,22 @@ def startup():
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS pnpm_cache_dir VARCHAR(255) NOT NULL DEFAULT '/root/.local/share/pnpm/store'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS yarn_cache_dir VARCHAR(255) NOT NULL DEFAULT '/root/.cache/yarn'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS pip_cache_dir VARCHAR(255) NOT NULL DEFAULT '/root/.cache/pip'"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS default_nginx_image VARCHAR(255) NOT NULL DEFAULT 'nginx:1.30.3-alpine'"))
+        connection.execute(text("UPDATE deployment_settings SET default_nginx_image = 'nginx:1.30.3-alpine' WHERE default_nginx_image IN ('nginx:1.30.6-alpine', 'nginx:1.30.6')"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS default_redis_image VARCHAR(255) NOT NULL DEFAULT 'redis:7.4-alpine'"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS default_mysql_image VARCHAR(255) NOT NULL DEFAULT 'mysql:8.4'"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS default_postgres_image VARCHAR(255) NOT NULL DEFAULT 'postgres:16'"))
         connection.execute(text("ALTER TABLE ai_configs ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE"))
         connection.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS ai_config_id VARCHAR(36)"))
+        connection.execute(text("ALTER TABLE deployment_experiences ADD COLUMN IF NOT EXISTS state VARCHAR(24) NOT NULL DEFAULT 'candidate'"))
+        connection.execute(text("ALTER TABLE deployment_experiences ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE"))
+        connection.execute(text("ALTER TABLE deployment_experiences ADD COLUMN IF NOT EXISTS stage VARCHAR(32) NOT NULL DEFAULT 'deployment'"))
+        connection.execute(text("ALTER TABLE deployment_experiences ADD COLUMN IF NOT EXISTS scope_tags TEXT NOT NULL DEFAULT '[]'"))
+        connection.execute(text("ALTER TABLE deployment_experiences ADD COLUMN IF NOT EXISTS confidence INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE deployment_experiences ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE deployment_experiences ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ"))
+        connection.execute(text("UPDATE deployment_experiences SET state=CASE WHEN verified THEN 'verified' ELSE 'candidate' END WHERE state='' OR state IS NULL OR (verified AND state='candidate')"))
+        connection.execute(text("UPDATE deployment_experiences SET state='quarantined', enabled=FALSE WHERE position(chr(65533) in COALESCE(error_sample, '')) > 0 OR position(chr(65533) in COALESCE(repair_summary, '')) > 0"))
         connection.execute(text(
             "WITH ranked AS (SELECT id, ROW_NUMBER() OVER (ORDER BY provider_name, id) AS rn "
             "FROM ai_configs WHERE is_default = TRUE) "
@@ -364,10 +483,11 @@ def startup():
                 seed_rows = json.loads(seed_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 seed_rows = []
-            existing_signatures = set(db.scalars(select(DeploymentExperience.signature)).all())
+            existing_rows = {item.signature: item for item in db.scalars(select(DeploymentExperience)).all()}
+            existing_signatures = set(existing_rows)
             for row in seed_rows if isinstance(seed_rows, list) else []:
                 signature = str(row.get("signature") or "").strip()
-                if not signature or signature in existing_signatures:
+                if not signature:
                     continue
                 def seed_time(key: str):
                     value = row.get(key)
@@ -377,20 +497,29 @@ def startup():
                         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
                     except ValueError:
                         return None
-                db.add(DeploymentExperience(
-                    signature=signature,
-                    category=str(row.get("category") or "unknown")[:64],
-                    error_sample=str(row.get("error_sample") or ""),
-                    repair_summary=str(row.get("repair_summary") or ""),
-                    occurrences=max(1, int(row.get("occurrences") or 1)),
-                    successful_repairs=max(0, int(row.get("successful_repairs") or 0)),
-                    failed_repairs=max(0, int(row.get("failed_repairs") or 0)),
-                    verified=bool(row.get("verified")),
-                    created_at=seed_time("created_at") or datetime.now(timezone.utc),
-                    updated_at=seed_time("updated_at") or datetime.now(timezone.utc),
-                    last_verified_at=seed_time("last_verified_at"),
-                ))
-                existing_signatures.add(signature)
+                experience = existing_rows.get(signature)
+                if experience and not (contains_corruption(experience.error_sample) or contains_corruption(experience.repair_summary)):
+                    continue
+                if not experience:
+                    experience = DeploymentExperience(signature=signature)
+                experience.category = str(row.get("category") or "unknown")[:64]
+                experience.error_sample = str(row.get("error_sample") or "")
+                experience.repair_summary = str(row.get("repair_summary") or "")
+                experience.occurrences = max(1, int(row.get("occurrences") or 1))
+                experience.successful_repairs = max(0, int(row.get("successful_repairs") or 0))
+                experience.failed_repairs = max(0, int(row.get("failed_repairs") or 0))
+                experience.verified = bool(row.get("verified"))
+                experience.state = "verified" if experience.verified else "candidate"
+                experience.enabled = True
+                experience.created_at = seed_time("created_at") or experience.created_at or datetime.now(timezone.utc)
+                experience.updated_at = seed_time("updated_at") or datetime.now(timezone.utc)
+                experience.last_verified_at = seed_time("last_verified_at")
+                prepare_new_experience(experience)
+                if signature not in existing_signatures:
+                    db.add(experience)
+                    existing_signatures.add(signature)
+            for experience in db.scalars(select(DeploymentExperience)).all():
+                prepare_new_experience(experience)
             db.commit()
         default_ai = db.scalar(select(AiConfig).where(AiConfig.enabled.is_(True), AiConfig.is_default.is_(True)))
         if not default_ai:
@@ -565,7 +694,8 @@ def perform_backup(db: Session, user: User | None = None) -> dict:
             "app": settings.app_name,
             "created_at": now_local.isoformat(),
             "database": "database.json",
-            "uploads": Path(settings.upload_root).exists(),
+            "uploads": False,
+            "source_recovery": "Git 项目按仓库地址、分支和提交重新拉取；上传项目需由用户重新上传原包。",
             "excluded_directories": sorted(BACKUP_EXCLUDED_DIRS),
             "ai_analysis": analysis,
             "note": "敏感字段保持数据库中的加密状态；恢复时必须使用原 ENCRYPTION_KEY。",
@@ -574,9 +704,6 @@ def perform_backup(db: Session, user: User | None = None) -> dict:
         with tarfile.open(target, "w:gz") as archive:
             archive.add(dump_file, arcname="database.json")
             archive.add(temp_dir / "manifest.json", arcname="manifest.json")
-            upload_root = Path(settings.upload_root)
-            if upload_root.exists():
-                archive.add(upload_root, arcname="uploads", recursive=True, filter=backup_tar_filter)
         retention = load_backup_config()["retention"]
         for old in backup_items()[retention:]:
             (root / old["name"]).unlink(missing_ok=True)
@@ -681,7 +808,9 @@ def delete_backup(name: str, db: Session = Depends(get_db), user: User = Depends
 
 
 @app.post("/api/auth/login", response_model=TokenOut)
-def login(body: LoginIn, db: Session = Depends(get_db)):
+def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
+    source_ip = _login_source_ip(request)
+    enforce_login_source_limit(source_ip)
     user = db.scalar(select(User).where(User.username == body.username))
     policy = get_security_config(db)
     now = datetime.now(timezone.utc)
@@ -693,13 +822,20 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
         user.locked_until = None
         user.failed_login_attempts = 0
     if not user or not user.active or not verify_password(body.password, user.password_hash):
+        record_login_failure(source_ip)
+        detail = "用户名或密码错误"
         if user and user.active:
             user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
             if user.failed_login_attempts >= policy.login_max_attempts:
                 user.locked_until = now + timedelta(minutes=policy.login_lock_minutes)
                 user.failed_login_attempts = 0
+                detail = f"登录失败次数过多，账号已锁定 {policy.login_lock_minutes} 分钟"
+            else:
+                remaining = policy.login_max_attempts - user.failed_login_attempts
+                detail = f"用户名或密码错误，还可尝试 {remaining} 次"
             db.commit()
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
+        raise HTTPException(status_code=401, detail=detail)
+    clear_login_failures(source_ip)
     user.failed_login_attempts = 0
     user.locked_until = None
     audit(db, user, "login")
@@ -730,12 +866,18 @@ def change_own_password(body: PasswordChange, db: Session = Depends(get_db), use
 
 @app.get("/api/dashboard")
 def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    recent = db.scalars(select(Deployment).order_by(desc(Deployment.created_at)).limit(8)).all()
+    deployment_query = select(Deployment)
+    project_query = select(Project)
+    if user.role != Role.admin:
+        owned_project_ids = select(Project.id).where(Project.owner_id == user.id)
+        deployment_query = deployment_query.where(Deployment.project_id.in_(owned_project_ids))
+        project_query = project_query.where(Project.owner_id == user.id)
+    recent = db.scalars(deployment_query.order_by(desc(Deployment.created_at)).limit(8)).all()
     return {
-        "projects": db.query(Project).count(),
+        "projects": db.scalar(select(func.count()).select_from(project_query.subquery())) or 0,
         "nodes": db.query(Node).count(),
-        "running": db.query(Deployment).filter(Deployment.status.in_([DeployStatus.queued, DeployStatus.running])).count(),
-        "success": db.query(Deployment).filter(Deployment.status == DeployStatus.success).count(),
+        "running": db.scalar(select(func.count()).select_from(deployment_query.where(Deployment.status.in_([DeployStatus.queued, DeployStatus.running])).subquery())) or 0,
+        "success": db.scalar(select(func.count()).select_from(deployment_query.where(Deployment.status == DeployStatus.success).subquery())) or 0,
         # Use the same derived stage/progress data as deployment details. Raw
         # DeploymentOut has no progress field, which made the workbench show 0%.
         "recent": [deployment_view(x, db, include_log=False) for x in recent],
@@ -778,6 +920,19 @@ def update_user(item_id: str, body: UserUpdate, db: Session = Depends(get_db), u
         else:
             setattr(item, key, value)
     audit(db, user, "update_user", "user", item.id)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@app.post("/api/users/{item_id}/unlock", response_model=UserOut)
+def unlock_user(item_id: str, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
+    item = db.get(User, item_id)
+    if not item:
+        raise HTTPException(404, "用户不存在")
+    item.failed_login_attempts = 0
+    item.locked_until = None
+    audit(db, user, "unlock_user", "user", item.id, item.username)
     db.commit()
     db.refresh(item)
     return item
@@ -1134,8 +1289,11 @@ def test_git_connection(body: GitConnectionTest, db: Session = Depends(get_db), 
 
 
 @app.get("/api/projects", response_model=list[ProjectOut])
-def list_projects(db: Session = Depends(get_db), _: User = Depends(current_user)):
-    return db.scalars(select(Project).order_by(desc(Project.created_at))).all()
+def list_projects(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    query = select(Project)
+    if user.role != Role.admin:
+        query = query.where(Project.owner_id == user.id)
+    return db.scalars(query.order_by(desc(Project.created_at))).all()
 
 
 @app.post("/api/projects", response_model=ProjectOut)
@@ -1666,9 +1824,71 @@ def update_project_environment(item_id: str, body: dict, db: Session = Depends(g
     if invalid:
         raise HTTPException(400, "环境变量格式应为 KEY=VALUE，每行一项")
     item.env_text_encrypted = encrypt(env_text.strip() + "\n" if env_text.strip() else "")
+    # Keep the analysis summary aligned with the saved integration mode.
+    # Switching MySQL/Redis/PostgreSQL to external must immediately remove the
+    # misleading platform-image recommendation without requiring re-analysis.
+    state = dict(item.source_analysis or {})
+    if state.get("status") == "completed":
+        state["runtime_services"] = _runtime_service_versions(
+            item,
+            state.get("deployment_plan") or {},
+            db,
+            state.get("workspace_path") or state.get("repository_cache_path"),
+        )
+        item.integration_analysis_json = json.dumps(state, ensure_ascii=False)
     audit(db, user, "update_project_environment", "project", item.id, "environment updated")
     db.commit()
     return {"ok": True}
+
+
+@app.put("/api/projects/{item_id}/runtime-images", response_model=ProjectOut)
+def update_project_runtime_images(item_id: str, body: dict, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+    item = db.get(Project, item_id)
+    if not item:
+        raise HTTPException(404, "项目不存在")
+    state = dict(item.source_analysis or {})
+    if state.get("status") != "completed":
+        raise HTTPException(409, "请等待源码分析完成后再修改运行版本")
+    supported = {"Nginx": "nginx", "Redis": "redis", "MySQL": "mysql", "PostgreSQL": "postgres"}
+    requested = body.get("items") or []
+    requested_images = {}
+    for row in requested:
+        service = str(row.get("service") or "")
+        image = str(row.get("image") or "").strip().lower()
+        family = supported.get(service)
+        if not family or not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*:[a-z0-9][a-z0-9._-]*", image):
+            raise HTTPException(400, f"{service or '运行服务'}镜像格式不正确")
+        if image.rsplit("/", 1)[-1].split(":", 1)[0] != family or image.endswith(":latest"):
+            raise HTTPException(400, f"{service}必须使用对应的固定版本镜像，不能使用 latest")
+        requested_images[service] = image
+    current_rows = list(state.get("runtime_services") or [])
+    editable_rows = [row for row in current_rows if row.get("editable", True)]
+    if set(requested_images) != {str(row.get("service") or "") for row in editable_rows}:
+        raise HTTPException(400, "请完整提交当前项目已识别的运行服务")
+    overrides = dict(item.runtime_image_overrides)
+    for row in current_rows:
+        if not row.get("editable", True):
+            continue
+        service = str(row.get("service") or "")
+        old_image = str(row.get("image") or "")
+        new_image = requested_images[service]
+        if new_image != old_image:
+            row["image"] = new_image
+            row["source"] = "用户修改"
+            plan = state.get("deployment_plan") or {}
+            for field in ("compose_yaml", "dockerfile"):
+                text_value = str(plan.get(field) or "")
+                if old_image and text_value:
+                    plan[field] = re.sub(rf"(?<![a-zA-Z0-9._/-]){re.escape(old_image)}(?![a-zA-Z0-9._-])", new_image, text_value)
+            state["deployment_plan"] = plan
+            overrides[service] = new_image
+    state["runtime_services"] = current_rows
+    item.runtime_image_overrides_json = json.dumps(overrides, ensure_ascii=False)
+    item.integration_analysis_json = json.dumps(state, ensure_ascii=False)
+    audit(db, user, "update_runtime_images", "project", item.id, json.dumps(overrides, ensure_ascii=False))
+    db.commit()
+    db.refresh(item)
+    return item
 
 
 def _source_workspace_metadata(item: Project) -> tuple[str | None, str | None]:
@@ -1684,6 +1904,98 @@ def _source_workspace_metadata(item: Project) -> tuple[str | None, str | None]:
         return cache, cache
     source = str(item.source_path or "").strip() or None
     return source, None
+
+
+def _runtime_service_versions(item: Project, plan: dict | None, db: Session, source_path: str | Path | None = None) -> list[dict]:
+    """Build the small, auditable runtime-version summary shown in source management."""
+    policy = get_deployment_settings(db)
+    defaults = {
+        "nginx": policy.default_nginx_image,
+        "redis": policy.default_redis_image,
+        "mysql": policy.default_mysql_image,
+        "postgres": policy.default_postgres_image,
+    }
+    labels = {"nginx": "Nginx", "redis": "Redis", "mysql": "MySQL", "postgres": "PostgreSQL"}
+    text_parts = []
+    if plan:
+        text_parts.extend([str(plan.get("compose_yaml") or ""), str(plan.get("dockerfile") or "")])
+        for row in plan.get("build_environment") or []:
+            if isinstance(row, dict):
+                text_parts.extend([str(row.get("build_image") or ""), str(row.get("runtime_image") or "")])
+    plan_text = "\n".join(text_parts)
+    source_text = ""
+    root = Path(source_path) if source_path else None
+    if root and root.exists():
+        source_files = []
+        for pattern in (
+            "Dockerfile*", "compose*.yml", "compose*.yaml", "docker-compose*.yml", "docker-compose*.yaml",
+            "pom.xml", "build.gradle*", "package.json", "requirements*.txt", "application*.yml",
+            "application*.yaml", "application*.properties", ".env*",
+        ):
+            source_files.extend(root.rglob(pattern))
+        for path in list(dict.fromkeys(source_files))[:200]:
+            if path.is_file() and not any(part in {".git", "node_modules", "dist", "build", "target"} for part in path.relative_to(root).parts):
+                source_text += "\n" + path.read_text(encoding="utf-8", errors="ignore")[:100_000]
+    explicit: dict[str, str] = {}
+    for match in re.finditer(r"(?i)(?<![a-z0-9._/-])(nginx|redis|mysql|postgres(?:ql)?):([a-z0-9][a-z0-9._-]*)", source_text):
+        family = "postgres" if match.group(1).lower().startswith("postgres") else match.group(1).lower()
+        explicit.setdefault(family, f"{family}:{match.group(2)}")
+    detected_text = " ".join(str(value) for value in ((plan or {}).get("services") or [])).lower()
+    dependency_text = (source_text + "\n" + plan_text).lower()
+    dependency_markers = {
+        "mysql": ("mysql-connector", "jdbc:mysql", "pymysql", "mysqlclient"),
+        "postgres": ("postgresql", "jdbc:postgres", "psycopg", "pg8000"),
+        "redis": ("data-redis", "redis.clients", "spring.redis", "ioredis", "redis://"),
+    }
+    env_values = {}
+    for line in (decrypt(item.env_text_encrypted) or "").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, value = line.split("=", 1)
+            env_values[key.strip()] = value.strip().lower()
+    rows = []
+    overrides = item.runtime_image_overrides
+    for family in ("nginx", "redis", "mysql", "postgres"):
+        external_key = f"YUNZHOU_{'POSTGRES' if family == 'postgres' else family.upper()}_MODE"
+        external = env_values.get(external_key) == "external"
+        mentioned = family in detected_text or family in explicit or any(
+            marker in dependency_text for marker in dependency_markers.get(family, ())
+        )
+        if family == "nginx":
+            mentioned = mentioned or any(str(row.get("runtime_image") or "").lower().startswith("nginx") for row in ((plan or {}).get("build_environment") or []) if isinstance(row, dict))
+        if not mentioned:
+            continue
+        if external:
+            prefix = "POSTGRES" if family == "postgres" else family.upper()
+            host = env_values.get(f"YUNZHOU_{prefix}_HOST", "")
+            port = env_values.get(f"YUNZHOU_{prefix}_PORT", "")
+            database = env_values.get(f"YUNZHOU_{prefix}_DATABASE", "")
+            endpoint = ":".join(value for value in (host, port) if value)
+            if database:
+                endpoint += "/" + database
+            rows.append({
+                "service": labels[family],
+                "image": "",
+                "source": "外部依赖",
+                "mode": "external",
+                "endpoint": endpoint or "已使用项目保存的外接配置",
+                "editable": False,
+            })
+            continue
+        selected_image = str(overrides.get(labels[family]) or defaults[family])
+        selected_source = "用户修改" if labels[family] in overrides else "平台推荐"
+        rows.append({
+            "service": labels[family],
+            "image": selected_image,
+            "source": selected_source,
+            "editable": True,
+        })
+        if plan:
+            original_image = explicit.get(family) or defaults[family]
+            for field in ("compose_yaml", "dockerfile"):
+                value = str(plan.get(field) or "")
+                if value and original_image:
+                    plan[field] = re.sub(rf"(?<![a-zA-Z0-9._/-]){re.escape(original_image)}(?![a-zA-Z0-9._-])", selected_image, value)
+    return rows
 
 
 @app.post("/api/projects/{item_id}/integration-analysis")
@@ -1950,6 +2262,7 @@ def analyze_project_integrations(item_id: str, db: Session = Depends(get_db), us
             "inferred": inferred,
             "model": model,
             "build_environment": list(plan.get("build_environment") or []) if plan else [],
+            "runtime_services": _runtime_service_versions(item, plan, db, source),
             "deployment_kind": str(plan.get("deployment_kind") or "") if plan else "",
             "container_port": plan.get("container_port") if plan else None,
             "access_path": str(plan.get("access_path") or "/") if plan else "/",
@@ -2019,6 +2332,7 @@ def remember_analysis_outcome(db: Session, error: str, repaired: bool) -> None:
         }, ensure_ascii=False)
     else:
         row.failed_repairs = (row.failed_repairs or 0) + 1
+    prepare_new_experience(row)
     db.flush()
 
 
@@ -2030,6 +2344,7 @@ def run_project_integration_analysis(item_id: str, user_id: str) -> None:
             return
         queued_state = item.source_analysis or {}
         previous_error = str(queued_state.get("previous_error") or queued_state.get("error") or "")
+        retry_count = int(queued_state.get("retry_count") or 0)
         workspace_path, repository_cache_path = _source_workspace_metadata(item)
         item.integration_analysis_json = json.dumps({
             "status": "running", "phase": "pulling", "progress": 15,
@@ -2042,6 +2357,7 @@ def run_project_integration_analysis(item_id: str, user_id: str) -> None:
             # analyze_project_integrations reads this state to apply only the
             # platform's bounded, audited repair classifiers.
             "previous_error": previous_error,
+            "retry_count": retry_count,
         }, ensure_ascii=False)
         db.commit()
         try:
@@ -2060,13 +2376,36 @@ def run_project_integration_analysis(item_id: str, user_id: str) -> None:
             if item:
                 detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
                 previous = item.source_analysis or {}
-                item.integration_analysis_json = json.dumps({
-                    **previous, "status": "failed", "phase": "failed", "progress": 100,
-                    "summary": "源码处理未完成", "error": str(detail)[:500],
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                }, ensure_ascii=False)
-                audit(db, user, "analyze_integrations_failed", "project", item.id, str(detail)[:1000])
-                remember_analysis_outcome(db, str(detail), False)
+                detail_text = str(detail)[:500]
+                normalized = detail_text.lower()
+                recoverable = any(token in normalized for token in (
+                    "timed out", "timeout", "read operation timed out", "connect error",
+                    "connection reset", "temporarily unavailable", "remote protocol",
+                    "ai 源码分析暂不可用", "502", "503", "504",
+                ))
+                attempt = int(previous.get("retry_count") or retry_count or 0)
+                if recoverable and attempt < 3:
+                    next_attempt = attempt + 1
+                    delay_seconds = 15 * next_attempt
+                    item.integration_analysis_json = json.dumps({
+                        **previous,
+                        "status": "queued", "phase": "queued", "progress": 10,
+                        "summary": f"AI 分析暂时未响应，{delay_seconds} 秒后自动重试（{next_attempt}/3）。",
+                        "error": detail_text,
+                        "previous_error": detail_text,
+                        "retry_count": next_attempt,
+                        "next_retry_at": (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat(),
+                    }, ensure_ascii=False)
+                    audit(db, user, "analyze_integrations_retry", "project", item.id, f"{next_attempt}/3: {detail_text[:800]}")
+                else:
+                    item.integration_analysis_json = json.dumps({
+                        **previous, "status": "failed", "phase": "failed", "progress": 100,
+                        "summary": "源码处理未完成", "error": detail_text,
+                        "retry_count": attempt,
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                    }, ensure_ascii=False)
+                    audit(db, user, "analyze_integrations_failed", "project", item.id, detail_text[:1000])
+                    remember_analysis_outcome(db, detail_text, False)
                 db.commit()
 
 
@@ -2287,13 +2626,29 @@ def get_project_domain_config(item_id: str, db: Session = Depends(get_db), _: Us
         Deployment.project_id == item_id, Deployment.status == DeployStatus.success,
     ).order_by(desc(Deployment.created_at)).limit(1))
     gateway_services = []
+    gateway_service_targets = {}
+    auto_routes = []
     if latest:
         node = db.get(Node, latest.node_id)
         if node:
             try:
-                gateway_services = [row["name"] for row in _runtime_service_gateway_routes(db, item, latest, node)]
+                route_groups = _runtime_service_gateway_routes(db, item, latest, node)
+                gateway_services = [row["name"] for row in route_groups]
+                for group in route_groups:
+                    gateway_service_targets[str(group.get("name") or "")] = [
+                        f"{host}:{port}" for host, port in (group.get("targets") or [])
+                    ]
+                    for route in group.get("paths") or [{"path": group.get("path") or "/", "strip_prefix": False}]:
+                        route = route if isinstance(route, dict) else {"path": route}
+                        auto_routes.append({
+                            "path": str(route.get("path") or "/"),
+                            "service": str(group.get("name") or ""),
+                            "strip_prefix": bool(route.get("strip_prefix", False)),
+                        })
             except Exception:
                 gateway_services = []
+                gateway_service_targets = {}
+                auto_routes = []
     try:
         custom_routes = json.loads(config.custom_routes_json or "[]") if config else []
     except Exception:
@@ -2306,9 +2661,11 @@ def get_project_domain_config(item_id: str, db: Session = Depends(get_db), _: Us
         "redirect_https": config.redirect_https if config else True,
         "gateway_mode": config.gateway_mode if config else "auto",
         "custom_routes": custom_routes,
+        "auto_routes": auto_routes,
         "proxy_read_timeout": config.proxy_read_timeout if config else 300,
         "client_max_body_mb": config.client_max_body_mb if config else 50,
         "gateway_services": gateway_services,
+        "gateway_service_targets": gateway_service_targets,
         "has_certificate": bool(config and config.certificate_encrypted and config.private_key_encrypted),
         "certificate_name": config.certificate_name if config else None,
         "certificate_id": shared.id if shared else None,
@@ -2446,7 +2803,12 @@ def update_project_gateway_policy(
 
     config = db.get(ProjectDomainConfig, item_id) or ProjectDomainConfig(project_id=item_id)
     config.gateway_mode = mode
-    config.custom_routes_json = json.dumps(normalized_routes, ensure_ascii=False)
+    # Auto and custom are two independently persisted plans. Switching back to
+    # automatic routing must not erase a known-good manual fallback: operators
+    # can safely compare/test automatic detection and later return to the exact
+    # custom plan they saved before.
+    if mode == "custom":
+        config.custom_routes_json = json.dumps(normalized_routes, ensure_ascii=False)
     config.proxy_read_timeout = timeout
     config.client_max_body_mb = upload_mb
     db.add(config)
@@ -2511,7 +2873,7 @@ def _runtime_service_gateway_routes(db: Session, project: Project, deployment: D
     Docker is the source of truth for service-specific published ports; the
     versioned traffic plan remains the source of truth for URL paths.
     """
-    compose_project = "yz-" + project.slug
+    compose_project = deployment_compose_project_name(deployment, project)
     service_targets: dict[str, list[tuple[str, int]]] = {}
     try:
         with SSHNode(node) as ssh:
@@ -2559,7 +2921,9 @@ def _runtime_service_gateway_routes(db: Session, project: Project, deployment: D
             service_targets.setdefault(row.service_name, []).append((node.host, row.host_port))
     for service, targets in service_targets.items():
         service_targets[service] = list(dict.fromkeys(targets))
-    return _route_groups_for_services(project, service_targets)
+    groups = _route_groups_for_services(project, service_targets)
+    groups, _ = reconcile_runtime_frontend_routes(groups)
+    return groups or []
 
 
 def _ensure_domain_ports_available(
@@ -2808,6 +3172,9 @@ def update_project(item_id: str, body: ProjectUpdate, db: Session = Depends(get_
 
 
 REGISTRY_API = "http://registry:5000/v2"
+_REGISTRY_CACHE_TTL = 30.0
+_registry_catalog_cache: tuple[float, dict] | None = None
+_registry_catalog_guard = threading.Lock()
 REGISTRY_MANIFEST_ACCEPT = ", ".join((
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.oci.image.manifest.v1+json",
@@ -2829,41 +3196,88 @@ def _registry_request(method: str, path: str, **kwargs):
     return response
 
 
+def _invalidate_registry_catalog_cache() -> None:
+    global _registry_catalog_cache
+    with _registry_catalog_guard:
+        _registry_catalog_cache = None
+
+
+def _registry_version_detail(name: str, tag: str) -> dict:
+    response = _registry_request("GET", f"/{quote(name, safe='/')}/manifests/{quote(tag, safe='')}", headers={"Accept": REGISTRY_MANIFEST_ACCEPT})
+    manifest = response.json()
+    size = sum(int(x.get("size") or 0) for x in manifest.get("layers") or []) + int((manifest.get("config") or {}).get("size") or 0)
+    created_at = None
+    config_digest = (manifest.get("config") or {}).get("digest")
+    if config_digest:
+        try:
+            image_config = _registry_request("GET", f"/{quote(name, safe='/')}/blobs/{quote(config_digest, safe=':')}").json()
+            created_at = image_config.get("created")
+        except HTTPException:
+            pass
+    if not created_at and re.fullmatch(r"\d{12}(?:\d{2}|-\d{2})?", tag):
+        try:
+            stamp = tag.split("-", 1)[0]
+            pattern = "%Y%m%d%H%M%S" if len(stamp) == 14 else "%Y%m%d%H%M"
+            created_at = datetime.strptime(stamp, pattern).replace(tzinfo=timezone(timedelta(hours=8))).isoformat()
+        except ValueError:
+            pass
+    return {"tag": tag, "digest": response.headers.get("Docker-Content-Digest", ""), "size_bytes": size, "created_at": created_at}
+
+
 @app.get("/api/images")
-def list_image_repository(db: Session = Depends(get_db), _: User = Depends(require(Role.admin, Role.deployer))):
+def list_image_repository(refresh: bool = False, db: Session = Depends(get_db), _: User = Depends(require(Role.admin, Role.deployer))):
+    global _registry_catalog_cache
+    if not refresh:
+        with _registry_catalog_guard:
+            cached = _registry_catalog_cache
+            if cached and time.monotonic() - cached[0] <= _REGISTRY_CACHE_TTL:
+                return copy.deepcopy(cached[1])
     names = _registry_request("GET", "/_catalog?n=100").json().get("repositories") or []
+    tags_by_name = {}
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(names)))) as pool:
+        futures = {pool.submit(_registry_request, "GET", f"/{quote(name, safe='/')}/tags/list"): name for name in names}
+        for future in as_completed(futures):
+            name = futures[future]
+            tags_by_name[name] = future.result().json().get("tags") or []
+    versions_by_name = {name: [] for name, tags in tags_by_name.items() if tags}
+    version_jobs = [(name, tag) for name, tags in tags_by_name.items() for tag in tags]
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(version_jobs)))) as pool:
+        futures = {pool.submit(_registry_version_detail, name, tag): name for name, tag in version_jobs}
+        for future in as_completed(futures):
+            versions_by_name[futures[future]].append(future.result())
+    projects = db.scalars(select(Project)).all()
+    project_by_slug = {str(project.slug): project for project in projects if project.slug}
     repositories = []
-    for name in sorted(names):
-        tags = _registry_request("GET", f"/{quote(name, safe='/')}/tags/list").json().get("tags") or []
-        # Registry catalogs may retain a repository name after its last
-        # manifest is deleted. It has no usable image and should not appear as
-        # a platform repository or inflate repository totals.
-        if not tags:
-            continue
-        versions = []
-        for tag in sorted(tags, reverse=True):
-            response = _registry_request("GET", f"/{quote(name, safe='/')}/manifests/{quote(tag, safe='')}", headers={"Accept": REGISTRY_MANIFEST_ACCEPT})
-            manifest = response.json()
-            size = sum(int(x.get("size") or 0) for x in manifest.get("layers") or []) + int((manifest.get("config") or {}).get("size") or 0)
-            created_at = None
-            config_digest = (manifest.get("config") or {}).get("digest")
-            if config_digest:
-                try:
-                    image_config = _registry_request("GET", f"/{quote(name, safe='/')}/blobs/{quote(config_digest, safe=':')}").json()
-                    created_at = image_config.get("created")
-                except HTTPException:
-                    pass
-            if not created_at and re.fullmatch(r"\d{12}(?:\d{2}|-\d{2})?", tag):
-                try:
-                    stamp = tag.split("-", 1)[0]
-                    pattern = "%Y%m%d%H%M%S" if len(stamp) == 14 else "%Y%m%d%H%M"
-                    created_at = datetime.strptime(stamp, pattern).replace(tzinfo=timezone(timedelta(hours=8))).isoformat()
-                except ValueError:
-                    pass
-            versions.append({"tag": tag, "digest": response.headers.get("Docker-Content-Digest", ""), "size_bytes": size, "created_at": created_at})
-        repositories.append({"name": name, "tags": versions, "tag_count": len(versions)})
+    for name, versions in sorted(versions_by_name.items()):
+        repository_tail = name.split("/", 1)[-1]
+        matching_slug = next(
+            (
+                slug for slug in sorted(project_by_slug, key=len, reverse=True)
+                if repository_tail == slug or repository_tail.startswith(slug + "-")
+            ),
+            None,
+        )
+        project = project_by_slug.get(matching_slug) if matching_slug else None
+        service_name = (
+            repository_tail[len(matching_slug) + 1:]
+            if matching_slug and repository_tail.startswith(matching_slug + "-")
+            else "app"
+        )
+        repositories.append({
+            "name": name,
+            "tags": sorted(versions, key=lambda item: item["tag"], reverse=True),
+            "tag_count": len(versions),
+            "project_id": project.id if project else None,
+            "project_name": project.name if project else None,
+            "project_slug": matching_slug,
+            "service_name": service_name,
+        })
     policy = get_deployment_settings(db)
-    return {"repositories": repositories, "repository_count": len(repositories), "tag_count": sum(x["tag_count"] for x in repositories), "endpoint": policy.registry_endpoint}
+    project_count = len({item["project_slug"] or item["name"] for item in repositories})
+    result = {"repositories": repositories, "repository_count": len(repositories), "project_count": project_count, "tag_count": sum(x["tag_count"] for x in repositories), "endpoint": policy.registry_endpoint}
+    with _registry_catalog_guard:
+        _registry_catalog_cache = (time.monotonic(), copy.deepcopy(result))
+    return result
 
 
 @app.delete("/api/images")
@@ -2880,6 +3294,7 @@ def delete_image_tag(body: dict, db: Session = Depends(get_db), user: User = Dep
     if not digest:
         raise HTTPException(409, "仓库未返回镜像摘要，无法安全删除")
     _registry_request("DELETE", f"/{quote(repository, safe='/')}/manifests/{quote(digest, safe=':')}")
+    _invalidate_registry_catalog_cache()
     audit(db, user, "delete_registry_tag", "registry_image", None, f"{repository}:{tag}")
     db.commit()
     return {"ok": True, "message": f"已从仓库删除 {repository}:{tag}"}
@@ -2992,6 +3407,8 @@ def bulk_delete_image_repositories(body: dict, db: Session = Depends(get_db), us
             removed.append(f"{repository}:{tag}")
         except Exception as exc:
             failed.append({"image": f"{repository}:{tag}", "error": str(exc)[:300]})
+    if removed:
+        _invalidate_registry_catalog_cache()
     audit(db, user, "bulk_delete_registry_repositories", "registry", None,
           f"repositories={len(repositories)},removed={len(removed)},protected={len(protected_tags)},failed={len(failed)}")
     db.commit()
@@ -3050,6 +3467,9 @@ def project_delete_preview(item_id: str, db: Session = Depends(get_db), _: User 
     for node in db.scalars(select(Node).where(Node.enabled == True)).all():
         nodes.setdefault(node.id, node)
     resources = {"deployments": [], "containers": [], "images": [], "registry_images": [], "directories": [], "volumes": [], "gateway_files": [], "source_origin": [], "source": []}
+    runtime_policy = db.get(DeploymentSettings, "default")
+    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
+    runtime_project = compose_project_name(item.slug, namespace=runtime_namespace)
     if item.source_type == SourceType.git:
         parsed_source = urlsplit(item.git_url or "")
         safe_repository = (
@@ -3061,6 +3481,11 @@ def project_delete_preview(item_id: str, db: Session = Depends(get_db), _: User 
     else:
         resources["source_origin"].append({"name": "平台上传源码（删除项目时一并清理）"})
     gateway_candidates = []
+    gateway_candidates.extend([
+        f"/data/yunzhou-control/data/gateway/conf.d/project-{item.id}.conf",
+        f"/data/yunzhou-control/data/gateway/certs/project-{item.id}.crt",
+        f"/data/yunzhou-control/data/gateway/certs/project-{item.id}.key",
+    ])
     warnings = []
     try:
         for repository in _project_registry_repositories(db, item):
@@ -3117,12 +3542,27 @@ def project_delete_preview(item_id: str, db: Session = Depends(get_db), _: User 
                     entry = {"name": name, "node": node.name}
                     if entry not in resources["containers"]:
                         resources["containers"].append(entry)
+                _, current_containers = ssh.run(
+                    "docker ps -a --format '{{.Names}}|{{.Label \"com.docker.compose.project\"}}'",
+                    timeout=20,
+                )
+                for row in filter(None, map(str.strip, current_containers.splitlines())):
+                    name, _, owner = row.partition("|")
+                    if not (
+                        name.startswith(runtime_project + "-")
+                        or owner == runtime_project + "-data"
+                        or owner.startswith(runtime_project + "-")
+                    ):
+                        continue
+                    entry = {"name": name, "node": node.name}
+                    if entry not in resources["containers"]:
+                        resources["containers"].append(entry)
                 _, volumes = ssh.run("docker volume ls -q", timeout=20)
-                prefix = f"yz-{item.slug}"
+                prefixes = (f"yz-{item.slug}", runtime_project)
                 for name in filter(None, map(str.strip, volumes.splitlines())):
-                    if not (name == prefix or name.startswith(prefix + "_") or name.startswith(prefix + "-")):
+                    if not any(name == prefix or name.startswith(prefix + "_") or name.startswith(prefix + "-") for prefix in prefixes):
                         _, label = ssh.run("docker volume inspect -f " + shlex.quote('{{index .Labels "com.docker.compose.project"}}') + " " + shlex.quote(name), timeout=10)
-                        if label.strip() != prefix:
+                        if label.strip() not in prefixes and not label.strip().startswith(runtime_project + "-"):
                             continue
                     resources["volumes"].append({"name": name, "node": node.name})
         except Exception as exc:
@@ -3153,7 +3593,7 @@ def project_delete_preview(item_id: str, db: Session = Depends(get_db), _: User 
 
 
 @app.delete("/api/projects/{item_id}")
-def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str | None = None, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str | None = None, keep_project: bool = False, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     item = db.get(Project, item_id)
     if not item:
         raise HTTPException(404, "项目不存在")
@@ -3162,6 +3602,9 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
     cleanup_results = []
     retained_volumes = []
     discovered_volumes = []
+    runtime_policy = db.get(DeploymentSettings, "default")
+    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
+    runtime_project = compose_project_name(item.slug, namespace=runtime_namespace)
     try:
         selected_volume_names = set(json.loads(delete_volumes)) if delete_volumes is not None else None
         if selected_volume_names is not None and not all(isinstance(name, str) for name in selected_volume_names):
@@ -3209,13 +3652,13 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
                 continue
             with SSHNode(node) as ssh:
                 _, output = ssh.run("docker volume ls -q", timeout=20)
-                prefix = f"yz-{item.slug}"
+                prefixes = (f"yz-{item.slug}", runtime_project)
                 names = []
                 for name in filter(None, map(str.strip, output.splitlines())):
-                    owned = name == prefix or name.startswith(prefix + "_") or name.startswith(prefix + "-")
+                    owned = any(name == prefix or name.startswith(prefix + "_") or name.startswith(prefix + "-") for prefix in prefixes)
                     if not owned:
                         _, label = ssh.run("docker volume inspect -f " + shlex.quote('{{index .Labels "com.docker.compose.project"}}') + " " + shlex.quote(name), timeout=10)
-                        owned = label.strip() == prefix
+                        owned = label.strip() in prefixes or label.strip().startswith(runtime_project + "-")
                     if owned:
                         names.append(name)
             discovered_volumes.extend({"name": name, "node_id": node.id, "node": node.name} for name in names)
@@ -3225,24 +3668,18 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
         if not selected_volume_names.issubset(known_names):
             raise RuntimeError("数据卷清单已经变化，请关闭窗口后重新核实")
         retained_volumes = [volume for volume in discovered_volumes if volume["name"] not in selected_volume_names]
+        # Deleting a project is a project-wide operation.  Only queued/running
+        # jobs need the normal stop path (task cancellation and port release).
+        # Successful historical releases are removed by the single node sweep
+        # below; cleaning every historical release first made deletion repeat
+        # the same Docker/SSH work many times.
         for dep in deployments:
             node = db.get(Node, dep.node_id)
-            if node and dep.status in (DeployStatus.queued, DeployStatus.running, DeployStatus.success):
+            if node and dep.status in (DeployStatus.queued, DeployStatus.running):
                 cleanup_results.append(stop_deployment(dep, item, node))
+            if dep.status in (DeployStatus.queued, DeployStatus.running, DeployStatus.success):
                 dep.status = DeployStatus.stopped
         db.flush()
-        remaining_by_node = {}
-        for dep in deployments:
-            remaining_by_node[dep.node_id] = remaining_by_node.get(dep.node_id, 0) + 1
-        for dep in deployments:
-            node = db.get(Node, dep.node_id)
-            if node:
-                remaining_by_node[dep.node_id] -= 1
-                cleanup_results.append(delete_deployment_resources(
-                    dep, item, node,
-                    remove_compose_images=remaining_by_node[dep.node_id] == 0,
-                    remove_persistent_data=False,
-                ))
         # A release record can be removed independently or an interrupted
         # operation can fail before it is committed. Reconcile the real Docker
         # state on every node instead of trusting database records alone.
@@ -3257,9 +3694,14 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
                 ]))
                 command = (
                     "ids=$(docker ps -aq --filter " + shlex.quote(f"label=com.docker.compose.project={compose_project}") + "); "
-                    f"named=$(docker ps -a --format '{{{{.Names}}}}' | awk -v p={shlex.quote(container_prefix)} 'index($0,p)==1 {{print}}'); "
-                    "all=$(printf '%s\\n%s\\n' \"$ids\" \"$named\" | sed '/^$/d' | sort -u); "
+                    "current=$(docker ps -a --format '{{.ID}}|{{.Label \"com.docker.compose.project\"}}' | "
+                    f"awk -F'|' -v p={shlex.quote(runtime_project)} '$2==p\"-data\" || index($2,p\"-\")==1 {{print $1}}'); "
+                    f"named=$(docker ps -a --format '{{{{.Names}}}}' | awk -v p={shlex.quote(container_prefix)} -v q={shlex.quote(runtime_project + '-')} 'index($0,p)==1 || index($0,q)==1 {{print}}'); "
+                    "all=$(printf '%s\\n%s\\n%s\\n' \"$ids\" \"$current\" \"$named\" | sed '/^$/d' | sort -u); "
                     "[ -z \"$all\" ] || docker rm -f $all >/dev/null; "
+                    "networks=$(docker network ls --format '{{.ID}}|{{.Label \"com.docker.compose.project\"}}' | "
+                    f"awk -F'|' -v p={shlex.quote(runtime_project)} '$2==p\"-data\" || index($2,p\"-\")==1 {{print $1}}'); "
+                    "[ -z \"$networks\" ] || docker network rm $networks >/dev/null 2>&1 || true; "
                     "images=$(docker images --format '{{.Repository}}:{{.Tag}}' | "
                     f"awk -F: -v r={shlex.quote(image_root)} '$1==r || index($1,r\"-\")==1 {{print}}'); "
                     "[ -z \"$images\" ] || printf '%s\\n' \"$images\" | xargs -r docker image rm -f >/dev/null; "
@@ -3267,8 +3709,8 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
                     "docker image prune -f >/dev/null 2>&1 || true; "
                     "left_images=$(docker images --format '{{.Repository}}' | "
                     f"awk -v r={shlex.quote(image_root)} '$1==r || index($1,r\"-\")==1 {{print}}'); "
-                    "left_containers=$(docker ps -a --format '{{.Names}}' | "
-                    f"awk -v p={shlex.quote(container_prefix)} 'index($0,p)==1 {{print}}'); "
+                    "left_containers=$(docker ps -a --format '{{.Names}}|{{.Label \"com.docker.compose.project\"}}' | "
+                    f"awk -F'|' -v p={shlex.quote(container_prefix)} -v q={shlex.quote(runtime_project)} 'index($1,p)==1 || $2==q\"-data\" || index($2,q\"-\")==1 {{print}}'); "
                     "[ -z \"$left_images$left_containers\" ]"
                 )
                 code, output = ssh.run(command, timeout=180)
@@ -3285,31 +3727,50 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
                 if not node:
                     continue
                 with SSHNode(node) as ssh:
-                    command = "; ".join(f"docker volume rm -f {shlex.quote(name)} >/dev/null 2>&1 || true" for name in names)
-                    ssh.run(command or "true", timeout=60)
+                    command = "; ".join(
+                        f"docker volume rm -f {shlex.quote(name)} >/dev/null && ! docker volume inspect {shlex.quote(name)} >/dev/null 2>&1"
+                        for name in names
+                    )
+                    code, output = ssh.run(command or "true", timeout=60)
+                    if code:
+                        raise RuntimeError(output or f"{node.name} 数据卷清理后复查失败")
             cleanup_results.append(f"{len(deleted_volumes)} 个平台数据卷已清理")
+        if retained_volumes:
+            cleanup_results.append(
+                f"按用户选择保留 {len(retained_volumes)} 个数据卷："
+                + "、".join(volume["name"] for volume in retained_volumes)
+            )
         gateway = platform_gateway_node(db)
-        if gateway and deployments:
-            ids = " ".join(shlex.quote(dep.id) for dep in deployments)
+        if gateway:
+            gateway_keys = [f"project-{item.id}", *(dep.id for dep in deployments)]
+            ids = " ".join(shlex.quote(value) for value in gateway_keys)
             with SSHNode(gateway) as ssh:
                 code, output = ssh.run(
                     "for id in " + ids + "; do rm -f -- /data/yunzhou-control/data/gateway/conf.d/$id.conf /data/yunzhou-control/data/gateway/certs/$id.crt /data/yunzhou-control/data/gateway/certs/$id.key; done; "
-                    "docker exec yunzhou-platform-gateway nginx -t >/dev/null 2>&1 && docker exec yunzhou-platform-gateway nginx -s reload >/dev/null 2>&1 || true",
+                    "docker exec yunzhou-platform-gateway nginx -t && docker exec yunzhou-platform-gateway nginx -s reload; "
+                    "for id in " + ids + "; do test ! -e /data/yunzhou-control/data/gateway/conf.d/$id.conf && test ! -e /data/yunzhou-control/data/gateway/certs/$id.crt && test ! -e /data/yunzhou-control/data/gateway/certs/$id.key || exit 45; done",
                     timeout=30,
                 )
                 if code:
                     raise RuntimeError(output or "平台网关文件清理失败")
+                cleanup_results.append("平台网关配置、证书和监听已清理并复查")
         # Images are built centrally on the platform host before being copied
         # to a target node. They are not represented by target deployment
         # records, so remove them explicitly when the project is deleted.
         if gateway:
             with SSHNode(gateway) as ssh:
                 central_prefix = f"yunzhou/{item.slug}-"
+                builder_project_root = settings.build_data_root.rstrip('/') + '/builder/projects/' + item.slug
+                builder_cleanup = (
+                    f"rm -rf -- {shlex.quote(builder_project_root + '/runs')}; mkdir -p {shlex.quote(builder_project_root + '/runs')}"
+                    if keep_project else
+                    f"rm -rf -- {shlex.quote(builder_project_root)}"
+                )
                 code, output = ssh.run(
                     "images=$(docker images --format '{{.Repository}}:{{.Tag}}' | "
                     f"awk -v p={shlex.quote(central_prefix)} 'index($0,p)==1 {{print}}'); "
                     "if [ -n \"$images\" ]; then printf '%s\\n' \"$images\" | xargs -r docker image rm -f; fi; "
-                    f"rm -rf -- {shlex.quote(settings.build_data_root.rstrip('/') + '/builder/projects/' + item.slug)}; "
+                    + builder_cleanup + "; "
                     "docker image prune -f >/dev/null 2>&1 || true; "
                     "docker images --format '{{.Repository}}' | "
                     f"awk -v p={shlex.quote(central_prefix)} 'index($0,p)==1 {{found=1}} END {{exit found ? 1 : 0}}'",
@@ -3317,18 +3778,31 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
                 )
                 if code:
                     raise RuntimeError(output or "平台构建镜像清理失败")
-                cleanup_results.append("平台构建机上的项目镜像及悬空镜像已清理并复查")
+                cleanup_results.append(
+                    "平台构建机上的项目镜像和临时运行目录已清理，源码及依赖缓存已保留"
+                    if keep_project else
+                    "平台构建机上的项目镜像及悬空镜像已清理并复查"
+                )
         registry_cleanup = _delete_project_registry_repositories(db, item)
         if registry_cleanup["tags"]:
             cleanup_results.append(
                 f"平台镜像仓库中的 {len(registry_cleanup['repositories'])} 个项目仓库、"
                 f"{len(registry_cleanup['tags'])} 个镜像版本已清理并复查"
             )
-        shutil.rmtree(Path(settings.upload_root) / item.id, ignore_errors=True)
+        # A reset keeps the project definition and source credentials so the
+        # user can immediately re-analyse or redeploy from a clean runtime.
+        # Uploaded source belongs to that retained definition and must not be
+        # removed in reset mode.
+        if not keep_project:
+            uploaded_source = Path(settings.upload_root) / item.id
+            had_uploaded_source = uploaded_source.exists()
+            shutil.rmtree(uploaded_source, ignore_errors=True)
+            if had_uploaded_source:
+                cleanup_results.append("平台上传的项目源码已删除")
     except Exception as exc:
         db.rollback()
         raise HTTPException(502, f"项目尚未删除，资源清理失败：{exc}")
-    audit(db, user, "delete_project", "project", item_id, json.dumps({
+    audit(db, user, "reset_project" if keep_project else "delete_project", "project", item_id, json.dumps({
         "project": item.name,
         "project_slug": item.slug,
         "deployment_count": len(deployments),
@@ -3338,9 +3812,27 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
         "external_data": "preserved",
         "resources": [result.get("summary", str(result)) if isinstance(result, dict) else str(result) for result in cleanup_results],
     }, ensure_ascii=False))
-    db.delete(item)
+    if keep_project:
+        for replica in replicas:
+            db.delete(replica)
+        for deployment in deployments:
+            db.delete(deployment)
+        # Runtime-derived fields must not make the retained project appear to
+        # be online. Source/build/integration configuration remains intact.
+        cleanup_results.append("项目配置、源码、分支、凭据和外部集成设置已保留")
+    else:
+        db.delete(item)
     db.commit()
-    return {"ok": True, "summary": f"项目及 {len(deployments)} 条发布记录已删除，远端资源已清理并复查", "details": cleanup_results}
+    return {
+        "ok": True,
+        "project_retained": keep_project,
+        "summary": (
+            f"项目运行资源及 {len(deployments)} 条发布记录已清空，项目配置已保留"
+            if keep_project else
+            f"项目及 {len(deployments)} 条发布记录已删除，远端资源已清理并复查"
+        ),
+        "details": cleanup_results,
+    }
 
 
 def make_deployment_plan(project: Project, node: Node, db: Session, reserved_host_port: int | None = None) -> dict:
@@ -3469,6 +3961,148 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
     return item
 
 
+def compact_stage_log(section: str) -> str:
+    """Keep live Docker progress readable without altering downloadable logs."""
+    lines = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", section).splitlines()
+    visible: list[str] = []
+    latest_progress: tuple[str, str] | None = None
+    compose_progress: dict[str, str] = {}
+    progress_was_tail = False
+    for line in lines:
+        stripped = line.strip()
+        service_progress = re.search(
+            r"Service\s+(\S+)\s+Building(?:\s+.*?\s)?(\d+(?:\.\d+)?)s\s*$",
+            stripped,
+        )
+        generic_progress = re.search(r"(?:^|\]\s)(?:\[\+\]\s*)?Building\s+\d+/\d+\s*$", stripped)
+        orphan_duration = re.search(r"(?:^|\]\s)\d+(?:\.\d+)?s$", stripped)
+        compose_header = re.match(r"^\[\+\]\s+(?:Running|Pulling|Building|Stopping|Restarting)\s+\d+/\d+", stripped)
+        compose_item = re.match(
+            r"^[^A-Za-z0-9\[]*(Network|Container|Volume|Image)\s+(\S+)\s+"
+            r"(Created|Creating|Started|Starting|Waiting|Running|Healthy|Error|Pulling|Pulled|Removed|Removing)"
+            r"(?:\s+(\d+(?:\.\d+)?s))?\s*$",
+            stripped,
+        )
+        if compose_header:
+            progress_was_tail = True
+            continue
+        if compose_item:
+            kind, name, state, duration = compose_item.groups()
+            compose_progress[f"{kind}:{name}"] = f"{kind} {name} · {state}" + (f" · {duration}" if duration else "")
+            progress_was_tail = True
+            continue
+        if service_progress:
+            latest_progress = (service_progress.group(1), service_progress.group(2))
+            progress_was_tail = True
+            continue
+        if generic_progress or orphan_duration:
+            progress_was_tail = True
+            continue
+        if stripped:
+            progress_was_tail = False
+        visible.append(line)
+    if latest_progress and progress_was_tail:
+        service, seconds = latest_progress
+        visible.append(f"[构建进度] {service} · {seconds}秒")
+    if compose_progress:
+        visible.append("[Compose 最新状态]")
+        visible.extend(compose_progress.values())
+    return "\n".join(visible).strip()
+
+
+def build_log_streams(section: str) -> list[dict]:
+    """Split timestamped concurrent build output into service-specific views."""
+    channels: dict[str, dict] = {}
+    for match in re.finditer(
+        r"(?m)^\[构建通道\]\s+([^|\s]+)\|([^|]+)\|(开始|完成|失败)\|(\S+)\s*$",
+        section,
+    ):
+        key, label, state, raw_time = match.groups()
+        channel = channels.setdefault(key, {"key": key, "label": label, "lines": [], "started_at": None, "finished_at": None, "status": "running"})
+        channel["label"] = label
+        try:
+            moment = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        except ValueError:
+            moment = None
+        if state == "开始":
+            channel["started_at"] = moment
+        else:
+            channel["finished_at"] = moment
+            channel["status"] = "success" if state == "完成" else "failed"
+    line_pattern = re.compile(r"^\[(\S+)\]\[构建:([^\]]+)\]\s?(.*)$")
+    for raw_line in section.splitlines():
+        match = line_pattern.match(raw_line.strip())
+        if not match:
+            continue
+        raw_time, key, message = match.groups()
+        channel = channels.setdefault(key, {"key": key, "label": key, "lines": [], "started_at": None, "finished_at": None, "status": "running"})
+        channel["lines"].append(raw_line)
+        if channel["started_at"] is None:
+            try:
+                channel["started_at"] = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+    build_terminal_match = re.search(
+        r"(?m)^\[阶段时间\]\s+build\s+(完成|失败|停止)\s+(\S+)\s*$",
+        section,
+    )
+    build_terminal_state = build_terminal_match.group(1) if build_terminal_match else None
+    result = []
+    latest_stream_end: datetime | None = None
+    for channel in channels.values():
+        started, finished = channel.pop("started_at"), channel.pop("finished_at")
+        if finished and (latest_stream_end is None or finished > latest_stream_end):
+            latest_stream_end = finished
+        effective_end = finished or datetime.now(timezone.utc)
+        duration = max(0, (effective_end - started).total_seconds()) if started else None
+        if not finished and build_terminal_state:
+            channel["status"] = {
+                "完成": "success", "失败": "failed", "停止": "stopped",
+            }[build_terminal_state]
+        channel["duration_seconds"] = round(duration, 1) if duration is not None else None
+        channel["log"] = compact_stage_log("\n".join(channel.pop("lines")))[-30_000:]
+        result.append(channel)
+    # Frontend/backend compilation can run concurrently, then the platform
+    # still needs to package the final runtime images.  Expose that wall-clock
+    # interval as its own stream; otherwise the stage total legitimately
+    # exceeds both service timers and looks like a calculation error.
+    package_markers = (
+        "[并发构建] 前端 Web 与后端 API 依赖构建已汇合，开始封装运行镜像。",
+        "[镜像封装]",
+        "镜像封装完成",
+        "[即时封装]",
+    )
+    package_positions = [section.find(marker) for marker in package_markers if section.find(marker) >= 0]
+    package_pos = min(package_positions) if package_positions else -1
+    # A real package channel is emitted by immediate packaging. Do not append
+    # a second synthetic package tab (which previously duplicated the timer).
+    has_package_channel = any(item.get("key") == "package" for item in result)
+    if package_pos >= 0 and not has_package_channel:
+        stage_end_match = re.search(
+            r"(?m)^\[阶段时间\]\s+build\s+(?:完成|失败|停止)\s+(\S+)\s*$",
+            section,
+        )
+        stage_end = None
+        if stage_end_match:
+            try:
+                stage_end = datetime.fromisoformat(stage_end_match.group(1).replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        effective_end = stage_end or datetime.now(timezone.utc)
+        package_log = section[package_pos:]
+        package_log = re.sub(r"(?m)^\[阶段(?:时间|开始|完成|失败|停止)\].*$", "", package_log)
+        package_log = re.sub(r"(?m)^\[构建通道\].*$", "", package_log)
+        result.append({
+            "key": "package",
+            "label": "镜像封装",
+            "status": "success" if stage_end_match and "完成" in stage_end_match.group(0) else ("failed" if stage_end_match else "running"),
+            "duration_seconds": round(max(0, (effective_end - (latest_stream_end or effective_end)).total_seconds()), 1),
+            "log": compact_stage_log(package_log)[-30_000:],
+        })
+    order = {"web": 0, "api": 1, "package": 2, "distribute": 3}
+    return sorted(result, key=lambda item: (order.get(item["key"], 99), item["label"]))
+
+
 def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None = None, is_compose: bool = False) -> list[dict]:
     # Keep the user-facing pipeline compact. Detailed AI/preflight activity is
     # retained in the log for the active major stage.
@@ -3482,6 +4116,40 @@ def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None
         ("start", "启动服务", ("启动",)),
         ("verify", "验证访问", ("检查", "完成")),
     ]
+    skipped_stages = set()
+    if re.search(r"(?m)^\[平台构建\].*(?:没有\s+build|固定镜像).*已跳过", log_text):
+        skipped_stages.add("build")
+    stage_times: dict[str, dict[str, datetime]] = {}
+    for match in re.finditer(
+        r"(?m)^\[阶段时间\]\s+(analyze|prepare|build|start|verify)\s+"
+        r"(开始|完成|失败|停止)\s+(\S+)\s*$",
+        log_text,
+    ):
+        try:
+            moment = datetime.fromisoformat(match.group(3).replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        bucket = stage_times.setdefault(match.group(1), {})
+        if match.group(2) == "开始":
+            bucket["start"] = moment
+        else:
+            bucket["end"] = moment
+
+    def timing_for(key: str) -> dict:
+        timing = stage_times.get(key) or {}
+        started = timing.get("start")
+        finished = timing.get("end")
+        if not started:
+            return {"started_at": None, "finished_at": None, "duration_seconds": None}
+        effective_end = finished or (datetime.now(timezone.utc) if status == DeployStatus.running else None)
+        duration = max(0, (effective_end - started).total_seconds()) if effective_end else None
+        return {
+            "started_at": started.isoformat(),
+            "finished_at": finished.isoformat() if finished else None,
+            "duration_seconds": round(duration, 1) if duration is not None else None,
+        }
     # New deployments emit explicit stage boundaries. Prefer them over
     # guessing from ordinary human-readable log messages.
     if "[阶段开始]" in log_text:
@@ -3498,24 +4166,60 @@ def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None
             r"(?m)^\[阶段停止\]\s+(analyze|prepare|build|start|verify)\s*$", log_text
         )}
         active_key = max(starts, key=starts.get) if starts else "analyze"
+        stage_order = {key: index for index, (key, _title, _tags) in enumerate(definitions)}
+        active_index = stage_order.get(active_key, 0)
         failure_key = next((key for key, _title, _tags in definitions if key in failed), None)
         default_key = failure_key or active_key
         valid_keys = {item[0] for item in definitions}
-        log_key = selected_key if selected_key in valid_keys and selected_key in starts else default_key
+        # Keep the stage the user clicked even when an older/retried worker
+        # emitted explicit boundaries for only the tail of the deployment.
+        # The per-stage legacy markers below can still provide that log.  The
+        # previous `selected_key in starts` guard silently switched the API to
+        # the latest stage while the UI continued to display the clicked card,
+        # producing an empty panel with "等待该步骤开始...".
+        log_key = selected_key if selected_key in valid_keys else default_key
         ordered_starts = sorted((position, key) for key, position in starts.items())
+        # Some releases were completed by a worker that only emitted explicit
+        # boundaries for part of the pipeline.  The detailed, human-readable
+        # markers are still present (for example [启动] and [检查]).  Use those
+        # markers as a per-stage fallback so a successful card never opens an
+        # empty log panel merely because one boundary marker is missing.
+        legacy_positions = {}
+        for legacy_key, _legacy_title, legacy_tags in definitions:
+            legacy_positions[legacy_key] = max(
+                (log_text.rfind(f"[{tag}]") for tag in legacy_tags),
+                default=-1,
+            )
         result = []
         for key, title, _tags in definitions:
+            stream_rows = []
             start = starts.get(key)
             if start is None:
                 # A successful deployment is authoritative even when an
                 # older worker did not emit the final explicit stage marker.
                 # Leaving the last card at "waiting" after progress reached
                 # 100% makes a healthy release look unfinished.
-                stage_status = "success" if status == DeployStatus.success else "waiting"
-                section = ""
+                # Retried/resumed workers may only emit explicit boundaries
+                # for the tail of a deployment.  Once a later stage has
+                # started, every earlier stage is necessarily complete even
+                # if its boundary was written by an older worker version.
+                stage_status = (
+                    "success"
+                    if status == DeployStatus.success or stage_order[key] < active_index
+                    else "waiting"
+                )
+                legacy_start = legacy_positions.get(key, -1)
+                later_legacy = [
+                    position for candidate, position in legacy_positions.items()
+                    if candidate != key and position > legacy_start
+                ] if legacy_start >= 0 else []
+                legacy_end = min(later_legacy) if later_legacy else len(log_text)
+                section = log_text[legacy_start:legacy_end].strip() if key == log_key and legacy_start >= 0 else ""
+                if key == log_key and not section and status == DeployStatus.success:
+                    section = log_text.strip()
             else:
                 end = next((position for position, _next_key in ordered_starts if position > start), len(log_text))
-                section = log_text[start:end].strip()[-30_000:] if key == log_key else ""
+                section = log_text[start:end].strip() if key == log_key else ""
                 if key in failed:
                     stage_status = "failed"
                 elif key in stopped:
@@ -3530,7 +4234,12 @@ def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None
                     stage_status = "stopped"
                 else:
                     stage_status = "waiting"
-            result.append({"key": key, "title": title, "status": stage_status, "log": section})
+            if section:
+                if key == "build":
+                    stream_rows = build_log_streams(section)
+                section = re.sub(r"(?m)^\[AI跟进\].*$", "", section).rstrip()
+                section = compact_stage_log(section)[-30_000:]
+            result.append({"key": key, "title": title, "status": stage_status, "skipped": key in skipped_stages, "log": section, "build_streams": stream_rows, **timing_for(key)})
         return result
     positions = []
     for key, title, tags in definitions:
@@ -3564,15 +4273,19 @@ def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None
         log_key = selected_key if selected_key in {x[0] for x in definitions} else default_key
     result = []
     for index, (key, title, _tags) in enumerate(definitions):
+        stream_rows = []
         start = positions[index]
         later = [x for x in positions[index + 1:] if x >= 0]
         end = min(later) if later else len(log_text)
-        section = log_text[start:end].strip()[-30_000:] if start >= 0 and key == log_key else ""
+        section = log_text[start:end].strip() if start >= 0 and key == log_key else ""
         if status == DeployStatus.failed and index == active_index and key == log_key and not section:
-            section = log_text.strip()[-30_000:]
+            section = log_text.strip()
         # AI follow-up records are metadata, not build output. Keep raw stage
         # logs clean even for records created by older platform versions.
+        if key == "build" and section:
+            stream_rows = build_log_streams(section)
         section = re.sub(r"(?m)^\[AI跟进\].*$", "", section).rstrip()
+        section = compact_stage_log(section)[-30_000:]
         # Long dependency output can push the useful cache result outside the
         # active 30k window, especially while a build waits for the serialized
         # image-store lock. Keep a compact, evidence-based summary visible so
@@ -3586,11 +4299,19 @@ def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None
         if status == DeployStatus.success:
             stage_status = "success"
             if key == log_key and start < 0:
-                section = log_text[-30_000:]
+                section = compact_stage_log(log_text)[-30_000:]
         elif inferred_index is not None and not available:
             stage_status = "success" if index < inferred_index else (("stopped" if status == DeployStatus.stopped else "running") if index == inferred_index else "waiting")
             if index == inferred_index and key == log_key:
-                section = log_text[-30_000:]
+                section = compact_stage_log(log_text)[-30_000:]
+        elif status == DeployStatus.failed and index == active_index:
+            # Legacy workers and failures during task initialization may not
+            # have emitted a normal stage marker.  The deployment status is
+            # still authoritative: show the first/last inferred stage as
+            # failed instead of rendering all five stages as "waiting".
+            stage_status = "failed"
+            if key == log_key and not section:
+                section = compact_stage_log(log_text)[-30_000:]
         elif start < 0:
             stage_status = "waiting"
         elif active_index is not None and index < active_index:
@@ -3605,22 +4326,116 @@ def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None
             stage_status = "success"
         else:
             stage_status = "running"
-        result.append({"key": key, "title": title, "status": stage_status, "log": section})
+        result.append({"key": key, "title": title, "status": stage_status, "skipped": key in skipped_stages, "log": section, "build_streams": stream_rows, **timing_for(key)})
     return result
 
 
-def deployment_view(item: Deployment, db: Session, include_log: bool = True, stage: str | None = None) -> dict:
+def deployment_view(
+    item: Deployment, db: Session, include_log: bool = True, stage: str | None = None,
+    port_reservations: list[DeploymentPortReservation] | None = None,
+) -> dict:
     data = DeploymentOut.model_validate(item).model_dump()
     project, node = db.get(Project, item.project_id), db.get(Node, item.node_id)
-    log_text = item.log_text or ""
+    database_log_text = item.log_text or ""
+    log_text = database_log_text
+    # The database value is deliberately a compact live window and can lose a
+    # tail fragment when background diagnostics finish at the same time as the
+    # deployment transaction.  The append-only file is the authoritative,
+    # ordered source for detail pages and includes every stage boundary.
+    if include_log:
+        full_log_path = Path(settings.upload_root) / "deployment-logs" / f"{item.id}.log"
+        try:
+            if full_log_path.is_file():
+                full_log_text = full_log_path.read_text(encoding="utf-8", errors="replace")
+                if full_log_text:
+                    log_text = full_log_text
+        except OSError:
+            # A transient file read failure must not make deployment details
+            # unavailable; the retained database window remains usable.
+            pass
     if item.status == DeployStatus.failed and item.error and item.error not in log_text:
         log_text = (log_text + "\n[失败] " + item.error).strip()
+    # Rollback used to exist only as free-form log lines.  That made a release
+    # which was activated by rollback indistinguishable from an ordinary
+    # running release in collection views.  Expose the latest version switch
+    # as structured metadata so both the history list and detail view can show
+    # where the running version came from without loading the full log.
+    # Runtime operations (start/stop/rollback) are appended to the database
+    # window after the immutable pipeline log file has been written, so use
+    # both sources when extracting lifecycle metadata for detail responses.
+    lifecycle_log_text = database_log_text if log_text == database_log_text else f"{log_text}\n{database_log_text}"
+    rollback_events: list[tuple[int, dict]] = []
+    rollback_starts = list(re.finditer(
+        r"\[回滚开始\]\s*正在从版本\s+([^\s，,。]+)\s+切换到\s+([^\s，,。]+)",
+        lifecycle_log_text,
+    ))
+    if rollback_starts:
+        rollback_start = rollback_starts[-1]
+        rollback_complete_at = lifecycle_log_text.find("[回滚完成]", rollback_start.end())
+        if rollback_complete_at >= 0:
+            rollback_events.append((rollback_complete_at, {
+                "kind": "rollback_target",
+                "from_release": rollback_start.group(1),
+                "to_release": rollback_start.group(2),
+            }))
+    rollback_sources = list(re.finditer(
+        r"\[版本切换\]\s*已回滚至版本\s+([^。\r\n]+)",
+        lifecycle_log_text,
+    ))
+    if rollback_sources:
+        rollback_source = rollback_sources[-1]
+        rollback_events.append((rollback_source.start(), {
+            "kind": "rollback_source",
+            "from_release": item.release,
+            "to_release": rollback_source.group(1).strip(),
+        }))
+    rollback_transition = max(rollback_events, key=lambda event: event[0])[1] if rollback_events else None
+    # Auto-repair metadata is assembled before the progress parser below.
+    # A freshly running repair may not have emitted a stage marker yet, so it
+    # still needs a valid status label instead of raising UnboundLocalError.
+    current_step = "修复任务正在执行"
+    auto_repair = None
+    if include_log and (str(item.trigger or "").startswith("ai_autofix_") or "[修复问题]" in lifecycle_log_text):
+        def latest_marker(name: str) -> str:
+            matches = re.findall(rf"(?m)^\[{re.escape(name)}\]\s*(.+?)\s*$", lifecycle_log_text)
+            return matches[-1].strip() if matches else ""
+
+        problem = latest_marker("修复问题")
+        source_match = re.search(r"\[AI自动修复\].*?任务\s+([0-9a-f]{8})", lifecycle_log_text)
+        change_rows = [row.strip() for row in re.findall(
+            r"(?m)^\[(?:修复变更|识别|配置预检)\]\s*(.+?)\s*$",
+            lifecycle_log_text,
+        ) if any(word in row for word in ("修复", "调整", "修改", "变化"))]
+        if "[AI自动修复] 构建前变化校验通过：" in lifecycle_log_text:
+            verified = re.findall(r"(?m)^\[AI自动修复\]\s*构建前变化校验通过：(.+?)\s*$", lifecycle_log_text)
+            if verified:
+                change_rows.insert(0, verified[-1].strip())
+        change_rows = list(dict.fromkeys(change_rows))[-8:]
+        if item.status == DeployStatus.success:
+            verification = "修复后的版本已完成构建、启动和访问验证"
+        elif item.status == DeployStatus.failed:
+            verification = "修复后仍未通过验证，平台已保留新的失败证据"
+        elif item.status == DeployStatus.running:
+            verification = current_step
+        elif item.status == DeployStatus.queued:
+            verification = "修复任务已创建，正在等待执行"
+        else:
+            verification = "修复验证已停止"
+        auto_repair = {
+            "active": True,
+            "attempt": int(str(item.trigger).rsplit("_", 1)[-1]) if str(item.trigger).rsplit("_", 1)[-1].isdigit() else None,
+            "source_deployment": source_match.group(1) if source_match else None,
+            "problem": problem or "平台正在从上一轮失败日志中提取具体问题",
+            "changes": change_rows,
+            "verification": verification,
+            "has_verified_change": bool(change_rows),
+        }
     stage_definitions = [
         (("方案",), 10, "正在读取方案"),
-        (("准备", "源码", "依赖分析", "架构分析", "识别", "上传", "镜像"), 40, "正在准备运行环境"),
-        (("构建", "平台构建", "AI构建"), 65, "正在构建应用"),
-        (("启动",), 82, "正在启动服务"),
-        (("检查", "完成"), 95, "正在验证访问"),
+        (("准备", "源码", "依赖分析", "架构分析", "识别", "上传", "镜像"), 25, "正在准备运行环境"),
+        (("构建", "平台构建", "AI构建"), 45, "正在构建应用"),
+        (("启动",), 75, "正在启动服务"),
+        (("检查", "完成"), 92, "正在验证访问"),
     ]
     if item.status == DeployStatus.queued:
         ahead = db.scalar(select(func.count()).select_from(Deployment).where(Deployment.status.in_([DeployStatus.queued, DeployStatus.running]), Deployment.created_at < item.created_at)) or 0
@@ -3645,10 +4460,82 @@ def deployment_view(item: Deployment, db: Session, include_log: bool = True, sta
         if latest_stage:
             _, progress, current_step = latest_stage
         lower = log_text.lower()
-        if progress == 10 and any(word in lower for word in ("load build definition", "building", "docker:default", "transferring context")):
-            progress, current_step = 70, "正在构建镜像并安装依赖"
+        queue_position = log_text.rfind("[构建队列]")
+        package_position = max(
+            log_text.rfind("[镜像封装]"),
+            log_text.rfind("[平台构建]"),
+        )
+        build_stage_position = log_text.rfind("[阶段开始] build")
+        later_stage_position = max(
+            log_text.rfind("[阶段开始] start"),
+            log_text.rfind("[阶段开始] verify"),
+        )
+        packaging_is_active = build_stage_position > later_stage_position
+        # Explicit pipeline boundaries are more reliable than incidental
+        # Chinese/Docker log words.  Use them first so a real build never sits
+        # at 10% until the first image-packaging message appears.
+        analyze_started = log_text.rfind("[阶段开始] analyze")
+        prepare_started = log_text.rfind("[阶段开始] prepare")
+        verify_started = log_text.rfind("[阶段开始] verify")
+        if verify_started >= 0:
+            progress, current_step = 90, "正在验证访问"
+        elif later_stage_position >= 0:
+            progress, current_step = 75, "正在启动服务"
+        elif build_stage_position >= 0:
+            channel_started = set(re.findall(
+                r"(?m)^\[构建通道\]\s+([^|\s]+)\|[^|]+\|开始\|", log_text
+            ))
+            channel_done = set(re.findall(
+                r"(?m)^\[构建通道\]\s+([^|\s]+)\|[^|]+\|(?:完成|失败)\|", log_text
+            ))
+            if channel_started:
+                progress = 35 + round(20 * len(channel_done) / len(channel_started))
+            else:
+                progress = 35
+            current_step = "正在并发构建应用"
+        elif prepare_started >= 0:
+            progress, current_step = 22, "正在准备运行环境"
+        elif analyze_started >= 0:
+            progress, current_step = 10, "正在读取并校验方案"
+        # Older workers and a few recovery paths do not emit an explicit
+        # ``[阶段开始] build`` boundary.  Derive the same monotonic progress
+        # from real compiler/package completion events instead of leaving the
+        # deployment card at 25% for several minutes.
+        compiler_started = any(marker in log_text for marker in (
+            "[并发构建]", "[平台构建]", "[构建通道]", "[即时封装]",
+        ))
+        compiler_done = {
+            role for role, marker in (
+                ("api", "Maven 已使用公共缓存"),
+                ("api", "后端产物已由并发 Maven 构建生成"),
+                ("web", "Node 已使用默认公共缓存生成运行产物"),
+                ("web", "前端产物已生成"),
+            ) if marker in log_text
+        }
+        eager_started = set(re.findall(r"\[即时封装\]\s+([^\s]+)\s+构建产物已就绪", log_text))
+        eager_done = set(re.findall(r"\[即时封装\]\s+([^\s]+)\s+运行镜像已完成", log_text))
+        if later_stage_position < 0 and compiler_started:
+            progress = max(progress, 32 + 9 * len(compiler_done))
+            current_step = "正在并发构建应用"
+            if eager_started:
+                progress = max(progress, 52 + 8 * len(eager_done))
+                current_step = "正在封装运行镜像"
+        if packaging_is_active and queue_position > package_position:
+            progress, current_step = 55, "依赖编译完成，排队封装镜像"
+        elif packaging_is_active and package_position >= 0:
+            package_matches = re.findall(r"\[镜像封装\]\s*服务\s+(\d+)/(\d+)", log_text)
+            if package_matches:
+                package_index, package_total = map(int, package_matches[-1])
+                progress = 58 + round(12 * max(0, package_index - 1) / max(1, package_total))
+            else:
+                progress = 58
+            current_step = "正在封装运行镜像"
+        elif log_text.rfind("[数据服务检查]") > log_text.rfind("[启动] 使用平台构建镜像"):
+            progress, current_step = 72, "正在检查数据服务"
+        elif progress == 10 and any(word in lower for word in ("load build definition", "building", "docker:default", "transferring context")):
+            progress, current_step = 45, "正在构建镜像并安装依赖"
         elif progress == 10 and any(word in lower for word in ("pulling", "pull complete", "downloading")):
-            progress, current_step = 52, "正在拉取项目所需镜像"
+            progress, current_step = 30, "正在拉取项目所需镜像"
     # Collection views only need the assigned ports. Rebuilding the complete
     # deployment plan for every row caused an N+1 query/CPU spike and returned
     # 100+ KB every few seconds on the project and history pages.
@@ -3676,6 +4563,13 @@ def deployment_view(item: Deployment, db: Session, include_log: bool = True, sta
         ProjectReplica.deployment_id == item.id,
         ProjectReplica.status == "running",
     ).order_by(ProjectReplica.created_at)).all() if include_log else []
+    if port_reservations is None:
+        port_reservations = db.scalars(select(DeploymentPortReservation).where(
+            DeploymentPortReservation.deployment_id == item.id,
+            DeploymentPortReservation.status.in_(["reserved", "active"]),
+        ).order_by(DeploymentPortReservation.created_at)).all()
+    service_ports = [{"service": row.service_name, "port": row.host_port, "status": row.status}
+                     for row in port_reservations if row.service_name != "__gateway__"]
     internal_instances = []
     if node and item.host_port:
         internal_instances.append({
@@ -3699,15 +4593,18 @@ def deployment_view(item: Deployment, db: Session, include_log: bool = True, sta
         "image_items": [{"name": name, "status": state} for name, state in image_states.items()],
         "node_access_url": (f"http://{node.host}:{item.host_port}" if node and item.host_port else None),
         "internal_instances": internal_instances,
+        "service_ports": service_ports,
         "ready_replicas": len(internal_instances) if item.status == DeployStatus.success else 0,
         "platform_access_url": item.access_url,
         "login_info": login_info,
+        "rollback_transition": rollback_transition,
+        "auto_repair": auto_repair,
         "rollback_allowed": bool(
             item.status == DeployStatus.stopped
             and item.release
             and item.access_url
             and item.host_port
-            and any(marker in log_text for marker in ("[完成] 部署成功", "[启用确认]", "[回滚完成]"))
+            and any(marker in lifecycle_log_text for marker in ("[完成] 部署成功", "[启用确认]", "[回滚完成]"))
         ),
     })
     data["log_text"] = ""
@@ -3715,11 +4612,25 @@ def deployment_view(item: Deployment, db: Session, include_log: bool = True, sta
 
 
 @app.get("/api/deployments")
-def list_deployments(project_id: str | None = None, db: Session = Depends(get_db), _: User = Depends(current_user)):
+def list_deployments(project_id: str | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
     query = select(Deployment).order_by(desc(Deployment.created_at))
+    if user.role != Role.admin:
+        query = query.where(Deployment.project_id.in_(select(Project.id).where(Project.owner_id == user.id)))
     if project_id:
         query = query.where(Deployment.project_id == project_id)
-    return [deployment_view(x, db, include_log=False) for x in db.scalars(query.limit(100)).all()]
+    deployments = db.scalars(query.limit(100)).all()
+    ids = [item.id for item in deployments]
+    reservations: dict[str, list[DeploymentPortReservation]] = {}
+    if ids:
+        for row in db.scalars(select(DeploymentPortReservation).where(
+            DeploymentPortReservation.deployment_id.in_(ids),
+            DeploymentPortReservation.status.in_(["reserved", "active"]),
+        ).order_by(DeploymentPortReservation.created_at)).all():
+            reservations.setdefault(row.deployment_id, []).append(row)
+    return [deployment_view(
+        item, db, include_log=False,
+        port_reservations=reservations.get(item.id, []),
+    ) for item in deployments]
 
 
 @app.get("/api/deployments/{item_id}")
@@ -3769,11 +4680,6 @@ def deployment_gateway_config(item_id: str, db: Session = Depends(get_db), _: Us
         configured = code == 0
         if not configured:
             config = ""
-        _, firewall = ssh.run(
-            "policy=$(iptables -S INPUT 2>/dev/null | head -1); "
-            "if printf %s \"$policy\" | grep -q -- '-P INPUT ACCEPT'; then printf unrestricted; else printf managed; fi",
-            timeout=20,
-        )
         _, gateway_status = ssh.run("docker inspect -f '{{.State.Status}}' yunzhou-platform-gateway 2>/dev/null || printf missing", timeout=20)
     upstreams = re.findall(r"(?m)^\s*server\s+([^;\s]+)\s+max_fails=", config) if configured else []
     if not upstreams and configured:
@@ -3788,7 +4694,6 @@ def deployment_gateway_config(item_id: str, db: Session = Depends(get_db), _: Us
         "config_path": filename if configured else None,
         "container": "yunzhou-platform-gateway",
         "container_status": gateway_status.strip(),
-        "firewall_status": firewall.strip(),
         "upstream": "、".join(f"http://{value}" for value in upstreams) or f"http://{target.host}:{item.host_port}",
         "upstreams": upstreams,
         "replica_count": len(upstreams) if upstreams else 1,
@@ -3813,12 +4718,49 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
         raise HTTPException(404, "该发布尚未生成运行配置")
     release_dir = f"{node.work_dir.rstrip('/')}/{project_directory(project)}/{item.release}"
     legacy_dir = f"{node.work_dir.rstrip('/')}/{project.slug}/{item.release}"
-    candidates = (".yunzhou.ai.compose.yml", ".yunzhou.compose.yml", "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml", ".yunzhou.ai.Dockerfile", ".yunzhou.Dockerfile", "Dockerfile")
+    candidates = (".yunzhou.app.yml", ".yunzhou.ai.compose.yml", ".yunzhou.compose.yml", "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml", ".yunzhou.ai.Dockerfile", ".yunzhou.Dockerfile", "Dockerfile")
     with SSHNode(node) as ssh:
         _, resolved = ssh.run(f"if [ -d {shlex.quote(release_dir)} ]; then printf %s {shlex.quote(release_dir)}; elif [ -d {shlex.quote(legacy_dir)} ]; then printf %s {shlex.quote(legacy_dir)}; fi")
         actual_dir = resolved.strip()
         if not actual_dir:
-            raise HTTPException(404, "原发布目录已不存在")
+            snapshot_root = Path(settings.upload_root) / "deployment-files" / item.id
+            manifest_file = snapshot_root / "manifest.json"
+            if not manifest_file.is_file():
+                raise HTTPException(404, "本次发布尚未生成可查看的发布文件")
+            try:
+                manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise HTTPException(502, "发布文件快照读取失败") from exc
+            snapshot_files = []
+            for record in manifest.get("files") or []:
+                relative = str(record.get("path") or "").replace("\\", "/").lstrip("/")
+                candidate = (snapshot_root / relative).resolve()
+                try:
+                    candidate.relative_to(snapshot_root.resolve())
+                except ValueError:
+                    continue
+                if not candidate.is_file():
+                    continue
+                lowered = relative.lower()
+                snapshot_files.append({
+                    "path": relative,
+                    "type": "environment" if Path(relative).name == ".env" else ("compose" if lowered.endswith((".yml", ".yaml")) else ("nginx" if lowered.endswith(".conf") else "dockerfile")),
+                    "content": candidate.read_text(encoding="utf-8", errors="replace")[:300_000],
+                    "sha256": record.get("sha256"),
+                    "used": bool(record.get("used")),
+                })
+            build_file = str(manifest.get("build_file") or "")
+            selected_file = next((file for file in snapshot_files if file["used"]), snapshot_files[0] if snapshot_files else None)
+            is_compose_snapshot = build_file.lower().endswith((".yml", ".yaml"))
+            return {
+                "type": "compose" if is_compose_snapshot else "dockerfile",
+                "file": build_file or (selected_file["path"] if selected_file else "尚未确定"),
+                "content": selected_file["content"] if selected_file else "",
+                "command": "构建完成后由平台生成最终启动命令",
+                "environment": next((file["content"] for file in snapshot_files if file["type"] == "environment"), ""),
+                "release_dir": "平台保存的发布文件快照（原失败目录已清理）",
+                "files": snapshot_files,
+            }
         checks = " ".join(shlex.quote(name) for name in candidates)
         _, selected = ssh.run(f"cd {shlex.quote(actual_dir)} && for f in {checks}; do [ -f \"$f\" ] && printf %s \"$f\" && break; done")
         config_file = selected.strip()
@@ -3828,6 +4770,13 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
         if code:
             raise HTTPException(502, "读取运行配置失败")
         _, env_output = ssh.run(f"cd {shlex.quote(actual_dir)} && test -f .env && head -c 100000 .env || true")
+        _, file_listing = ssh.run(
+            f"find {shlex.quote(actual_dir)} -maxdepth 6 -type f -size -300k "
+            "\\( -name 'Dockerfile*' -o -name '*.Dockerfile' -o -name 'compose.yml' -o -name 'compose.yaml' "
+            "-o -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name '.yunzhou*.yml' "
+            "-o -name '.env' -o -name 'nginx.conf' -o -name 'default.conf' \\) -print | head -n 40",
+            timeout=30,
+        )
     secret_words = ("password", "secret", "token", "key", "credential")
     # The generated Compose file is useful for diagnostics, but it may contain
     # literal credentials as either YAML values or KEY=VALUE environment items.
@@ -3847,13 +4796,77 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
             continue
         key, value = line.split("=", 1)
         env_lines.append(f"{key}={'******' if any(word in key.lower() for word in secret_words) else value}")
+    listed_relatives = {
+        remote_path[len(actual_dir.rstrip("/")) + 1:]
+        for remote_path in (line.strip() for line in file_listing.splitlines() if line.strip())
+        if remote_path.startswith(actual_dir.rstrip("/") + "/")
+    }
+    used_files = {config_file, ".env"}
+    if ".yunzhou.app.yml" in listed_relatives:
+        used_files.add(".yunzhou.app.yml")
+        used_files.update(name for name in (".yunzhou.app-images.yml", ".yunzhou.external-access.yml") if name in listed_relatives)
+    else:
+        used_files.update(name for name in (".yunzhou.images.yml", ".yunzhou.external-access.yml") if name in listed_relatives)
+    files = []
+    sftp = None
+    try:
+        with SSHNode(node) as file_ssh:
+            sftp = file_ssh.client.open_sftp()
+            for remote_path in dict.fromkeys(line.strip() for line in file_listing.splitlines() if line.strip()):
+                if not remote_path.startswith(actual_dir.rstrip("/") + "/"):
+                    continue
+                relative = remote_path[len(actual_dir.rstrip("/")) + 1:]
+                try:
+                    raw = sftp.open(remote_path, "rb").read(300_000)
+                except Exception:
+                    continue
+                text_value = raw.decode("utf-8", "replace")
+                if Path(relative).name == ".env":
+                    safe_lines = []
+                    for line in text_value.splitlines():
+                        if "=" not in line or line.lstrip().startswith("#"):
+                            safe_lines.append(line)
+                            continue
+                        key, value = line.split("=", 1)
+                        safe_lines.append(f"{key}={'******' if any(word in key.lower() for word in secret_words) else value}")
+                    text_value = "\n".join(safe_lines)
+                else:
+                    safe_lines = []
+                    for line in text_value.splitlines():
+                        match = yaml_secret.match(line)
+                        env_match = re.match(
+                            r"^(\s*(?:ENV|ARG)\s+[A-Za-z_][A-Za-z0-9_.-]*(?:PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL)[A-Za-z0-9_.-]*[=\s]+)(.*)$",
+                            line,
+                            re.I,
+                        )
+                        safe_lines.append(f"{match.group(1)}******" if match else (f"{env_match.group(1)}******" if env_match else line))
+                    text_value = "\n".join(safe_lines)
+                lowered = relative.lower()
+                file_type = "environment" if Path(relative).name == ".env" else (
+                    "compose" if lowered.endswith((".yml", ".yaml")) else (
+                        "nginx" if lowered.endswith(".conf") else "dockerfile"
+                    )
+                )
+                files.append({
+                    "path": relative,
+                    "type": file_type,
+                    "content": text_value,
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "used": relative in used_files,
+                })
+    finally:
+        if sftp:
+            sftp.close()
     is_compose = config_file.lower().endswith((".yml", ".yaml"))
+    compose_runtime_files = [name for name in (".yunzhou.app.yml", ".yunzhou.app-images.yml", ".yunzhou.external-access.yml") if name in used_files]
+    if not compose_runtime_files and is_compose:
+        compose_runtime_files = [name for name in (config_file, ".yunzhou.images.yml", ".yunzhou.external-access.yml") if name in used_files]
     command = (
-        f"docker compose -p yz-{project.slug} -f {config_file} up -d --no-build --remove-orphans"
+        f"docker compose -p yz-{project.slug} " + " ".join(f"-f {name}" for name in compose_runtime_files) + " up -d --no-build --remove-orphans"
         if is_compose else
         f"docker run -d --name {item.container_name or '应用容器'} -p {item.host_port}:<容器端口> {item.image_name or '应用镜像'}"
     )
-    return {"type": "compose" if is_compose else "dockerfile", "file": config_file, "content": content, "command": command, "environment": "\n".join(env_lines), "release_dir": actual_dir}
+    return {"type": "compose" if is_compose else "dockerfile", "file": config_file, "content": content, "command": command, "environment": "\n".join(env_lines), "release_dir": actual_dir, "files": files}
 
 
 def _docker_size_bytes(value: str) -> float:
@@ -3877,19 +4890,39 @@ def _runtime_snapshot_uncached(item: Deployment, db: Session) -> dict:
     if not project or not node:
         raise HTTPException(404, "项目或节点不存在")
     release_dir = f"{node.work_dir.rstrip('/')}/{project_directory(project)}/{item.release}" if item.release else ""
-    # A compose project name is intentionally stable across releases.  Looking up
-    # containers by that name for an old deployment would therefore attach the
-    # *current* release to a historical/failed record.  Only the active deployment
-    # may expose live containers and container operations.
+    compose_project = deployment_compose_project_name(item, project)
+    runtime_policy = db.get(DeploymentSettings, "default")
+    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
+    data_compose_project = f"{safe_namespace}-{project.slug}-data"
+    # Historical records never attach to the current runtime. New releases also
+    # have a distinct Compose project name, which makes this ownership explicit.
     latest_success = db.scalar(select(Deployment).where(
         Deployment.project_id == item.project_id,
+        Deployment.node_id == item.node_id,
         Deployment.status == DeployStatus.success,
+    ).order_by(desc(Deployment.created_at)).limit(1))
+    latest_runtime_record = db.scalar(select(Deployment).where(
+        Deployment.project_id == item.project_id,
+        Deployment.node_id == item.node_id,
+        Deployment.status.in_([DeployStatus.success, DeployStatus.stopped]),
+        Deployment.release.is_not(None),
+        Deployment.access_url.is_not(None),
     ).order_by(desc(Deployment.created_at)).limit(1))
     owns_live_runtime = (
         item.status == DeployStatus.running
         or (item.status == DeployStatus.success and latest_success is not None and latest_success.id == item.id)
     )
-    if not owns_live_runtime:
+    # When the application is stopped, the latest verified release remains the
+    # anchor for project-shared MySQL/Redis inspection. Failed candidates must
+    # not hide those still-running data containers from the project runtime.
+    owns_project_data_runtime = owns_live_runtime or (
+        item.status == DeployStatus.stopped
+        and latest_success is None
+        and latest_runtime_record is not None
+        and latest_runtime_record.id == item.id
+    )
+    if not owns_project_data_runtime:
         return {
             "deployment_id": item.id,
             "project": {"id": project.id, "name": project.name, "slug": project.slug, "build_type": project.build_type},
@@ -3935,13 +4968,13 @@ def _runtime_snapshot_uncached(item: Deployment, db: Session) -> dict:
         elif item.image_name:
             code, output = direct_code, direct_output
         else:
-            cmd = f"cd {shlex.quote(release_dir)} && docker compose -p {shlex.quote('yz-' + project.slug)} ps --all --format json" if release_dir else "false"
+            cmd = f"cd {shlex.quote(release_dir)} && docker compose -p {shlex.quote(compose_project)} ps --all --format json" if release_dir else "false"
             code, output = ssh.run(cmd)
             if code != 0:
                 code, output = ssh.run(
-                    f"docker ps -a --filter label=com.docker.compose.project={shlex.quote('yz-' + project.slug)} --format '{{{{json .}}}}'"
+                    f"docker ps -a --filter label=com.docker.compose.project={shlex.quote(compose_project)} --format '{{{{json .}}}}'"
                 )
-            config_cmd = f"cd {shlex.quote(release_dir)} && docker compose -p {shlex.quote('yz-' + project.slug)} config --format json" if release_dir else "false"
+            config_cmd = f"cd {shlex.quote(release_dir)} && docker compose -p {shlex.quote(compose_project)} config --format json" if release_dir else "false"
             cfg_code, cfg_output = ssh.run(config_cmd)
             if cfg_code == 0:
                 try:
@@ -3971,6 +5004,33 @@ def _runtime_snapshot_uncached(item: Deployment, db: Session) -> dict:
                     "state": row.get("State") or row.get("Status") or "unknown",
                     "status": row.get("Status") or row.get("State") or "unknown",
                     "ports": row.get("Ports") or row.get("Publishers") or "",
+                })
+        # Stateful dependencies live in a stable Compose project so upgrades
+        # can replace the application without recreating its database volumes.
+        # Include those containers in the same runtime snapshot; the frontend
+        # presents them separately under Data Resources.
+        data_code, data_output = ssh.run(
+            f"docker ps -a --filter label=com.docker.compose.project={shlex.quote(data_compose_project)} --format '{{{{json .}}}}'"
+        )
+        if data_code == 0:
+            for line in data_output.splitlines():
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                name = row.get("Names") or row.get("Name") or ""
+                if not name or any(current["name"] == name for current in containers):
+                    continue
+                labels = str(row.get("Labels") or "")
+                matched_service = re.search(r"(?:^|,)com\.docker\.compose\.service=([^,]+)", labels)
+                containers.append({
+                    "id": row.get("ID") or row.get("Id") or "",
+                    "name": name,
+                    "service": matched_service.group(1) if matched_service else "data",
+                    "image": row.get("Image") or "",
+                    "state": row.get("State") or row.get("Status") or "unknown",
+                    "status": row.get("Status") or row.get("State") or "unknown",
+                    "ports": row.get("Ports") or "",
                 })
         if replica_names:
             replica_cmd = "docker ps -a --format '{{json .}}' " + " ".join(
@@ -4052,8 +5112,12 @@ def _runtime_snapshot_uncached(item: Deployment, db: Session) -> dict:
         "application_instances": len(application_instances),
         "ready_application_instances": sum(1 for x in application_instances if "running" in str(x["state"]).lower() or str(x["status"]).lower().startswith("up")),
         "resources": {"cpu_percent": round(total_cpu, 2), "cpu": f"{total_cpu:.2f}%", "memory_bytes": total_memory, "memory_usage": _human_bytes(total_memory)},
-        "live_runtime": True,
-        "runtime_message": "当前发布拥有实时运行环境。",
+        "live_runtime": bool(containers),
+        "application_runtime": owns_live_runtime,
+        "runtime_message": (
+            "当前发布拥有实时运行环境。" if owns_live_runtime
+            else "应用已停止；当前仅显示项目共享数据服务。"
+        ),
     }
 
 
@@ -4169,13 +5233,20 @@ def project_runtime(item_id: str, refresh: bool = False, db: Session = Depends(g
     return {"project_id": project.id, "project_name": project.name, "environments": environments}
 
 
-def _service_instance_prefix(project_slug: str, service_name: str) -> str:
+def _service_instance_prefix(
+    project_slug: str, service_name: str, release: str | None = None, namespace: str = "yunzhou",
+) -> str:
     safe_service = re.sub(r"[^a-z0-9-]", "-", str(service_name).lower()).strip("-") or "app"
-    return f"yz-{project_slug}-{safe_service}"
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(namespace).lower()).strip("-") or "yunzhou"
+    safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
+    version = f"-{safe_release}" if safe_release else ""
+    return f"{safe_namespace}-{project_slug}{version}-{safe_service}"
 
 
-def _service_instance_sequence(name: str, project_slug: str, service_name: str) -> int | None:
-    matched = re.fullmatch(re.escape(_service_instance_prefix(project_slug, service_name)) + r"-([1-9][0-9]*)", name or "")
+def _service_instance_sequence(
+    name: str, project_slug: str, service_name: str, release: str | None = None, namespace: str = "yunzhou",
+) -> int | None:
+    matched = re.fullmatch(re.escape(_service_instance_prefix(project_slug, service_name, release, namespace)) + r"-([1-9][0-9]*)", name or "")
     return int(matched.group(1)) if matched else None
 
 
@@ -4184,9 +5255,11 @@ def _next_service_instance_name(
     service_name: str,
     existing_names: set[str],
     minimum: int = 2,
+    release: str | None = None,
+    namespace: str = "yunzhou",
 ) -> str:
     """Reserve the smallest free sequence; sequence 1 belongs to the primary."""
-    prefix = _service_instance_prefix(project_slug, service_name)
+    prefix = _service_instance_prefix(project_slug, service_name, release, namespace)
     sequence = max(1, int(minimum))
     while f"{prefix}-{sequence}" in existing_names:
         sequence += 1
@@ -4199,12 +5272,14 @@ def _replicas_for_scale_down(
     replicas: list[ProjectReplica],
     project_slug: str,
     service_name: str,
+    release: str | None = None,
+    namespace: str = "yunzhou",
 ) -> list[ProjectReplica]:
     """Remove legacy random names first, then the highest numeric sequence."""
     numbered: list[tuple[int, ProjectReplica]] = []
     legacy: list[ProjectReplica] = []
     for replica in replicas:
-        sequence = _service_instance_sequence(replica.container_name, project_slug, service_name)
+        sequence = _service_instance_sequence(replica.container_name, project_slug, service_name, release, namespace)
         if sequence is None:
             legacy.append(replica)
         else:
@@ -4234,6 +5309,8 @@ def scale_project(item_id: str, body: ScaleProjectIn, db: Session = Depends(get_
     stale_replicas = [item for item in all_replicas if item.deployment_id != deployment.id]
     created: list[ProjectReplica] = []
     removed: list[ProjectReplica] = []
+    runtime_policy = db.get(DeploymentSettings, "default")
+    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
     with SSHNode(node) as ssh:
         names_code, names_output = ssh.run("docker ps -a --format '{{.Names}}'", timeout=30)
         if names_code:
@@ -4244,9 +5321,16 @@ def scale_project(item_id: str, body: ScaleProjectIn, db: Session = Depends(get_
         # while its replica container kept running and holding a host port.
         configured_base_name = deployment.container_name or f"yz-{project.slug}"
         known_names = {configured_base_name, *(item.container_name for item in all_replicas)}
+        modern_replica_pattern = (
+            "^" + re.escape(_service_instance_prefix(
+                project.slug, "SERVICE", deployment.release, runtime_namespace,
+            ).replace("-service", "-")) + ".+-([2-9]|[1-9][0-9]+)$"
+        )
         _, discovered_output = ssh.run(
-            "docker ps -a --format '{{.Names}}' | "
-            f"grep -E '^{re.escape('yz-' + project.slug + '-replica-')}[0-9]+$' || true"
+            "docker ps -a --format '{{.Names}}' | grep -E " + shlex.quote(
+                "(^" + re.escape("yz-" + project.slug + "-replica-") +
+                "[0-9]+$)|(" + modern_replica_pattern + ")"
+            ) + " || true"
         )
         for discovered_name in filter(None, map(str.strip, discovered_output.splitlines())):
             if discovered_name not in known_names:
@@ -4283,12 +5367,17 @@ def scale_project(item_id: str, body: ScaleProjectIn, db: Session = Depends(get_
                 db.flush()
                 configured_base_name = deployment.container_name
         base_name = configured_base_name
+        # Always inspect the complete Compose release first.  Inspecting only
+        # `deployment.container_name` sees the entry Web container but misses
+        # sibling API services.  A custom route such as /frapi/ -> server then
+        # fails validation even though the server container is healthy.
+        compose_name = deployment_compose_project_name(deployment, project)
         ps_code, ps_output = ssh.run(
-            f"docker ps --filter name=^/{shlex.quote(base_name)}$ --format '{{{{json .}}}}'"
+            f"docker ps --filter label=com.docker.compose.project={shlex.quote(compose_name)} --format '{{{{json .}}}}'"
         )
-        if (ps_code or not ps_output.strip()) and not deployment.image_name:
+        if ps_code or not ps_output.strip():
             ps_code, ps_output = ssh.run(
-                f"docker ps --filter label=com.docker.compose.project={shlex.quote('yz-' + project.slug)} --format '{{{{json .}}}}'"
+                f"docker ps --filter name=^/{shlex.quote(base_name)}$ --format '{{{{json .}}}}'"
             )
         if ps_code or not ps_output.strip():
             raise HTTPException(409, "未找到当前运行的应用容器")
@@ -4341,7 +5430,10 @@ def scale_project(item_id: str, body: ScaleProjectIn, db: Session = Depends(get_
                 policy = db.get(DeploymentSettings, "default")
                 port_end = policy.internal_port_end if policy else 39999
                 for _ in range(body.replicas - current):
-                    name = _next_service_instance_name(project.slug, base_service, existing_names, minimum=2)
+                    name = _next_service_instance_name(
+                        project.slug, base_service, existing_names, minimum=2,
+                        release=deployment.release, namespace=runtime_namespace,
+                    )
                     port = choose_port(db, None)
                     while port <= port_end:
                         occupied, _ = ssh.run(
@@ -4393,7 +5485,9 @@ def scale_project(item_id: str, body: ScaleProjectIn, db: Session = Depends(get_
                     created.append(replica)
             elif body.replicas < current:
                 remove_count = current - body.replicas
-                removed = _replicas_for_scale_down(replicas, project.slug, base_service)[:remove_count]
+                removed = _replicas_for_scale_down(
+                    replicas, project.slug, base_service, deployment.release, runtime_namespace,
+                )[:remove_count]
 
             active = [x for x in replicas if x not in removed] + created
             targets = [(node.host, deployment.host_port)] + [(node.host, x.host_port) for x in active]
@@ -4465,6 +5559,16 @@ _NON_SCALABLE_SERVICES = re.compile(
 )
 
 
+def _runtime_entry_is_data(container: dict) -> bool:
+    identity = " ".join(str(container.get(key) or "") for key in ("service", "name", "image")).lower()
+    return bool(_NON_SCALABLE_SERVICES.search(identity))
+
+
+def _runtime_entry_is_running(container: dict) -> bool:
+    state = f"{container.get('state') or ''} {container.get('status') or ''}".lower()
+    return "running" in state or state.startswith("up") or " up " in state or "healthy" in state
+
+
 def _traffic_plan(project: Project) -> dict:
     try:
         analysis = json.loads(project.integration_analysis_json or "{}")
@@ -4486,7 +5590,13 @@ def _service_role(project: Project, service: str) -> tuple[str, bool]:
     for row in roles:
         if isinstance(row, dict) and str(row.get("service") or "") == service:
             role = str(row.get("role") or "app").lower()
-            return role, bool(row.get("scalable", role in {"frontend", "backend", "app", "web", "api"}))
+            # Application services are always eligible for horizontal scaling.
+            # Older AI analyses occasionally persisted scalable=false for a
+            # backend, which made the UI mislabel a healthy API as a fixed
+            # dependency. Only data/background roles are true singletons.
+            if role in {"frontend", "backend", "app", "web", "api"}:
+                return role, True
+            return role, bool(row.get("scalable", False))
     lowered = service.lower()
     if _NON_SCALABLE_SERVICES.search(lowered):
         return ("worker" if re.search(r"worker|scheduler|cron|job|sync", lowered) else "data"), False
@@ -4569,7 +5679,7 @@ def scale_project_service(item_id: str, service_name: str, body: ScaleProjectIn,
     node = db.get(Node, deployment.node_id)
     if not node:
         raise HTTPException(404, "部署节点不存在")
-    compose_project = "yz-" + project.slug
+    compose_project = deployment_compose_project_name(deployment, project)
     all_rows = db.scalars(select(ProjectReplica).where(
         ProjectReplica.project_id == item_id,
         ProjectReplica.deployment_id == deployment.id,
@@ -4577,6 +5687,8 @@ def scale_project_service(item_id: str, service_name: str, body: ScaleProjectIn,
     known_replica_names = {row.container_name for row in all_rows}
     created: list[ProjectReplica] = []
     removed: list[ProjectReplica] = []
+    runtime_policy = db.get(DeploymentSettings, "default")
+    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
     with SSHNode(node) as ssh:
         names_code, names_output = ssh.run("docker ps -a --format '{{.Names}}'", timeout=30)
         if names_code:
@@ -4641,7 +5753,10 @@ def scale_project_service(item_id: str, service_name: str, body: ScaleProjectIn,
                 policy = db.get(DeploymentSettings, "default")
                 port_end = policy.internal_port_end if policy else 39999
                 for _ in range(body.replicas - current):
-                    name = _next_service_instance_name(project.slug, service_name, existing_names, minimum=2)
+                    name = _next_service_instance_name(
+                        project.slug, service_name, existing_names, minimum=2,
+                        release=deployment.release, namespace=runtime_namespace,
+                    )
                     port = choose_port(db, None)
                     while port <= port_end:
                         occupied, _ = ssh.run(
@@ -4665,7 +5780,7 @@ def scale_project_service(item_id: str, service_name: str, body: ScaleProjectIn,
                         mode = "" if mount.get("RW", True) else ",readonly"
                         mount_args.append("--mount " + shlex.quote(f"type={mount.get('Type')},src={source},dst={destination}{mode}"))
                     command = (
-                        f"docker run -d --name {shlex.quote(name)} --restart unless-stopped "
+                        f"docker create --name {shlex.quote(name)} --restart unless-stopped "
                         f"--label {shlex.quote('com.docker.compose.project=' + compose_project)} "
                         f"--label {shlex.quote('com.docker.compose.service=' + service_name)} "
                         f"--label {shlex.quote('yunzhou.service=' + service_name)} "
@@ -4675,18 +5790,56 @@ def scale_project_service(item_id: str, service_name: str, body: ScaleProjectIn,
                     run_code, run_output = ssh.run(command, timeout=60)
                     if run_code:
                         raise RuntimeError(run_output)
+                    # Compose application services may join both a release
+                    # network and a stable data-service network. Copy every
+                    # network from the primary before starting the candidate;
+                    # otherwise a healthy process can wait forever for Redis
+                    # or MySQL while its published HTTP port stays closed.
+                    for extra_network in networks[1:]:
+                        connect_code, connect_output = ssh.run(
+                            f"docker network connect {shlex.quote(extra_network)} {shlex.quote(name)}",
+                            timeout=30,
+                        )
+                        if connect_code:
+                            ssh.run(f"docker rm -f {shlex.quote(name)} >/dev/null 2>&1 || true")
+                            raise RuntimeError(f"副本接入网络 {extra_network} 失败：{connect_output.strip()}")
+                    start_code, start_output = ssh.run(f"docker start {shlex.quote(name)}", timeout=30)
+                    if start_code:
+                        ssh.run(f"docker rm -f {shlex.quote(name)} >/dev/null 2>&1 || true")
+                        raise RuntimeError(start_output)
                     ready = False
-                    for _ in range(20):
+                    # Runtime images may legitimately declare a 60-90 second
+                    # health-check start period. The old 40 second HTTP-only
+                    # probe removed a sound backend before Docker could mark it
+                    # healthy. Honour both signals and keep the old instance in
+                    # service while the candidate warms up.
+                    for _ in range(60):
                         check, status = ssh.run(
                             f"curl -sS -o /dev/null -w '%{{http_code}}' --connect-timeout 2 --max-time 5 http://127.0.0.1:{port}/"
                         )
                         if check == 0 and status.strip().isdigit() and int(status.strip()) < 500:
                             ready = True
                             break
+                        _, health = ssh.run(
+                            "docker inspect --format "
+                            + shlex.quote("{{if .State.Health}}{{.State.Health.Status}}{{else}}none:{{.State.Status}}{{end}}")
+                            + " " + shlex.quote(name)
+                        )
+                        if health.strip().lower() == "healthy":
+                            ready = True
+                            break
+                        if health.strip().lower() in {"exited", "dead", "none:exited", "none:dead"}:
+                            break
                         time.sleep(2)
                     if not ready:
+                        _, failure_state = ssh.run(
+                            "docker inspect --format "
+                            + shlex.quote("status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}")
+                            + " " + shlex.quote(name)
+                        )
                         ssh.run(f"docker rm -f {shlex.quote(name)} >/dev/null 2>&1 || true")
-                        raise RuntimeError(f"新实例 {name} 健康检查未通过")
+                        evidence = failure_state.strip() or "状态无法读取"
+                        raise RuntimeError(f"新实例 {name} 健康检查未通过（{evidence}）")
                     replica = ProjectReplica(
                         project_id=item_id, deployment_id=deployment.id, node_id=node.id,
                         container_name=name, host_port=port, service_name=service_name,
@@ -4698,7 +5851,9 @@ def scale_project_service(item_id: str, service_name: str, body: ScaleProjectIn,
                     created.append(replica)
             elif body.replicas < current:
                 remove_count = current - body.replicas
-                removed = _replicas_for_scale_down(replicas, project.slug, service_name)[:remove_count]
+                removed = _replicas_for_scale_down(
+                    replicas, project.slug, service_name, deployment.release, runtime_namespace,
+                )[:remove_count]
             active = [row for row in replicas if row not in removed]
             service_targets: dict[str, list[tuple[str, int]]] = {}
             for service, (_, _, published, _) in service_specs.items():
@@ -5372,6 +6527,8 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
     item = db.get(Deployment, item_id)
     if not item:
         raise HTTPException(404, "部署不存在")
+    project = db.get(Project, item.project_id)
+    node = db.get(Node, item.node_id)
     view = deployment_view(item, db)
     steps = view.get("pipeline_steps", [])
     active = next((x for x in steps if x["status"] in ("running", "failed", "stopped")), None) or (steps[-1] if steps else {"title": view["current_step"], "log": ""})
@@ -5384,38 +6541,98 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
     live_states = ",".join(sorted(f"{x.get('name')}={x.get('status')}" for x in (live or {}).get("containers", [])))
     cache_key = f"{item.status.value}|{active['title']}|{item.access_url or '-'}|{live_states}"
     marker = "[AI跟进] "
+    evidence = active.get("log", "") + ("\n[实时运行状态]\n" + json.dumps((live or {}).get("containers", []), ensure_ascii=False) if live is not None else "")
+    combined_evidence = evidence + "\n" + (item.error or "")
+    project_values = environment_values(decrypt(project.env_text_encrypted) or "") if project else {}
+    external_mysql_env_error = (
+        project_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() == "external"
+        and bool(re.search(r"YUNZHOU_MYSQL_(?:HOST|PORT|DATABASE).*not set|项目级 MySQL 数据服务", combined_evidence, re.I | re.S))
+    )
+    access_verified = bool(re.search(r"访问验证通过：HTTP\s+2\d\d", combined_evidence, re.I))
     for line in reversed((item.log_text or "").splitlines()):
         if line.startswith(marker):
             try:
                 cached = json.loads(line[len(marker):])
-                if cached.get("cache_key") == cache_key and cached.get("source") == "ai":
+                if not external_mysql_env_error and not access_verified and cached.get("cache_key") == cache_key and cached.get("source") == "ai":
                     return cached
             except Exception:
                 pass
             break
-    try:
-        evidence = active.get("log", "") + ("\n[实时运行状态]\n" + json.dumps((live or {}).get("containers", []), ensure_ascii=False) if live is not None else "")
-        result = deployment_followup(db, item, db.get(Project, item.project_id), db.get(Node, item.node_id), active["title"], evidence)
-    except Exception as exc:
-        lower = evidence.lower()
-        if "jctree$jcimport" in lower and "qualid" in lower:
-            summary = "已定位为 Java 编译环境不兼容：项目中的旧版编译器或注解处理器访问了 JDK 21 已变化的 javac 内部字段，sc-common 因此编译失败。"
-            advice = "优先按项目原要求改用兼容的 JDK（常见为 8、11 或 17）；也可以升级 Lombok、Maven Compiler Plugin 等注解处理依赖后再用 JDK 21。平台仍会继续尝试调用 AI 给出项目化建议。"
-        elif "non-resolvable" in lower or "could not resolve dependencies" in lower:
-            summary = "构建失败在依赖解析阶段，Maven 未能取得项目所需依赖。"
-            advice = "检查私有仓库凭据、镜像源和目标服务器网络；平台会继续调用 AI 分析具体依赖。"
-        elif "compilation failure" in lower or "fatal error compiling" in lower:
-            summary = "构建失败在源码编译阶段，已排除容器启动和端口问题。"
-            advice = "需要根据最早的编译错误核对源码、JDK 与构建插件版本；平台会继续调用 AI 提炼具体修复项。"
-        else:
-            unresolved = re.search(r'Could not resolve\s+["\']([^"\']+)["\']\s+from\s+["\']([^"\']+)', evidence, re.I)
-            if unresolved:
-                summary = f"构建时无法解析模块 {unresolved.group(1)}，引用位置为 {unresolved.group(2)}。"
-                advice = "平台将先核对生成的 Dockerfile 是否完整复制了跨目录依赖；若构建上下文完整，则归类为源码缺文件、路径或大小写问题，不会自动修改业务源码。"
+    # Platform interpreter errors are deterministic and must not be handed to
+    # a language model that could guess a later stage such as "验证访问".
+    # The pipeline parser above is the source of truth for the actual stage.
+    platform_name_error = re.search(r"name ['\"]([^'\"]+)['\"] is not defined", combined_evidence, re.I)
+    if access_verified and item.status == DeployStatus.running:
+        verified_url = re.search(r"访问验证通过：HTTP\s+2\d\d\s*[·，,]?\s*(https?://\S+)", combined_evidence, re.I)
+        result = {
+            "source": "system",
+            "summary": "访问验证已通过，平台正在完成版本切换和成功状态提交。",
+            "advice": "无需处理；该阶段通常只持续数秒，完成后会自动显示运行中和正式访问地址。",
+            "fix_plan": [],
+            "next_step": "等待平台提交成功状态并刷新项目卡片。" + (f" 已验证地址：{verified_url.group(1)}" if verified_url else ""),
+            "scope": "platform",
+            "confidence": "high",
+            "retry_safe": False,
+        }
+    elif external_mysql_env_error:
+        result = {
+            "source": "system",
+            "summary": "已确认不是用户漏填数据库配置，而是平台生成发布环境时提前展开了外接 MySQL 变量，导致已保存的值在 Compose 中变成空值。",
+            "advice": "平台将调整环境变量生成顺序，先写入 MySQL 地址、端口、库名和账号，再生成应用连接串；发布前还会校验这些值已完整写入，并跳过项目内置 MySQL 的创建与健康检查。",
+            "fix_plan": [
+                "重新生成本次发布环境，保留项目已保存的外接 MySQL 配置",
+                "校验外接数据库参数已注入 Compose，且不在日志中输出密码",
+                "仅启动项目实际需要的 Redis 与应用服务",
+            ],
+            "next_step": "平台修复上线后重新发布当前源码，并依次验证数据库连接、容器健康和访问地址。",
+            "scope": "platform",
+            "confidence": "high",
+            "retry_safe": True,
+        }
+    elif platform_name_error:
+        variable = platform_name_error.group(1)
+        result = {
+            "source": "system",
+            "summary": f"平台在“{active['title']}”阶段发生内部变量错误（{variable} 未定义），任务已失败；后续步骤未执行。",
+            "advice": "这是平台程序问题，与项目源码、依赖、数据库和访问地址无关。修复平台后可直接重新发布。",
+            "scope": "platform",
+            "confidence": "high",
+            "evidence": [f"name '{variable}' is not defined"],
+            "retry_safe": False,
+            "fix_plan": ["修复平台内部变量引用", "部署平台修复", "重新发布并验证原项目"],
+            "next_step": "平台修复完成后重新发布；无需修改项目源码或数据库配置。",
+        }
+    else:
+        try:
+            result = deployment_followup(db, item, project, node, active["title"], evidence)
+        except Exception as exc:
+            lower = evidence.lower()
+            if "jctree$jcimport" in lower and "qualid" in lower:
+                summary = "已定位为 Java 编译环境不兼容：项目中的旧版编译器或注解处理器访问了 JDK 21 已变化的 javac 内部字段，sc-common 因此编译失败。"
+                advice = "优先按项目原要求改用兼容的 JDK（常见为 8、11 或 17）；也可以升级 Lombok、Maven Compiler Plugin 等注解处理依赖后再用 JDK 21。平台仍会继续尝试调用 AI 给出项目化建议。"
+            elif "non-resolvable" in lower or "could not resolve dependencies" in lower:
+                summary = "构建失败在依赖解析阶段，Maven 未能取得项目所需依赖。"
+                advice = "检查私有仓库凭据、镜像源和目标服务器网络；平台会继续调用 AI 分析具体依赖。"
+            elif "compilation failure" in lower or "fatal error compiling" in lower:
+                summary = "构建失败在源码编译阶段，已排除容器启动和端口问题。"
+                advice = "需要根据最早的编译错误核对源码、JDK 与构建插件版本；平台会继续调用 AI 提炼具体修复项。"
             else:
-                summary = f"正在重新分析“{active['title']}”阶段的异常。"
-                advice = "AI 请求暂未完成，平台将在 15 秒后自动重试。"
-        result = {"source": "system", "summary": summary, "advice": advice, "retryable": True, "retry_reason": str(exc)}
+                unresolved = re.search(r'Could not resolve\s+["\']([^"\']+)["\']\s+from\s+["\']([^"\']+)', evidence, re.I)
+                if unresolved:
+                    summary = f"构建时无法解析模块 {unresolved.group(1)}，引用位置为 {unresolved.group(2)}。"
+                    advice = "平台将先核对生成的 Dockerfile 是否完整复制了跨目录依赖；若构建上下文完整，则归类为源码缺文件、路径或大小写问题，不会自动修改业务源码。"
+                else:
+                    summary = f"正在重新分析“{active['title']}”阶段的异常。"
+                    advice = "AI 请求暂未完成，平台将在 15 秒后自动重试。"
+            result = {"source": "system", "summary": summary, "advice": advice, "retryable": True, "retry_reason": str(exc)}
+    if not result.get("fix_plan") and result.get("advice"):
+        result["fix_plan"] = [str(result["advice"])]
+    if not result.get("next_step"):
+        result["next_step"] = (
+            "平台正在继续分析并准备可验证的处理方案。"
+            if item.status == DeployStatus.running
+            else "按修复方案处理后重新发布，并由平台完成启动和访问验证。"
+        )
     result.update({"cache_key": cache_key, "stage": active["title"], "status": item.status.value, "generated_at": datetime.now(timezone.utc).isoformat()})
     if result.get("source") == "ai":
         item.log_text = ((item.log_text or "") + "\n" + marker + json.dumps(result, ensure_ascii=False) + "\n")[-200_000:]
@@ -5451,11 +6668,22 @@ def _container_access(item_id: str, container_name: str, db: Session) -> tuple[D
     if not owns_live_runtime:
         raise HTTPException(409, "历史发布记录不能操作当前运行容器")
     replica_names = set(db.scalars(select(ProjectReplica.container_name).where(ProjectReplica.deployment_id == item.id)).all())
-    compose_prefix = f"yz-{project.slug}-"
+    # Compose container names use the release-scoped project name generated by
+    # the deployer (for example yunzhou-project-...-api-1), not the short
+    # historical ``yz-{slug}-`` prefix.  Accept only the exact current
+    # deployment namespace so another project's container can never be opened.
+    runtime_policy = db.get(DeploymentSettings, "default")
+    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
+    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
+    compose_prefixes = {
+        f"{deployment_compose_project_name(item, project)}-",
+        f"{safe_namespace}-{project.slug}-data-",
+        f"yz-{project.slug}-",
+    }
     allowed = (
         container_name == (item.container_name or "")
         or container_name in replica_names
-        or container_name.startswith(compose_prefix)
+        or any(container_name.startswith(prefix) for prefix in compose_prefixes)
     )
     if not allowed:
         raise HTTPException(404, "容器不存在或已停止")
@@ -5701,6 +6929,9 @@ async def container_terminal_websocket(websocket: WebSocket, item_id: str, conta
         if not user or not user.active or user.role not in {Role.admin, Role.deployer}:
             await websocket.close(code=4401)
             return
+        if not _user_can_access_deployment(db, user, item_id):
+            await websocket.close(code=4404)
+            return
         item, node = _container_access(item_id, container_name, db)
         cwd = _container_path(websocket.query_params.get("cwd") or "/")
         await websocket.accept(subprotocol="yunzhou-terminal")
@@ -5749,24 +6980,19 @@ def stop(item_id: str, db: Session = Depends(get_db), user: User = Depends(requi
     if not item:
         raise HTTPException(404, "部署不存在")
     previous = item.status
+    # Stopping an already published service is a runtime operation, not a new
+    # deployment.  Preserve the original build interval so days of uptime are
+    # never reported as deployment time.
+    original_finished_at = item.finished_at
     item.log_text = (item.log_text or "") + "\n[停止] 已收到请求，正在终止部署进程和容器...\n"
     # Publish the cancellation before touching the remote host.  Local work
     # such as AI analysis has no remote PID; it observes this state at its next
     # checkpoint and exits without continuing the release.
     item.status = DeployStatus.stopped
-    item.finished_at = datetime.now(timezone.utc)
+    item.finished_at = original_finished_at if previous == DeployStatus.success else datetime.now(timezone.utc)
     audit(db, user, "stop", "deployment", item.id)
     db.commit()
     try:
-        newer_replacement = db.scalar(
-            select(Deployment).where(
-                Deployment.project_id == item.project_id,
-                Deployment.node_id == item.node_id,
-                Deployment.id != item.id,
-                Deployment.created_at > item.created_at,
-                Deployment.status.in_([DeployStatus.queued, DeployStatus.running, DeployStatus.success]),
-            ).order_by(Deployment.created_at.desc())
-        )
         # While cancelling an unfinished duplicate release, an older successful
         # release is the current production runtime and must not be mistaken for
         # a container created by the task being cancelled.
@@ -5780,7 +7006,11 @@ def stop(item_id: str, db: Session = Depends(get_db), user: User = Depends(requi
                     Deployment.status == DeployStatus.success,
                 ).order_by(Deployment.created_at.desc())
             )
-        protected_runtime = newer_replacement or existing_runtime
+        # A newer release is never a reason to preserve this release's own
+        # containers: release-scoped Compose names make them independent. The
+        # only protected runtime is the already-successful version while an
+        # unfinished candidate record is being cancelled.
+        protected_runtime = existing_runtime
         builder_node = platform_gateway_node(db)
         if builder_node:
             with SSHNode(builder_node) as builder_ssh:
@@ -5800,9 +7030,18 @@ def stop(item_id: str, db: Session = Depends(get_db), user: User = Depends(requi
             removed_replica_names = {replica.container_name for replica in replicas}
             if node:
                 with SSHNode(node) as ssh:
+                    runtime_policy = db.get(DeploymentSettings, "default")
+                    runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
+                    modern_replica = (
+                        "^" + re.escape(_service_instance_prefix(
+                            db.get(Project, item.project_id).slug, "SERVICE", item.release, runtime_namespace,
+                        ).replace("-service", "-")) + ".+-([2-9]|[1-9][0-9]+)$"
+                    )
                     _, discovered = ssh.run(
-                        f"docker ps -a --filter {shlex.quote('name=^/yz-' + db.get(Project, item.project_id).slug + '-replica-')} "
-                        "--format '{{.Names}}'"
+                        "docker ps -a --format '{{.Names}}' | grep -E " + shlex.quote(
+                            "(^yz-" + re.escape(db.get(Project, item.project_id).slug) +
+                            "-replica-[0-9]+$)|(" + modern_replica + ")"
+                        ) + " || true"
                     )
                     removed_replica_names.update(name.strip() for name in discovered.splitlines() if name.strip())
                     for name in removed_replica_names:
@@ -5813,19 +7052,66 @@ def stop(item_id: str, db: Session = Depends(get_db), user: User = Depends(requi
         output = stop_deployment(item, db.get(Project, item.project_id), db.get(Node, item.node_id), preserve_runtime=bool(protected_runtime))
         if not protected_runtime:
             output += f"；已停止并清理 {len(removed_replica_names)} 个应用副本，固定 Service 配置已保留"
+        # A release-level stop controls only this version's application
+        # runtime. Project-shared MySQL/Redis containers remain available so a
+        # routine application stop cannot unexpectedly interrupt data services.
     except Exception as exc:
         item = db.get(Deployment, item_id)
+        # A failed remote stop is not a stopped deployment. Restore the prior
+        # state so the UI cannot claim success while containers are still live.
+        item.status = previous
+        item.finished_at = original_finished_at
         item.log_text = (item.log_text or "") + f"[停止失败] {exc}\n"
         item.error = f"停止失败：{exc}"
         db.commit()
         raise HTTPException(502, item.error)
     item = db.get(Deployment, item_id)
     item.status = DeployStatus.stopped
-    item.finished_at = datetime.now(timezone.utc)
+    item.finished_at = original_finished_at if previous == DeployStatus.success else datetime.now(timezone.utc)
     item.error = None
     item.log_text = (item.log_text or "") + f"[停止确认] {output}\n"
     db.commit()
+    invalidate_runtime_cache(item.id)
     return {"ok": True, "verified": True, "output": output}
+
+
+@app.post("/api/projects/{item_id}/runtime/stop")
+def stop_project_runtime(item_id: str, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+    """Stop every application and shared data service owned by a project."""
+    project = db.get(Project, item_id)
+    if not project:
+        raise HTTPException(404, "项目不存在")
+    active = db.scalars(select(Deployment).where(
+        Deployment.project_id == item_id,
+        Deployment.status == DeployStatus.success,
+    ).order_by(Deployment.created_at.desc())).all()
+    latest_stopped = None if active else db.scalar(select(Deployment).where(
+        Deployment.project_id == item_id,
+        Deployment.status == DeployStatus.stopped,
+        Deployment.release.is_not(None),
+        Deployment.access_url.is_not(None),
+    ).order_by(Deployment.created_at.desc()))
+    if not active and not latest_stopped:
+        raise HTTPException(409, "项目当前没有可停止的运行环境")
+
+    outputs: list[str] = []
+    nodes: dict[str, Node] = {}
+    for deployment in active or [latest_stopped]:
+        node = db.get(Node, deployment.node_id)
+        if not node:
+            raise HTTPException(404, "部署服务器不存在")
+        nodes[node.id] = node
+        if deployment.status == DeployStatus.success:
+            result = stop(deployment.id, db, user)
+            outputs.append(str(result.get("output") or "应用服务已停止"))
+
+    for node in nodes.values():
+        outputs.append(stop_project_data_services(project, node, db))
+
+    invalidate_runtime_cache()
+    audit(db, user, "stop_project_runtime", "project", project.id, "应用与数据服务已全部停止")
+    db.commit()
+    return {"ok": True, "verified": True, "output": "；".join(filter(None, outputs))}
 
 
 @app.post("/api/deployments/{item_id}/retry", response_model=DeploymentOut)
@@ -5903,10 +7189,12 @@ def deployment_delete_preview(item_id: str, db: Session = Depends(get_db), _: Us
                 if value.strip():
                     resources["containers"].append({"name": value.strip(), "node": node.name})
             if item.release:
+                release_compose_project = deployment_compose_project_name(item, project)
                 _, value = ssh.run(
-                    "docker ps -a --filter " + shlex.quote(f"label=com.docker.compose.project=yz-{project.slug}") +
+                    "{ docker ps -a --filter " + shlex.quote(f"label=com.docker.compose.project={release_compose_project}") +
+                    " --format '{{.Names}}'; docker ps -a --filter " + shlex.quote(f"label=com.docker.compose.project={compose_project_name(project.slug, namespace='yz')}") +
                     " --format '{{.Names}}|{{.Label \"com.docker.compose.project.config_files\"}}' | "
-                    f"awk -F'|' -v r={shlex.quote('/' + item.release + '/')} 'index($2,r) {{print $1}}'",
+                    f"awk -F'|' -v r={shlex.quote('/' + item.release + '/')} 'index($2,r) {{print $1}}'; }} | sort -u",
                     timeout=20,
                 )
                 for name in filter(None, map(str.strip, value.splitlines())):
@@ -5918,7 +7206,7 @@ def deployment_delete_preview(item_id: str, db: Session = Depends(get_db), _: Us
                 if value.strip():
                     resources["images"].append({"name": value.strip(), "node": node.name})
             else:
-                _, value = ssh.run("docker images --format '{{.Repository}}:{{.Tag}}' --filter " + shlex.quote(f"label=com.docker.compose.project=yz-{project.slug}"), timeout=20)
+                _, value = ssh.run("docker images --format '{{.Repository}}:{{.Tag}}' --filter " + shlex.quote(f"label=com.docker.compose.project={deployment_compose_project_name(item, project)}"), timeout=20)
                 resources["images"].extend({"name": name, "node": node.name} for name in filter(None, map(str.strip, value.splitlines())))
             for path in release_dirs:
                 _, value = ssh.run(f"test -e {shlex.quote(path)} && printf '%s' {shlex.quote(path)} || true", timeout=20)
@@ -5930,6 +7218,18 @@ def deployment_delete_preview(item_id: str, db: Session = Depends(get_db), _: Us
     gateway = platform_gateway_node(db)
     if gateway:
         candidates = [f"/data/yunzhou-control/data/gateway/conf.d/{item.id}.conf", f"/data/yunzhou-control/data/gateway/certs/{item.id}.crt", f"/data/yunzhou-control/data/gateway/certs/{item.id}.key"]
+        serving_release = db.scalar(select(Deployment.id).where(
+            Deployment.project_id == item.project_id,
+            Deployment.id != item.id,
+            Deployment.status == DeployStatus.success,
+        ).limit(1))
+        if not serving_release:
+            project_service = f"project-{item.project_id}"
+            candidates.extend([
+                f"/data/yunzhou-control/data/gateway/conf.d/{project_service}.conf",
+                f"/data/yunzhou-control/data/gateway/certs/{project_service}.crt",
+                f"/data/yunzhou-control/data/gateway/certs/{project_service}.key",
+            ])
         try:
             with SSHNode(gateway) as ssh:
                 checks = "; ".join(f"test -e {shlex.quote(path)} && printf '%s\\n' {shlex.quote(path)} || true" for path in candidates)
@@ -5942,6 +7242,11 @@ def deployment_delete_preview(item_id: str, db: Session = Depends(get_db), _: Us
                 scan_images(gateway)
             except Exception as exc:
                 warnings.append(f"平台构建镜像查询失败：{exc}")
+    if item.status == DeployStatus.failed and not resources["images"]:
+        if "[后台清理完成]" in (item.log_text or ""):
+            warnings.append("该失败版本曾完成镜像构建，但镜像已被旧版后台清理策略回收；本次只删除发布记录与日志。")
+        else:
+            warnings.append("该失败版本当前未找到可清理镜像；可能尚未完成镜像构建，或已按镜像保留策略回收。")
     resources["records"].append({"name": f"发布记录、流水线日志 · {item.release or item.id[:8]}"})
     inventory = {
         "project": project.name,
@@ -5994,6 +7299,12 @@ def delete_deployment(item_id: str, remove_data: bool = False, db: Session = Dep
             Deployment.status == DeployStatus.success,
         ).order_by(Deployment.created_at.desc())
     )
+    serving_release = db.scalar(select(Deployment).where(
+        Deployment.project_id == item.project_id,
+        Deployment.node_id == item.node_id,
+        Deployment.id != item.id,
+        Deployment.status == DeployStatus.success,
+    ).order_by(Deployment.created_at.desc()))
     try:
         # Remove replica containers before their rows are cascaded with the
         # deployment record.  Otherwise they become invisible to the platform
@@ -6017,23 +7328,55 @@ def delete_deployment(item_id: str, remove_data: bool = False, db: Session = Dep
             remove_persistent_data=remove_data,
             preserve_runtime=bool(replacement),
         )
+        # The build node keeps its own local copy after pushing to the central
+        # registry. A deleted release must lose that exact local tag on both
+        # the runtime node and the builder, while newer releases and shared
+        # base images remain untouched.
+        builder = platform_gateway_node(db)
+        if builder and node and builder.id != node.id and item.release:
+            prefixes = (
+                f"yunzhou/{project.slug}-", f"yz-{project.slug}-", f"{project.slug}-",
+            )
+            image_cleanup = (
+                "refs=$(docker images --format '{{.Repository}}|{{.Tag}}' | "
+                f"awk -F'|' -v t={shlex.quote(item.release)} "
+                + " ".join(f"-v p{index}={shlex.quote(prefix)}" for index, prefix in enumerate(prefixes, start=1))
+                + " '$2==t && (index($1,p1)==1 || index($1,p2)==1 || index($1,p3)==1) {print $1\":\"$2}'); "
+                "[ -z \"$refs\" ] || printf '%s\n' \"$refs\" | xargs -r docker image rm -f >/dev/null 2>&1; "
+                "docker image prune -f >/dev/null 2>&1 || true"
+            )
+            with SSHNode(builder) as builder_ssh:
+                cleanup_code, cleanup_output = builder_ssh.run(image_cleanup, timeout=180)
+                if cleanup_code:
+                    raise RuntimeError("构建节点历史镜像清理失败：" + cleanup_output[-500:])
+            cleanup += "；构建节点同版本镜像标签已清理"
         gateway = platform_gateway_node(db)
         if gateway:
-            deployment_id = shlex.quote(item.id)
-            project_service = shlex.quote(f"project-{item.project_id}")
+            gateway_keys = [item.id]
+            if not serving_release:
+                gateway_keys.append(f"project-{item.project_id}")
+            gateway_paths = [
+                f"/data/yunzhou-control/data/gateway/{folder}/{key}.{suffix}"
+                for key in gateway_keys
+                for folder, suffix in (("conf.d", "conf"), ("certs", "crt"), ("certs", "key"))
+            ]
+            path_words = " ".join(shlex.quote(path) for path in gateway_paths)
+            verify_words = "; ".join(f"test ! -e {shlex.quote(path)} || exit 45" for path in gateway_paths)
             with SSHNode(gateway) as ssh:
                 code, output = ssh.run(
-                    f"rm -f -- /data/yunzhou-control/data/gateway/conf.d/{deployment_id}.conf "
-                    f"/data/yunzhou-control/data/gateway/certs/{deployment_id}.crt "
-                    f"/data/yunzhou-control/data/gateway/certs/{deployment_id}.key "
-                    f"/data/yunzhou-control/data/gateway/conf.d/{project_service}.conf; "
-                    "docker exec yunzhou-platform-gateway nginx -t >/dev/null 2>&1 && "
-                    "docker exec yunzhou-platform-gateway nginx -s reload >/dev/null 2>&1 || true",
+                    f"rm -f -- {path_words}; "
+                    "docker exec yunzhou-platform-gateway nginx -t && "
+                    "docker exec yunzhou-platform-gateway nginx -s reload; "
+                    + verify_words,
                     timeout=30,
                 )
                 if code:
                     raise RuntimeError(output or "平台网关文件清理失败")
-            cleanup += "；该发布版本的 Nginx 配置与证书文件已清理"
+            cleanup += (
+                "；该发布记录的旧网关文件已清理，当前线上版本网关保持不变"
+                if serving_release else
+                "；该发布记录及项目级 Nginx 配置、证书与监听已清理并复查"
+            )
     except Exception as exc:
         raise HTTPException(502, f"部署记录未删除：{exc}")
     audit(db, user, "delete_deployment", "deployment", item.id, json.dumps({
@@ -6056,30 +7399,94 @@ def start_stopped_deployment(item_id: str, db: Session = Depends(get_db), user: 
         raise HTTPException(404, "部署不存在")
     if item.status != DeployStatus.stopped:
         raise HTTPException(409, "只有已停止的服务可以重新启用")
+    active_release = db.scalar(select(Deployment).where(
+        Deployment.project_id == item.project_id,
+        Deployment.node_id == item.node_id,
+        Deployment.id != item.id,
+        Deployment.status == DeployStatus.success,
+    ).order_by(Deployment.created_at.desc()))
+    if active_release:
+        raise HTTPException(409, "该服务器已有运行版本；如需切换历史版本，请使用“回滚到此版本”")
+    # Failure cleanup must restore the state that existed before this action.
+    # If shared data services were already running (the common "应用已停" state),
+    # keep them running even when the application fails to start.
+    data_was_running = True  # conservative fallback: never interrupt unknown data state
+    try:
+        before = runtime_snapshot(item, db, force=True)
+        data_was_running = any(
+            _runtime_entry_is_data(container) and _runtime_entry_is_running(container)
+            for container in before.get("containers", [])
+        )
+    except Exception:
+        pass
+    original_started_at = item.started_at
+    original_finished_at = item.finished_at
     item.log_text = (item.log_text or "") + "\n[启用] 正在重新启动原发布版本...\n"
     db.commit()
     try:
         output = start_deployment(item, db.get(Project, item.project_id), db.get(Node, item.node_id), db)
     except Exception as exc:
         item = db.get(Deployment, item_id)
-        item.error = f"启用失败：{exc}"
+        project = db.get(Project, item.project_id)
+        node = db.get(Node, item.node_id)
+        cleanup_error = ""
+        try:
+            # start_deployment can fail after Compose has already created some
+            # containers (for example during its health check).  The database
+            # still says stopped at this point, so explicitly remove this
+            # release instead of leaving an invisible live version behind.
+            stop_deployment(item, project, node)
+            if not data_was_running:
+                stop_project_data_services(project, node, db)
+        except Exception as cleanup_exc:
+            cleanup_error = f"；自动清理失败：{cleanup_exc}"
+        item = db.get(Deployment, item_id)
+        item.status = DeployStatus.stopped
+        item.error = f"启用失败：{exc}{cleanup_error}"
         if "原发布目录不存在" in str(exc):
             # Keep the historical version number, but revoke the stale launch
             # entry so project cards offer a clean redeploy instead.
             item.access_url = None
-        item.log_text = (item.log_text or "") + f"[启用失败] {exc}\n"
+        item.log_text = ((item.log_text or "") + f"[启用失败] {exc}\n" +
+                         (f"[清理异常] {cleanup_error}\n" if cleanup_error else "[自动清理] 未完成启动的容器已清理。\n"))[-200_000:]
         db.commit()
         raise HTTPException(502, item.error)
     item = db.get(Deployment, item_id)
     item.status = DeployStatus.success
     item.error = None
-    item.finished_at = datetime.now(timezone.utc)
-    item.log_text = (item.log_text or "") + f"[启用确认] {output}\n"
-    audit(db, user, "start", "deployment", item.id)
+    # Re-enabling the same release must not rewrite its original deployment
+    # duration.  Runtime stop/start time is tracked in the operation audit.
+    item.started_at = original_started_at
+    item.finished_at = original_finished_at
     db.commit()
     project = db.get(Project, item.project_id)
-    scaled = scale_project(item.project_id, ScaleProjectIn(replicas=1), db, user)
-    output += f"；项目 Service 已恢复，应用实例就绪 {scaled['ready']}/{scaled['desired']}"
+    node = db.get(Node, item.node_id)
+    try:
+        scaled = scale_project(item.project_id, ScaleProjectIn(replicas=1), db, user)
+        output += f"；项目 Service 已恢复，应用实例就绪 {scaled['ready']}/{scaled['desired']}"
+    except Exception as exc:
+        cleanup_error = ""
+        try:
+            stop_deployment(item, project, node)
+            if not data_was_running:
+                stop_project_data_services(project, node, db)
+        except Exception as cleanup_exc:
+            cleanup_error = f"；自动清理失败：{cleanup_exc}"
+        item = db.get(Deployment, item_id)
+        item.status = DeployStatus.stopped
+        item.error = f"启用失败：{exc}{cleanup_error}"
+        item.started_at = original_started_at
+        item.finished_at = original_finished_at
+        item.log_text = ((item.log_text or "") +
+                         f"[启用失败] {exc}\n" +
+                         (f"[清理异常] {cleanup_error}\n" if cleanup_error else "[自动清理] 本次启动的版本已停止，不会残留运行容器。\n"))[-200_000:]
+        db.commit()
+        raise HTTPException(502, item.error) from exc
+    item = db.get(Deployment, item_id)
+    item.log_text = ((item.log_text or "") + f"[启用确认] {output}\n")[-200_000:]
+    audit(db, user, "start", "deployment", item.id)
+    db.commit()
+    invalidate_runtime_cache()
     return {"ok": True, "verified": True, "output": output}
 
 
@@ -6112,6 +7519,8 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
     if not current:
         raise HTTPException(409, "当前没有可保护的线上版本；请使用“重新启用”而不是回滚")
 
+    target_original_started_at = target.started_at
+    target_original_finished_at = target.finished_at
     # `start_deployment` uses the ordinary deployment cancellation guard.
     # Historical releases are normally stored as `stopped`, so mark the
     # selected release as active before launching it; otherwise the guard
@@ -6126,6 +7535,7 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
     def apply_gateway(item: Deployment) -> str:
         domain_config = db.get(ProjectDomainConfig, project.id)
         defaults = db.get(DeploymentSettings, "default")
+        route_groups = _runtime_service_gateway_routes(db, project, item, node)
         access = configure_platform_gateway(
             db, item, node, int(item.host_port), project.domain,
             http_port=domain_config.http_port if domain_config else (defaults.default_domain_http_port if defaults else 80),
@@ -6134,29 +7544,52 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
             redirect_https=domain_config.redirect_https if domain_config else True,
             certificate=decrypt(domain_config.certificate_encrypted) if domain_config else None,
             private_key=decrypt(domain_config.private_key_encrypted) if domain_config else None,
+            upstreams=_project_gateway_targets(db, item, node),
+            route_groups=route_groups or None,
+            strategy=project.load_balance_strategy,
         )
         old_path = urlsplit(item.access_url or "").path
         if old_path and old_path != "/":
             access = access.rstrip("/") + old_path
         return access
 
+    current_stop_started = False
     try:
         output = start_deployment(target, project, node, db)
         access = apply_gateway(target)
         verify_access(db, target.id, access)
+        # `stop_deployment` releases port reservations in a short independent
+        # session. Commit the outer rollback transaction first, otherwise its
+        # reservation lock can make both sessions wait on each other forever.
+        db.commit()
+        current_stop_started = True
+        stop_output = stop_deployment(current, project, node)
+        output += f"；原线上版本已安全停止：{stop_output}"
     except Exception as exc:
-        restore_error = ""
+        recovery_errors = []
         try:
-            start_deployment(current, project, node, db)
+            # The candidate is always isolated by release. A failed switch must
+            # remove it before restoring traffic, otherwise a stopped record can
+            # leave healthy-looking historical containers behind.
+            stop_deployment(target, project, node)
+        except Exception as cleanup_exc:
+            recovery_errors.append(f"候选版本清理失败：{cleanup_exc}")
+        try:
+            if current_stop_started:
+                start_deployment(current, project, node, db)
             restored_access = apply_gateway(current)
             verify_access(db, current.id, restored_access)
         except Exception as restore_exc:
-            restore_error = f"；原线上版本恢复也失败：{restore_exc}"
+            recovery_errors.append(f"原线上版本恢复失败：{restore_exc}")
+        restore_error = ("；" + "；".join(recovery_errors)) if recovery_errors else ""
         target = db.get(Deployment, item_id)
         target.status = DeployStatus.stopped
         target.error = f"回滚失败：{exc}{restore_error}"
+        target.started_at = target_original_started_at
+        target.finished_at = target_original_finished_at
         target.log_text = ((target.log_text or "") + f"[回滚失败] {exc}\n" + ("[恢复失败] " + restore_error + "\n" if restore_error else "[自动恢复] 已恢复回滚前的线上版本。\n"))[-200_000:]
         db.commit()
+        invalidate_runtime_cache()
         raise HTTPException(502, target.error)
 
     current = db.get(Deployment, current.id)
@@ -6167,7 +7600,11 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
     target.status = DeployStatus.success
     target.error = None
     target.access_url = access
-    target.finished_at = datetime.now(timezone.utc)
+    # Rollback is a runtime switch, not a new build. Preserve the historical
+    # deployment interval so the release list keeps reporting build duration
+    # instead of the time spent performing this rollback.
+    target.started_at = target_original_started_at
+    target.finished_at = target_original_finished_at
     target.log_text = ((target.log_text or "") + f"[回滚完成] {output}；访问验证通过：{access}\n")[-200_000:]
     audit(db, user, "rollback_deployment", "deployment", target.id, f"from={current.release};to={target.release}")
     db.commit()
@@ -6177,6 +7614,7 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
         target = db.get(Deployment, target.id)
         target.log_text = ((target.log_text or "") + f"[副本同步] 主版本回滚成功，附加副本将在下次状态刷新时重试：{scale_exc}\n")[-200_000:]
         db.commit()
+    invalidate_runtime_cache()
     return {"ok": True, "verified": True, "release": target.release, "access_url": access}
 
 
@@ -6588,9 +8026,22 @@ def update_deployment_settings(body: DeploymentSettingsIn, db: Session = Depends
         path = value.strip().rstrip("/") or "/"
         if not path.startswith("/") or "\x00" in path or any(part == ".." for part in path.split("/")):
             raise HTTPException(400, f"{label}必须是安全的绝对路径")
+    image_defaults = {
+        "Nginx": (body.default_nginx_image, "nginx"),
+        "Redis": (body.default_redis_image, "redis"),
+        "MySQL": (body.default_mysql_image, "mysql"),
+        "PostgreSQL": (body.default_postgres_image, "postgres"),
+    }
+    for label, (value, repository) in image_defaults.items():
+        image = value.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*:[a-z0-9][a-z0-9._-]*", image):
+            raise HTTPException(400, f"{label} 默认镜像必须填写完整名称和固定版本")
+        if image.rsplit("/", 1)[-1].split(":", 1)[0] != repository or image.endswith(":latest"):
+            raise HTTPException(400, f"{label} 默认镜像名称不正确或使用了 latest")
     item = get_deployment_settings(db)
     item.global_concurrency = body.global_concurrency
     item.per_node_concurrency = body.per_node_concurrency
+    item.analysis_concurrency = body.analysis_concurrency
     item.connection_timeout_seconds = body.connection_timeout_seconds
     item.external_port_start = body.external_port_start
     item.external_port_end = body.external_port_end
@@ -6613,6 +8064,10 @@ def update_deployment_settings(body: DeploymentSettingsIn, db: Session = Depends
     item.pnpm_cache_dir = body.pnpm_cache_dir.strip().rstrip("/")
     item.yarn_cache_dir = body.yarn_cache_dir.strip().rstrip("/")
     item.pip_cache_dir = body.pip_cache_dir.strip().rstrip("/")
+    item.default_nginx_image = body.default_nginx_image.strip().lower()
+    item.default_redis_image = body.default_redis_image.strip().lower()
+    item.default_mysql_image = body.default_mysql_image.strip().lower()
+    item.default_postgres_image = body.default_postgres_image.strip().lower()
     audit(db, user, "update_deployment_settings", "system", item.id, f"global={item.global_concurrency},per_node={item.per_node_concurrency},timeout={item.connection_timeout_seconds}")
     db.commit()
     db.refresh(item)
@@ -6807,6 +8262,8 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
     if not session:
         title = re.sub(r"\s+", " ", body.message).strip()[:48] or "新对话"
         initial_project = db.get(Project, body.project_id) if body.project_id else None
+        if initial_project and not _user_can_access_project(db, user, initial_project.id):
+            raise HTTPException(404, "项目不存在")
         initial_node = db.get(Node, body.node_id) if body.node_id else None
         session = ChatSession(
             owner_id=user.id,
@@ -6915,6 +8372,32 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
     project_id = project_match.id if project_match else project_id
     node_id = node_match.id if node_match else node_id
     normalized = re.sub(r"[\s，。！!？?]", "", body.message)
+    # Model semantics and the explicitly associated project remain the primary
+    # signals.  If neither resolved a project, tolerate one-character typos in
+    # conversational names (for example “仓除” -> “仓储系统”).  This only
+    # selects the target for a confirmation prompt; it never executes an
+    # operation without the existing second confirmation.
+    if not project_id and projects:
+        from difflib import SequenceMatcher
+
+        project_words = re.sub(
+            r"(帮我|一下|现在|当前|这个|那个|项目|系统|平台|服务|应用|重启|重新启动|部署|发布|停止|回滚)",
+            "",
+            normalized,
+        )
+        ranked_projects = []
+        for candidate in projects:
+            candidate_name = re.sub(r"(项目|系统|平台|服务|应用|中心)$", "", candidate.name)
+            score = max(
+                SequenceMatcher(None, project_words, candidate.name).ratio(),
+                SequenceMatcher(None, project_words, candidate_name).ratio(),
+            ) if project_words else 0
+            ranked_projects.append((score, candidate))
+        ranked_projects.sort(key=lambda row: row[0], reverse=True)
+        best_score, best_project = ranked_projects[0]
+        runner_up = ranked_projects[1][0] if len(ranked_projects) > 1 else 0
+        if best_score >= 0.48 and best_score - runner_up >= 0.12:
+            project_id = best_project.id
     confirmed = normalized in {"是", "是的", "确认", "确认部署", "确认停止", "确认取消", "确认回滚", "确认重启", "确认执行表结构", "确认执行高风险表结构", "确认执行数据变更", "确认执行高风险数据变更", "开始", "开始部署", "可以", "执行", "上线", "停止", "取消", "回滚", "重启"}
     if direct_sql:
         target = db.get(Project, project_id) if project_id else None
@@ -7185,7 +8668,21 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
             node_id=current_deployment.node_id, intent=f"rollback:{target_deployment.id}",
         )
     restart_deployment_id = body.intent.split(":", 1)[1] if body.intent and body.intent.startswith("restart:") else None
-    wants_restart = decision.get("action") == "restart" or any(word in body.message for word in ("重启服务", "重启容器", "重启项目", "重启 pod", "重启pod"))
+    reenable_deployment_id = body.intent.split(":", 1)[1] if body.intent and body.intent.startswith("reenable:") else None
+    wants_restart = decision.get("action") == "restart" or "重启" in body.message.lower() or any(word in body.message.lower() for word in ("restart", "重启 pod", "重启pod"))
+    if reenable_deployment_id and confirmed:
+        target_deployment = db.get(Deployment, reenable_deployment_id)
+        if not target_deployment or (project_id and target_deployment.project_id != project_id):
+            raise HTTPException(409, "待启用的运行版本已经变化，请重新发起")
+        target_project = db.get(Project, target_deployment.project_id)
+        target_node = db.get(Node, target_deployment.node_id)
+        start_stopped_deployment(target_deployment.id, db, user)
+        return respond(
+            f"结论：已重新启用“{target_project.name if target_project else '当前项目'}”。\n"
+            f"关键依据：平台复用了原发布版本，没有重新构建镜像；运行服务已恢复并通过启动检查。",
+            action="reenabled", project_id=target_deployment.project_id,
+            node_id=target_deployment.node_id, intent=None,
+        )
     if restart_deployment_id and confirmed:
         target_deployment = db.get(Deployment, restart_deployment_id)
         if not target_deployment or (project_id and target_deployment.project_id != project_id):
@@ -7214,11 +8711,116 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         snapshot = runtime_snapshot(target_deployment, db)
         containers = [str(row.get("name") or "") for row in snapshot.get("containers", []) if row.get("name")]
         if not containers:
+            verified_markers = ("[完成] 部署成功", "[启用确认]", "[回滚完成]")
+            can_reenable = (
+                target_deployment.status == DeployStatus.stopped
+                and bool(target_deployment.release and target_deployment.access_url)
+                and any(marker in (target_deployment.log_text or "") for marker in verified_markers)
+            )
+            if can_reenable:
+                return respond(
+                    f"结论：“{target_project.name}”当前已停止，不能直接重启，但可以重新启用原版本。\n"
+                    f"关键依据：目标服务器为 {target_node.name if target_node else '原服务器'}；平台将复用已验证版本 {target_deployment.release}，不重新构建镜像。\n"
+                    "下一步：回复“确认重启”后，平台将按重新启用方式恢复服务。",
+                    action="confirm_reenable", project_id=target_project.id,
+                    node_id=target_deployment.node_id, intent=f"reenable:{target_deployment.id}",
+                )
             return respond(f"结论：“{target_project.name}”当前没有可重启的运行容器。\n下一步：如需重新创建容器，请说“重新部署 {target_project.name}”。", action="none", project_id=target_project.id, node_id=target_deployment.node_id, intent=None)
         return respond(
             f"结论：可以重启“{target_project.name}”。\n关键依据：目标服务器为 {target_node.name if target_node else '当前服务器'}，将重启 {len(containers)} 个运行容器。\n下一步：回复“确认重启”后执行，服务会短暂中断，但不会重新构建镜像或覆盖配置。",
             action="confirm_restart", project_id=target_project.id,
             node_id=target_deployment.node_id, intent=f"restart:{target_deployment.id}",
+        )
+    status_words = (
+        "状态", "怎么样", "正常", "成功了吗", "进度", "访问", "地址", "版本", "运行情况",
+        "失败", "原因", "为什么", "报错", "错误", "耗时", "多久", "服务器", "节点",
+    )
+    wants_project_status = (
+        project_id
+        and decision.get("action") in ("answer", "none", None, "")
+        and any(word in body.message for word in status_words)
+    )
+    if wants_project_status:
+        target_project = db.get(Project, project_id)
+        recent = db.scalars(select(Deployment).where(
+            Deployment.project_id == project_id,
+        ).order_by(Deployment.created_at.desc()).limit(20)).all()
+        active = next((item for item in recent if item.status in (DeployStatus.queued, DeployStatus.running)), None)
+        online = next((item for item in recent if item.status == DeployStatus.success), None)
+        latest = recent[0] if recent else None
+        if not latest:
+            return respond(
+                f"结论：“{target_project.name}”还没有发布记录。\n下一步：选择目标服务器后，可以让我发布这个项目。",
+                action="answer", project_id=project_id, node_id=node_id, intent=None,
+            )
+        asks_failure = any(word in body.message for word in ("失败", "原因", "为什么", "报错", "错误"))
+        if asks_failure:
+            failed = next((item for item in recent if item.status == DeployStatus.failed), None)
+            if not failed:
+                return respond(
+                    f"结论：“{target_project.name}”最近没有失败的发布记录。\n"
+                    f"当前状态：{'运行中' if online else ('正在部署' if active else '已停止')}。",
+                    action="answer", project_id=project_id,
+                    node_id=(online or active or latest).node_id, intent=None,
+                )
+            failed_node = db.get(Node, failed.node_id)
+            failure_text = (failed.error or "平台没有记录明确错误，请打开该发布记录查看完整日志。").strip().splitlines()[0][:500]
+            return respond(
+                f"结论：“{target_project.name}”最近一次发布失败。\n"
+                f"失败原因：{failure_text}\n"
+                f"服务器：{failed_node.name if failed_node else '服务器记录已移除'}；版本：{failed.release or '构建前失败'}。\n"
+                "下一步：可以打开该发布记录的 AI 诊断，平台会根据完整日志给出修复方案。",
+                deployment_id=failed.id, action="answer", project_id=project_id,
+                node_id=failed.node_id, intent=None,
+            )
+        asks_duration = any(word in body.message for word in ("耗时", "多久", "多长时间"))
+        if asks_duration:
+            measured = active or latest
+            started_at = measured.started_at or measured.created_at
+            ended_at = measured.finished_at or datetime.now(timezone.utc)
+            seconds = max(0, int((ended_at - started_at).total_seconds())) if started_at else 0
+            duration_text = f"{seconds // 60}分{seconds % 60}秒" if seconds >= 60 else f"{seconds}秒"
+            duration_state = "已用时" if measured.status in (DeployStatus.queued, DeployStatus.running) else "部署耗时"
+            return respond(
+                f"结论：“{target_project.name}”{duration_state} {duration_text}。\n"
+                f"状态：{measured.status.value}；版本：{measured.release or '尚未生成'}。",
+                deployment_id=measured.id, action="answer", project_id=project_id,
+                node_id=measured.node_id, intent=None,
+            )
+        focus = active or online or latest
+        target_node = db.get(Node, focus.node_id) if focus else None
+        if active:
+            view = deployment_view(active, db, include_log=False)
+            return respond(
+                f"结论：“{target_project.name}”正在部署，当前进度 {view.get('progress', 0)}%。\n"
+                f"当前步骤：{view.get('current_step') or '正在处理'}。\n"
+                f"目标服务器：{target_node.name if target_node else '服务器记录已移除'}。",
+                deployment_id=active.id, action="answer", project_id=project_id,
+                node_id=active.node_id, intent=None,
+            )
+        if online:
+            extra = ""
+            if latest.id != online.id and latest.status == DeployStatus.failed:
+                extra = "\n说明：最近一次新版本发布失败，当前成功版本未被覆盖。"
+            return respond(
+                f"结论：“{target_project.name}”当前运行中。\n"
+                f"服务器：{target_node.name if target_node else '服务器记录已移除'}；版本：{online.release or '未记录'}。\n"
+                f"访问地址：{online.access_url or '尚未生成'}。{extra}",
+                deployment_id=online.id, action="answer", project_id=project_id,
+                node_id=online.node_id, intent=None,
+            )
+        status_label = {
+            DeployStatus.failed: "最近一次发布失败",
+            DeployStatus.stopped: "当前已停止",
+            DeployStatus.queued: "正在等待部署",
+            DeployStatus.running: "正在部署",
+        }.get(latest.status, latest.status.value)
+        error_hint = f"\n失败原因：{(latest.error or '').splitlines()[0][:240]}" if latest.status == DeployStatus.failed and latest.error else ""
+        return respond(
+            f"结论：“{target_project.name}”{status_label}。\n"
+            f"服务器：{target_node.name if target_node else '服务器记录已移除'}；版本：{latest.release or '尚未生成'}。{error_hint}",
+            deployment_id=latest.id, action="answer", project_id=project_id,
+            node_id=latest.node_id, intent=None,
         )
     # A status question such as “部署成功了吗/发布用了多久” contains the
     # same nouns as an execution request.  Trust the model's explicit answer
@@ -7292,6 +8894,110 @@ def audit_logs(q: str = "", action: str = "", db: Session = Depends(get_db), _: 
             item.target_id or "", item.detail or "",
         )).lower()]
     return [{"id": x.id, "user_id": x.user_id, "user_name": users.get(x.user_id, "系统任务"), "action": x.action, "target_type": x.target_type, "target_id": x.target_id, "detail": x.detail, "created_at": x.created_at} for x in items[:200]]
+
+
+def _experience_view(item: DeploymentExperience) -> dict:
+    try:
+        tags = json.loads(item.scope_tags or "[]")
+    except (TypeError, ValueError):
+        tags = []
+    return {
+        "id": item.id,
+        "category": item.category,
+        "stage": item.stage,
+        "state": item.state,
+        "enabled": item.enabled,
+        "verified": item.verified,
+        "confidence": item.confidence,
+        "scope_tags": tags,
+        "error_sample": item.error_sample,
+        "repair_summary": item.repair_summary,
+        "occurrences": item.occurrences,
+        "successful_repairs": item.successful_repairs,
+        "failed_repairs": item.failed_repairs,
+        "use_count": item.use_count,
+        "last_used_at": item.last_used_at,
+        "last_verified_at": item.last_verified_at,
+        "updated_at": item.updated_at,
+    }
+
+
+@app.get("/api/ai-experiences")
+def ai_experiences(
+    q: str = "", state: str = "", stage: str = "",
+    db: Session = Depends(get_db), _: User = Depends(require(Role.admin)),
+):
+    rows = db.scalars(select(DeploymentExperience).order_by(
+        DeploymentExperience.verified.desc(),
+        DeploymentExperience.confidence.desc(),
+        DeploymentExperience.updated_at.desc(),
+    )).all()
+    keyword = q.strip().lower()
+    if state:
+        rows = [row for row in rows if row.state == state]
+    if stage:
+        rows = [row for row in rows if row.stage == stage]
+    if keyword:
+        rows = [row for row in rows if keyword in " ".join((
+            row.category or "", row.stage or "", row.scope_tags or "",
+            row.error_sample or "", row.repair_summary or "",
+        )).lower()]
+    all_rows = db.scalars(select(DeploymentExperience)).all()
+    return {
+        "summary": {
+            "total": len(all_rows),
+            "verified": sum(1 for row in all_rows if row.state == "verified" and row.enabled),
+            "candidate": sum(1 for row in all_rows if row.state == "candidate" and row.enabled),
+            "disabled": sum(1 for row in all_rows if not row.enabled),
+            "quarantined": sum(1 for row in all_rows if row.state == "quarantined"),
+        },
+        "items": [_experience_view(row) for row in rows[:500]],
+    }
+
+
+@app.patch("/api/ai-experiences/{experience_id}")
+def update_ai_experience(
+    experience_id: str, body: dict,
+    db: Session = Depends(get_db), user: User = Depends(require(Role.admin)),
+):
+    item = db.get(DeploymentExperience, experience_id)
+    if not item:
+        raise HTTPException(404, "经验不存在")
+    if "state" in body:
+        state = str(body.get("state") or "").strip().lower()
+        if state not in {"candidate", "verified", "deprecated", "quarantined"}:
+            raise HTTPException(400, "经验状态不正确")
+        if state == "verified" and not item.verified:
+            raise HTTPException(400, "候选经验必须经过真实部署验证，不能手工标记为已验证")
+        item.state = state
+        if state in {"deprecated", "quarantined"}:
+            item.enabled = False
+    if "enabled" in body:
+        enabled = bool(body.get("enabled"))
+        if enabled and (item.state == "quarantined" or contains_corruption(item.error_sample) or contains_corruption(item.repair_summary)):
+            raise HTTPException(400, "隔离或乱码经验不能启用")
+        item.enabled = enabled
+        if enabled and item.state == "deprecated":
+            item.state = "verified" if item.verified else "candidate"
+    item.updated_at = datetime.now(timezone.utc)
+    audit(db, user, "update_ai_experience", "deployment_experience", item.id, json.dumps({
+        "category": item.category, "state": item.state, "enabled": item.enabled,
+    }, ensure_ascii=False))
+    db.commit()
+    return _experience_view(item)
+
+
+@app.get("/api/ai-experiences/export")
+def export_ai_experiences(db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
+    rows = db.scalars(select(DeploymentExperience).order_by(DeploymentExperience.created_at)).all()
+    payload = [portable_experience(row) for row in rows if not contains_corruption(row.error_sample) and not contains_corruption(row.repair_summary)]
+    audit(db, user, "export_ai_experiences", "system", detail=json.dumps({"count": len(payload)}, ensure_ascii=False))
+    db.commit()
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    return Response(
+        content=content.encode("utf-8"), media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=deployment-experiences.json"},
+    )
 
 
 def _cleanup_audit_logs(db: Session) -> int:

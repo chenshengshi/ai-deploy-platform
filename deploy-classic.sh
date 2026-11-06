@@ -9,8 +9,12 @@ export DOCKER_BUILDKIT=0
 export COMPOSE_DOCKER_CLI_BUILD=0
 export COMPOSE_BAKE=false
 
-docker build -t yunzhou-control-api ./backend
-docker tag yunzhou-control-api yunzhou-control-worker
-docker build -t yunzhou-control-web ./frontend
+proxy_args=()
+if [[ -n "${BUILD_HTTP_PROXY:-}" ]]; then
+  proxy_args+=(--build-arg "HTTP_PROXY=${BUILD_HTTP_PROXY}" --build-arg "HTTPS_PROXY=${BUILD_HTTP_PROXY}")
+fi
+
+docker build -t yunzhou-control-backend:latest ./backend
+docker build "${proxy_args[@]}" -t yunzhou-control-web:latest ./frontend
 docker compose up -d --no-build
 docker compose ps

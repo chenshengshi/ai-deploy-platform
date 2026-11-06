@@ -3,7 +3,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -142,6 +142,7 @@ class Project(Base):
     env_text_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     integration_analysis_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     data_exposure_json: Mapped[str] = mapped_column(Text, default="{}")
+    runtime_image_overrides_json: Mapped[str] = mapped_column(Text, default="{}")
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     deployments: Mapped[list["Deployment"]] = relationship(back_populates="project", cascade="all,delete")
@@ -155,6 +156,14 @@ class Project(Base):
             return value if isinstance(value, dict) else None
         except (TypeError, ValueError):
             return None
+
+    @property
+    def runtime_image_overrides(self) -> dict:
+        try:
+            value = json.loads(self.runtime_image_overrides_json or "{}")
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            return {}
 
 
 class ChatSession(Base):
@@ -239,7 +248,7 @@ class Deployment(Base):
 
 
 class DeploymentExperience(Base):
-    """Sanitized, verified deployment knowledge shared by all projects."""
+    """Sanitized deployment knowledge with an explicit validation lifecycle."""
     __tablename__ = "deployment_experiences"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     signature: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -250,6 +259,13 @@ class DeploymentExperience(Base):
     successful_repairs: Mapped[int] = mapped_column(Integer, default=0)
     failed_repairs: Mapped[int] = mapped_column(Integer, default=0)
     verified: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    state: Mapped[str] = mapped_column(String(24), default="candidate", index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    stage: Mapped[str] = mapped_column(String(32), default="deployment", index=True)
+    scope_tags: Mapped[str] = mapped_column(Text, default="[]")
+    confidence: Mapped[int] = mapped_column(Integer, default=0)
+    use_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -270,6 +286,24 @@ class ProjectReplica(Base):
     pool_role: Mapped[str] = mapped_column(String(32), default="entry")
     container_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="running")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class DeploymentPortReservation(Base):
+    """Every host port owned by a deployment, including Compose side services.
+
+    Deployment.host_port stores only the public entry service.  Multi-service
+    Compose releases can publish additional backend ports, which must also be
+    reserved while concurrent releases are being prepared.
+    """
+    __tablename__ = "deployment_port_reservations"
+    __table_args__ = (UniqueConstraint("node_id", "host_port", name="uq_deployment_port_node_host"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    deployment_id: Mapped[str] = mapped_column(ForeignKey("deployments.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    service_name: Mapped[str] = mapped_column(String(120), default="")
+    host_port: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(24), default="reserved", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
@@ -301,6 +335,7 @@ class DeploymentSettings(Base):
     id: Mapped[str] = mapped_column(String(20), primary_key=True, default="default")
     global_concurrency: Mapped[int] = mapped_column(Integer, default=3)
     per_node_concurrency: Mapped[int] = mapped_column(Integer, default=2)
+    analysis_concurrency: Mapped[int] = mapped_column(Integer, default=2)
     connection_timeout_seconds: Mapped[int] = mapped_column(Integer, default=6)
     external_port_start: Mapped[int] = mapped_column(Integer, default=20000)
     external_port_end: Mapped[int] = mapped_column(Integer, default=21000)
@@ -320,6 +355,10 @@ class DeploymentSettings(Base):
     pnpm_cache_dir: Mapped[str] = mapped_column(String(255), default="/root/.local/share/pnpm/store")
     yarn_cache_dir: Mapped[str] = mapped_column(String(255), default="/root/.cache/yarn")
     pip_cache_dir: Mapped[str] = mapped_column(String(255), default="/root/.cache/pip")
+    default_nginx_image: Mapped[str] = mapped_column(String(255), default="nginx:1.30.3-alpine")
+    default_redis_image: Mapped[str] = mapped_column(String(255), default="redis:7.4-alpine")
+    default_mysql_image: Mapped[str] = mapped_column(String(255), default="mysql:8.4")
+    default_postgres_image: Mapped[str] = mapped_column(String(255), default="postgres:16")
     system_name: Mapped[str] = mapped_column(String(100), default="自助发布平台")
     short_name: Mapped[str] = mapped_column(String(40), default="自助发布")
     system_subtitle: Mapped[str] = mapped_column(String(120), default="应用交付平台")

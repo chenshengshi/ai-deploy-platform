@@ -51,6 +51,12 @@ services:
     image: yunzhou-control-backend:latest
     restart: always
     command: ["python", "-m", "app.worker"]
+    # The backend image is shared with the HTTP API.  A committed API image
+    # may carry its HTTP healthcheck, but the worker intentionally exposes no
+    # web port.  Disable that inherited check instead of reporting a healthy
+    # worker as perpetually starting/unhealthy.
+    healthcheck:
+      disable: true
     env_file: .env
     depends_on:
       db:
@@ -64,6 +70,7 @@ services:
       - /data/yunzhou:/data/yunzhou
 
   web:
+    image: yunzhou-control-web:latest
     build:
       context: ./frontend
     restart: always
