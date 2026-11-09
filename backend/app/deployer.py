@@ -49,9 +49,11 @@ PLATFORM_MYSQL_IMAGE = "mysql:8.4"
 PLATFORM_POSTGRES_IMAGE = "postgres:16"
 PLATFORM_NODE_BUILD_IMAGE = "node:22-bookworm-slim"
 PLATFORM_NODE_RUNTIME_IMAGE = "node:22-bookworm-slim"
+PLATFORM_PYTHON_IMAGE = "python:3.10-slim-bookworm"
 PLATFORM_IMAGE_VARIABLES = {
     "YUNZHOU_NODE_BUILD_IMAGE": PLATFORM_NODE_BUILD_IMAGE,
     "YUNZHOU_NODE_RUNTIME_IMAGE": PLATFORM_NODE_RUNTIME_IMAGE,
+    "YUNZHOU_PYTHON_IMAGE": PLATFORM_PYTHON_IMAGE,
 }
 
 
@@ -2849,7 +2851,7 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
             compose_text = updated
     if resolved_platform_images:
         plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + [
-            "已使用平台推荐的固定 Node 镜像：" + "、".join(resolved_platform_images)
+            "已使用平台推荐的固定运行镜像：" + "、".join(resolved_platform_images)
         ]
     # Some models put a complete Compose document in the `dockerfile` JSON
     # property. Recover it when possible instead of sending YAML to Docker.
@@ -6960,16 +6962,35 @@ def central_build_and_distribute(
                     docker_text,
                 )
                 virtual_env = virtual_env_match.group(1).strip("'\"") if virtual_env_match else ""
+                if not virtual_env:
+                    copied_virtual_env = re.search(
+                        r"(?im)^\s*COPY\s+--from=\S+\s+(/[^\s]+/(?:\.venv|venv))\s+\1\s*$",
+                        docker_text,
+                    )
+                    path_virtual_env = re.search(
+                        r"(?im)\bPATH\s*=\s*([^\s\\:]+/(?:\.venv|venv))/bin(?::|$)",
+                        docker_text,
+                    )
+                    if copied_virtual_env:
+                        virtual_env = copied_virtual_env.group(1)
+                    elif path_virtual_env:
+                        virtual_env = path_virtual_env.group(1)
+                # Only setup performed *before* the RUN block being replaced
+                # survives this rewrite. Counting ``python -m venv`` inside
+                # the same pip-install block incorrectly removes the command
+                # that creates the environment and leaves ``.../bin/pip``
+                # missing during the real Docker build.
+                docker_before_install = docker_text[:pip_block[0]]
                 virtual_env_ready = bool(
                     virtual_env
                     and (
                         re.search(
                             rf"(?im)\bpython(?:3)?\s+-m\s+venv\s+{re.escape(virtual_env)}(?:\s|$)",
-                            docker_text,
+                            docker_before_install,
                         )
                         or re.search(
                             rf"(?im)^\s*COPY\s+--from=\S+\s+{re.escape(virtual_env)}\s+{re.escape(virtual_env)}\s*$",
-                            docker_text,
+                            docker_before_install,
                         )
                     )
                 )

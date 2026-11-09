@@ -3118,6 +3118,31 @@ tbody tr:last-child td {
   width: 15px;
 }
 
+.user-project-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 9px;
+  border: 1px solid #e4e7ef;
+  border-radius: 999px;
+  background: #f8f9fc;
+  color: #7d8798;
+  font-size: 12px;
+}
+.user-project-count.has-projects { color: #554ce7; background: #f3f1ff; border-color: #dedaff; }
+.user-project-count svg { width: 13px; transition: transform .18s ease; }
+.user-project-count svg.expanded { transform: rotate(90deg); }
+.user-project-detail-row td { padding: 0 20px 16px; background: #fafbff; }
+.user-project-detail-row:hover td { background: #fafbff !important; }
+.user-project-detail { padding: 14px; border: 1px solid #e7e9f3; border-radius: 12px; background: #fff; }
+.user-project-detail-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.user-project-detail-head span { color: #8a95a7; font-size: 12px; }
+.user-project-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px; }
+.user-project-grid > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: 9px; background: #f7f8fc; }
+.user-project-grid small { margin-top: 2px; }
+.user-project-grid em { flex: 0 0 auto; padding: 3px 7px; border-radius: 999px; color: #554ce7; background: #ebe8ff; font-size: 11px; font-style: normal; }
+.user-project-empty { padding: 12px; color: #98a1b1; text-align: center; background: #f8f9fc; border-radius: 8px; }
+
 .image-pull-list {
   margin: 0 24px 12px;
   display: grid;

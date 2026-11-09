@@ -40,6 +40,13 @@ class UserUpdate(BaseModel):
     active: bool | None = None
 
 
+class UserProjectSummary(BaseModel):
+    id: str
+    name: str
+    slug: str
+    permission: str
+
+
 class UserOut(ORM):
     id: str
     username: str
@@ -49,6 +56,9 @@ class UserOut(ORM):
     failed_login_attempts: int = 0
     locked_until: datetime | None = None
     created_at: datetime
+    project_count: int = 0
+    project_scope: str = "owned"
+    projects: list[UserProjectSummary] = Field(default_factory=list)
 
 
 class NodeIn(BaseModel):

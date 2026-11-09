@@ -887,7 +887,32 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
 
 @app.get("/api/users", response_model=list[UserOut])
 def list_users(db: Session = Depends(get_db), _: User = Depends(require(Role.admin))):
-    return db.scalars(select(User).order_by(User.created_at)).all()
+    users = db.scalars(select(User).order_by(User.created_at)).all()
+    projects = db.scalars(select(Project).order_by(Project.name, Project.created_at)).all()
+    owned: dict[str, list[Project]] = {}
+    for project in projects:
+        owned.setdefault(project.owner_id, []).append(project)
+    result = []
+    for item in users:
+        visible = projects if item.role == Role.admin else owned.get(item.id, [])
+        permission = "管理全部" if item.role == Role.admin else ("只读" if item.role == Role.viewer else "管理")
+        result.append({
+            "id": item.id,
+            "username": item.username,
+            "display_name": item.display_name,
+            "role": item.role,
+            "active": item.active,
+            "failed_login_attempts": item.failed_login_attempts,
+            "locked_until": item.locked_until,
+            "created_at": item.created_at,
+            "project_count": len(visible),
+            "project_scope": "all" if item.role == Role.admin else "owned",
+            "projects": [
+                {"id": project.id, "name": project.name, "slug": project.slug, "permission": permission}
+                for project in visible
+            ],
+        })
+    return result
 
 
 @app.post("/api/users", response_model=UserOut)

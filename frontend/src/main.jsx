@@ -7777,6 +7777,7 @@ function UsersPage() {
   const [items, setItems] = useState([]),
     [show, setShow] = useState(false),
     [editing, setEditing] = useState(null),
+    [expandedUser, setExpandedUser] = useState(null),
     [toast, setToast] = useState(null);
   const load = () => api("/users").then(setItems);
   const done = () => {
@@ -7821,6 +7822,7 @@ function UsersPage() {
               <tr>
                 <th>用户</th>
                 <th>角色</th>
+                <th>项目</th>
                 <th>状态</th>
                 <th>创建时间</th>
                 <th>操作</th>
@@ -7828,12 +7830,25 @@ function UsersPage() {
             </thead>
             <tbody>
               {items.map((x) => (
-                <tr key={x.id} onClick={() => setEditing(x)}>
+                <React.Fragment key={x.id}>
+                <tr onClick={() => setEditing(x)}>
                   <td>
                     <b>{x.display_name || x.username}</b>
                     <small>@{x.username}</small>
                   </td>
                   <td>{roleText[x.role]}</td>
+                  <td>
+                    <button
+                      className={"user-project-count " + (x.project_count ? "has-projects" : "")}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setExpandedUser(expandedUser === x.id ? null : x.id);
+                      }}
+                    >
+                      {x.project_scope === "all" ? "全部" : `${x.project_count || 0} 个项目`}
+                      <ChevronRight className={expandedUser === x.id ? "expanded" : ""} />
+                    </button>
+                  </td>
                   <td>
                     <span
                       className={"badge " + (!x.active ? "muted" : (x.locked_until && new Date(x.locked_until) > new Date()) ? "danger" : "success")}
@@ -7862,6 +7877,29 @@ function UsersPage() {
                     </button>
                   </td>
                 </tr>
+                {expandedUser === x.id && (
+                  <tr className="user-project-detail-row">
+                    <td colSpan="6">
+                      <div className="user-project-detail">
+                        <div className="user-project-detail-head">
+                          <b>{x.display_name || x.username} 可管理的项目</b>
+                          <span>{x.project_count || 0} 个</span>
+                        </div>
+                        {(x.projects || []).length ? (
+                          <div className="user-project-grid">
+                            {x.projects.map((project) => (
+                              <div key={project.id}>
+                                <span><b>{project.name}</b><small>{project.slug}</small></span>
+                                <em>{project.permission}</em>
+                              </div>
+                            ))}
+                          </div>
+                        ) : <div className="user-project-empty">暂未分配项目</div>}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               ))}
             </tbody>
           </table>
