@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import traceback
+import zipfile
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,34 @@ PLATFORM_IMAGE_VARIABLES = {
     "YUNZHOU_NODE_RUNTIME_IMAGE": PLATFORM_NODE_RUNTIME_IMAGE,
     "YUNZHOU_PYTHON_IMAGE": PLATFORM_PYTHON_IMAGE,
 }
+
+
+def _executable_jar_score(path: Path) -> tuple[int, int, int, str]:
+    """Rank runnable application JARs ahead of parent/library artifacts.
+
+    Maven reactors may emit several similarly named JARs.  Size and module
+    names are only tie breakers: the manifest is the authoritative evidence
+    that ``java -jar`` can start the selected artifact.
+    """
+    manifest = ""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", "ignore")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        pass
+    executable = bool(re.search(r"(?im)^(?:Main-Class|Start-Class):\s*\S+", manifest))
+    spring_boot = bool(re.search(r"(?im)^Start-Class:\s*\S+", manifest))
+    return (
+        int(executable),
+        int(spring_boot),
+        path.stat().st_size if path.is_file() else 0,
+        path.as_posix(),
+    )
+
+
+def _select_runnable_jar(paths: list[Path]) -> Path | None:
+    candidates = [path for path in paths if path.is_file()]
+    return max(candidates, key=_executable_jar_score) if candidates else None
 
 
 def enforce_nginx_pid_compatibility(dockerfile_text: str) -> str:
@@ -749,6 +778,23 @@ def detect_java_version(path: str) -> int:
     # JDK 17 is the broadly compatible modern default. JDK 21 is too new for
     # many legacy Lombok/compiler combinations and should only be explicit.
     return 17
+
+
+def detect_spring_boot_version(path: str) -> str | None:
+    """Return an explicit Spring Boot version declared by Maven source."""
+    root = Path(path)
+    texts = [pom.read_text(encoding="utf-8", errors="ignore") for pom in list(root.rglob("pom.xml"))[:80]]
+    patterns = (
+        r"<spring-boot\.version>\s*([^<\s]+)\s*</spring-boot\.version>",
+        r"<artifactId>spring-boot-starter-parent</artifactId>[\s\S]{0,240}?<version>\s*([^<\s]+)",
+        r"<artifactId>spring-boot-dependencies</artifactId>[\s\S]{0,240}?<version>\s*([^<\s]+)",
+    )
+    for pattern in patterns:
+        for text in texts:
+            match = re.search(pattern, text, re.I)
+            if match and re.match(r"^\d+(?:\.\d+){1,3}(?:[-.][A-Za-z0-9]+)*$", match.group(1)):
+                return match.group(1)
+    return None
 
 
 _FRONTEND_API_ENV_KEYS = (
@@ -2610,8 +2656,16 @@ def runtime_stage_from_prebuilt_artifact(
                 context / value for value in artifact_paths
                 if str(value).lower().endswith(".jar") and (context / value).is_file()
             ]
-            if jar_candidates:
-                candidates.append(max(jar_candidates, key=lambda path: (path.stat().st_size, path.as_posix())))
+            selected = _select_runnable_jar(jar_candidates)
+            if selected and _executable_jar_score(selected)[0]:
+                candidates.append(selected)
+        if source.lower().endswith(".jar"):
+            # Never turn a multi-stage Java build into a runtime-only image
+            # using a plain reactor/library JAR.  If the host-side Maven pass
+            # has not produced a runnable artifact, preserve the original
+            # Dockerfile so its explicit Spring Boot repackage/bootJar stage
+            # can finish the job.
+            candidates = [path for path in candidates if _executable_jar_score(path)[0]]
         if not candidates:
             return match.group(0)
         artifact = candidates[0]
@@ -6363,10 +6417,9 @@ def central_build_and_distribute(
                         jars = [path for path in jars if path == ready_root or ready_root in path.parents]
                         jars = [path for path in jars if context_path == path.parent or context_path in path.parents]
                         if jars:
-                            jar = next(
-                                (path for path in jars if "ruoyi-admin" in path.as_posix().lower()),
-                                max(jars, key=lambda path: (path.stat().st_size, path.as_posix())),
-                            )
+                            jar = _select_runnable_jar(jars)
+                            if jar is None or not _executable_jar_score(jar)[0]:
+                                continue
                             java_images = re.findall(
                                 r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]*(?:temurin|openjdk|corretto|java)[^\s]*)",
                                 original_text,
@@ -6453,6 +6506,7 @@ def central_build_and_distribute(
                             len(candidate.relative_to(source_root).parts),
                         ),
                     )
+                    module_match = None
                     for candidate in ranked_dockerfiles:
                         candidate_text = candidate.read_text(encoding="utf-8", errors="ignore")
                         image_match = re.search(
@@ -6461,15 +6515,26 @@ def central_build_and_distribute(
                         )
                         if image_match:
                             maven_image = image_match.group(1)
+                        module_match = re.search(
+                            r"(?im)^\s*RUN\s+[^\n]*?\bmvn\b[^\n]*?\s-f\s+([\"']?)([^\s\"'\\]+pom[^\s\"'\\]*\.xml)\1",
+                            candidate_text,
+                        )
+                        if module_match:
                             break
+                    module_pom = module_match.group(2) if module_match else ""
+                    if module_pom and not (pom.parent / module_pom).is_file():
+                        real_pom = Path(module_pom).parent / "pom.xml"
+                        module_pom = real_pom.as_posix() if (pom.parent / real_pom).is_file() else ""
+                    module_arg = f"-f {shlex.quote(module_pom)} " if module_pom else ""
                     command = (
                         f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                         f"-v {shlex.quote(str(pom.parent))}:/workspace "
                         f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
                         f"-w /workspace {shlex.quote(maven_image)} sh -lc "
-                        + shlex.quote("mvn -B -DskipTests package")
+                        + shlex.quote(f"mvn -B {module_arg}-DskipTests package")
                     )
-                    log(deployment.id, f"[平台构建] {maven_image}：{relative}，与前端并发构建并写入 {cache_root}/maven。\n")
+                    build_scope = module_pom or relative
+                    log(deployment.id, f"[平台构建] {maven_image}：{build_scope}，与前端并发构建并写入 {cache_root}/maven。\n")
                     maven_code, maven_output = tracked_run(
                         maven_ssh, deployment.id, command, stream=stream, timeout=1800,
                         pid_prefix=f"yunzhou-maven-build-{pom_index}",
@@ -6478,9 +6543,57 @@ def central_build_and_distribute(
                     if maven_code:
                         log(deployment.id, f"[平台构建] Maven 外置编译未完成，保留原始方案继续诊断：{maven_output[-800:]}\n")
                     else:
+                        artifact_root = (pom.parent / Path(module_pom).parent) if module_pom else pom.parent
+                        built_jars = [
+                            path for path in artifact_root.rglob("target/*.jar")
+                            if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
+                        ]
+                        boot_version = detect_spring_boot_version(str(pom.parent))
+                        if (
+                            built_jars
+                            and not any(_executable_jar_score(path)[0] for path in built_jars)
+                            and boot_version
+                            and module_pom
+                        ):
+                            # Some integrated Maven/SPA repositories copy a
+                            # sibling frontend's dist directory during the
+                            # backend resources phase.  The two toolchains are
+                            # compiled concurrently, so wait briefly for that
+                            # already-running frontend build before the final
+                            # package+repackage lifecycle.  This is not a
+                            # second frontend build.
+                            sibling_frontends = [
+                                package.parent for package in node_manifests
+                                if package.parent != artifact_root
+                                and package.parent.parent in {pom.parent, artifact_root.parent}
+                            ]
+                            for frontend_root in sibling_frontends:
+                                for _ in range(240):
+                                    if any((frontend_root / name).is_dir() for name in ("dist", "build", "out")):
+                                        break
+                                    time.sleep(0.25)
+                            repackage = (
+                                f"mvn -B -f {shlex.quote(module_pom)} "
+                                "-DskipTests package "
+                                f"org.springframework.boot:spring-boot-maven-plugin:{shlex.quote(boot_version)}:repackage "
+                            )
+                            repackage_command = (
+                                f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                                f"-v {shlex.quote(str(pom.parent))}:/workspace "
+                                f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                                f"-w /workspace {shlex.quote(maven_image)} sh -lc {shlex.quote(repackage)}"
+                            )
+                            log(deployment.id, f"[平台构建] 普通 JAR 按 Spring Boot {boot_version} 自动重打包并校验。\n")
+                            repack_code, repack_output = tracked_run(
+                                maven_ssh, deployment.id, repackage_command, stream=stream, timeout=900,
+                                pid_prefix=f"yunzhou-maven-repackage-{pom_index}",
+                                stream_channel="api", stream_label="后端 API",
+                            )
+                            if repack_code:
+                                log(deployment.id, f"[平台构建] Spring Boot 重打包失败，保留原始方案继续诊断：{repack_output[-800:]}\n")
                         completed.add(str(pom.parent.resolve()))
                         log(deployment.id, f"[平台构建] Maven 已使用公共缓存 {maven_cache_dir} 生成 JAR：{relative}。\n")
-                        eager_package_ready_service("api", pom.parent)
+                        eager_package_ready_service("api", artifact_root)
             return completed
 
         maven_executor = None
@@ -7135,6 +7248,18 @@ def central_build_and_distribute(
                     path for path in context.rglob("target/*.jar")
                     if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
                 ]
+                maven_file_match = re.search(
+                    r"(?im)^\s*RUN\s+[^\n]*?\bmvn\b[^\n]*?\s-f\s+([\"']?)([^\s\"'\\]+pom[^\s\"'\\]*\.xml)\1",
+                    docker_text,
+                )
+                maven_file = maven_file_match.group(2) if maven_file_match else ""
+                # A generated Dockerfile may create a temporary corrected POM
+                # inside a Docker stage.  It is unavailable to the host-side
+                # compiler, so fall back to the real module pom beside it.
+                if maven_file and not (context / maven_file).is_file():
+                    candidate = Path(maven_file).parent / "pom.xml"
+                    maven_file = candidate.as_posix() if (context / candidate).is_file() else ""
+                maven_file_arg = f"-f {shlex.quote(maven_file)} " if maven_file else ""
                 if pom.is_file() and runtime_jar_copy and not existing_context_jars:
                     java_version = detect_java_version(str(context))
                     maven_image = f"maven:3.9-eclipse-temurin-{java_version}"
@@ -7145,7 +7270,7 @@ def central_build_and_distribute(
                         f"-v {shlex.quote(context_key)}:/workspace "
                         f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
                         f"-w /workspace {shlex.quote(maven_image)} "
-                        f"mvn {settings_arg}-B package -DskipTests"
+                        f"mvn {settings_arg}-B {maven_file_arg}package -DskipTests"
                     )
                     log(
                         deployment.id,
@@ -7174,6 +7299,35 @@ def central_build_and_distribute(
                                 backup.replace(platform_file)
                     if code:
                         raise RuntimeError("Maven 前置产物构建失败：" + output[-2000:])
+                    built_jars = [
+                        path for path in context.rglob("target/*.jar")
+                        if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
+                    ]
+                    if built_jars and not any(_executable_jar_score(path)[0] for path in built_jars):
+                        boot_version = detect_spring_boot_version(str(context))
+                        if boot_version and maven_file:
+                            repackage_command = (
+                                f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                                f"-v {shlex.quote(context_key)}:/workspace "
+                                f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                                f"-w /workspace {shlex.quote(maven_image)} "
+                                f"mvn {settings_arg}-B -f {shlex.quote(maven_file)} "
+                                f"org.springframework.boot:spring-boot-maven-plugin:{shlex.quote(boot_version)}:repackage "
+                                "-DskipTests"
+                            )
+                            log(deployment.id, f"[平台构建] 普通 JAR 按 Spring Boot {boot_version} 自动重打包。\n")
+                            repack_code, repack_output = tracked_run(
+                                build_ssh, deployment.id, repackage_command, stream=stream, timeout=900,
+                                pid_prefix="yunzhou-maven-repackage", stream_channel="api", stream_label="后端 API",
+                            )
+                            if repack_code:
+                                raise RuntimeError("Spring Boot JAR 重打包失败：" + repack_output[-2000:])
+                            built_jars = [
+                                path for path in context.rglob("target/*.jar")
+                                if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
+                            ]
+                            if not any(_executable_jar_score(path)[0] for path in built_jars):
+                                raise RuntimeError("Spring Boot 重打包完成，但仍未生成带 Main-Class 的可执行 JAR")
                     maven_built_contexts.add(context_key)
 
                 maven_match = re.search(r"(?im)^FROM\s+(maven:[^\s]+)", docker_text)
@@ -7184,13 +7338,46 @@ def central_build_and_distribute(
                             f"-v {shlex.quote(context_key)}:/workspace "
                             f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
                             f"-w /workspace {shlex.quote(maven_match.group(1))} "
-                            "mvn -B package -DskipTests"
+                            f"mvn -B {maven_file_arg}package -DskipTests"
                         )
-                        log(deployment.id, f"[平台构建] Maven 正式构建：{maven_match.group(1)}。\n")
+                        build_scope = maven_file or "根工程"
+                        log(deployment.id, f"[平台构建] Maven 正式构建：{maven_match.group(1)}，范围 {build_scope}。\n")
                         code, output = tracked_run(build_ssh, deployment.id, command, stream=stream, timeout=1800,
                                                    pid_prefix="yunzhou-maven-build", stream_channel="api", stream_label="后端 API")
                         if code:
                             raise RuntimeError("Maven 公共缓存构建失败：" + output[-2000:])
+                        built_jars = [
+                            path for path in context.rglob("target/*.jar")
+                            if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
+                        ]
+                        if built_jars and not any(_executable_jar_score(path)[0] for path in built_jars):
+                            boot_version = detect_spring_boot_version(str(context))
+                            if boot_version and maven_file:
+                                repackage_command = (
+                                    f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
+                                    f"-v {shlex.quote(context_key)}:/workspace "
+                                    f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                                    f"-w /workspace {shlex.quote(maven_match.group(1))} "
+                                    f"mvn -B -f {shlex.quote(maven_file)} "
+                                    f"org.springframework.boot:spring-boot-maven-plugin:{shlex.quote(boot_version)}:repackage "
+                                    "-DskipTests"
+                                )
+                                log(
+                                    deployment.id,
+                                    f"[平台构建] 检测到普通 Spring Boot JAR，按源码版本 {boot_version} 自动重打包并校验启动清单。\n",
+                                )
+                                repack_code, repack_output = tracked_run(
+                                    build_ssh, deployment.id, repackage_command, stream=stream, timeout=900,
+                                    pid_prefix="yunzhou-maven-repackage", stream_channel="api", stream_label="后端 API",
+                                )
+                                if repack_code:
+                                    raise RuntimeError("Spring Boot JAR 重打包失败：" + repack_output[-2000:])
+                                built_jars = [
+                                    path for path in context.rglob("target/*.jar")
+                                    if path.is_file() and not path.name.startswith(("original-", "sources-", "javadoc-"))
+                                ]
+                                if not any(_executable_jar_score(path)[0] for path in built_jars):
+                                    raise RuntimeError("Spring Boot 重打包完成，但仍未生成带 Main-Class 的可执行 JAR")
                         maven_built_contexts.add(context_key)
                     else:
                         log(deployment.id, "[平台构建] Maven JAR 已生成，跳过重复 package。\n")
@@ -7679,13 +7866,9 @@ def central_build_and_distribute(
                     usable_jars = context_jars or [
                         path for path in backend_artifacts if Path(work) in path.parents
                     ]
-                    selected_jar = max(
-                        usable_jars,
-                        key=lambda path: (
-                            "admin" in path.name.lower() or "app" in path.name.lower(),
-                            path.stat().st_size,
-                        ),
-                    )
+                    selected_jar = _select_runnable_jar(usable_jars)
+                    if selected_jar is None or not _executable_jar_score(selected_jar)[0]:
+                        continue
                     if context not in selected_jar.parents:
                         # A faulty AI plan may point the backend service at the
                         # frontend directory.  Re-anchor the generated runtime
