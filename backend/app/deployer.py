@@ -4726,18 +4726,26 @@ server {{
     legacy_files = [f"/data/yunzhou-control/data/gateway/conf.d/{item_id}.conf" for item_id in legacy_ids]
     with SSHNode(gateway) as ssh:
         cert_commands = ""
+        cert_restore = ""
+        cert_cleanup = ""
         if https_enabled:
             cert64 = base64.b64encode(certificate.encode()).decode()
             key64 = base64.b64encode(private_key.encode()).decode()
             cert_path = f"/data/yunzhou-control/data/gateway/certs/{service_key}.crt"
             key_path = f"/data/yunzhou-control/data/gateway/certs/{service_key}.key"
             cert_commands = (
+                f"cp {cert_path} {cert_path}.bak 2>/dev/null || true; cp {key_path} {key_path}.bak 2>/dev/null || true; "
                 f"printf %s {shlex.quote(cert64)} | base64 -d > {cert_path}.tmp; "
                 f"printf %s {shlex.quote(key64)} | base64 -d > {key_path}.tmp; chmod 600 {key_path}.tmp; "
                 f"openssl x509 -in {cert_path}.tmp -noout >/dev/null && openssl pkey -in {key_path}.tmp -noout >/dev/null && "
                 f"test \"$(openssl x509 -in {cert_path}.tmp -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum | cut -d' ' -f1)\" = \"$(openssl pkey -in {key_path}.tmp -pubout -outform DER | sha256sum | cut -d' ' -f1)\" || exit 42; "
                 f"mv {cert_path}.tmp {cert_path}; mv {key_path}.tmp {key_path}; "
             )
+            cert_restore = (
+                f"if test -f {cert_path}.bak; then mv {cert_path}.bak {cert_path}; else rm -f {cert_path}; fi; "
+                f"if test -f {key_path}.bak; then mv {key_path}.bak {key_path}; else rm -f {key_path}; fi; "
+            )
+            cert_cleanup = f"rm -f {cert_path}.bak {key_path}.bak; "
         hide_legacy = " ".join(
             f"[ ! -f {shlex.quote(path)} ] || mv {shlex.quote(path)} {shlex.quote(path + '.service-bak')};"
             for path in legacy_files
@@ -4760,7 +4768,7 @@ server {{
             "-v /data/yunzhou-control/data/gateway/conf.d:/etc/nginx/conf.d:ro -v /data/yunzhou-control/data/gateway/certs:/etc/nginx/certs:ro nginx:1.30.6-alpine >/dev/null; fi; "
             "if ! docker exec yunzhou-platform-gateway nginx -t; then "
             f"test -f {shlex.quote(filename)}.bak && mv {shlex.quote(filename)}.bak {shlex.quote(filename)} || rm -f {shlex.quote(filename)}; "
-            + restore_legacy + " exit 43; fi; "
+            + cert_restore + restore_legacy + " exit 43; fi; "
             + remove_legacy_backups +
             "docker exec yunzhou-platform-gateway nginx -s reload"
         )
@@ -4773,11 +4781,12 @@ server {{
         if code:
             ssh.run(
                 f"test -f {shlex.quote(filename)}.bak && mv {shlex.quote(filename)}.bak {shlex.quote(filename)} || rm -f {shlex.quote(filename)}; "
+                + cert_restore +
                 "docker exec yunzhou-platform-gateway nginx -t && docker exec yunzhou-platform-gateway nginx -s reload",
                 timeout=30,
             )
             raise RuntimeError("平台网关映射后无法访问源站：" + output)
-        ssh.run(f"rm -f {shlex.quote(filename)}.bak", timeout=15)
+        ssh.run(f"rm -f {shlex.quote(filename)}.bak; " + cert_cleanup, timeout=15)
     gateway_reservation = db.scalar(select(DeploymentPortReservation).where(
         DeploymentPortReservation.node_id == gateway.id,
         DeploymentPortReservation.host_port == gateway_port,

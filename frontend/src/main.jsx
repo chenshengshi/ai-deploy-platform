@@ -8131,6 +8131,8 @@ function CertificateSettings({ notify }) {
   const [privateKey, setPrivateKey] = useState(null);
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState(null);
+  const [updating, setUpdating] = useState(null);
+  const [uploadKey, setUploadKey] = useState(0);
   const load = () => {
     setItems(null);
     api("/certificates")
@@ -8145,10 +8147,12 @@ function CertificateSettings({ notify }) {
       const body = new FormData();
       body.append("certificate", certificate);
       body.append("private_key", privateKey);
-      await api("/certificates", { method: "POST", body });
+      await api(updating ? `/certificates/${updating.id}` : "/certificates", { method: updating ? "PUT" : "POST", body });
       setCertificate(null);
       setPrivateKey(null);
-      notify("证书已加入共享证书库，匹配的子域名将自动复用");
+      setUploadKey((value) => value + 1);
+      notify(updating ? `证书已更新，并同步应用到 ${updating.references || 0} 个项目` : "证书已加入共享证书库，匹配的子域名将自动复用");
+      setUpdating(null);
       load();
     } catch (e) {
       notify(e.message, "error");
@@ -8183,11 +8187,14 @@ function CertificateSettings({ notify }) {
       <div className="panel certificate-upload-panel">
         <div>
           <KeyRound />
-          <div><h3>添加证书</h3><p>上传 PEM/CRT 证书与对应私钥，平台会校验域名、有效期和密钥。</p></div>
+          <div><h3>{updating ? `更新证书 · ${updating.name}` : "添加证书"}</h3><p>{updating ? "证书 ID 与项目引用保持不变；校验或网关重载失败会继续使用旧证书。" : "上传 PEM/CRT 证书与对应私钥，平台会校验域名、有效期和密钥。"}</p></div>
         </div>
-        <label className="compact-file-field"><span>证书文件</span><input type="file" accept=".pem,.crt,.cer" onChange={(e) => setCertificate(e.target.files?.[0] || null)} /></label>
-        <label className="compact-file-field"><span>私钥文件</span><input type="file" accept=".key,.pem" onChange={(e) => setPrivateKey(e.target.files?.[0] || null)} /></label>
-        <button className="primary" disabled={busy || !certificate || !privateKey} onClick={upload}>{busy ? <LoaderCircle className="spin" /> : <Upload />}加入证书库</button>
+        <label className="compact-file-field"><span>证书文件</span><input key={`cert-${uploadKey}`} type="file" accept=".pem,.crt,.cer" onChange={(e) => setCertificate(e.target.files?.[0] || null)} /></label>
+        <label className="compact-file-field"><span>私钥文件</span><input key={`key-${uploadKey}`} type="file" accept=".key,.pem" onChange={(e) => setPrivateKey(e.target.files?.[0] || null)} /></label>
+        <div className="certificate-upload-actions">
+          {updating && <button className="ghost" disabled={busy} onClick={() => { setUpdating(null); setCertificate(null); setPrivateKey(null); setUploadKey((value) => value + 1); }}>取消</button>}
+          <button className="primary" disabled={busy || !certificate || !privateKey} onClick={upload}>{busy ? <LoaderCircle className="spin" /> : updating ? <RefreshCw /> : <Upload />}{updating ? "更新并应用" : "加入证书库"}</button>
+        </div>
       </div>
       {items === null ? (
         <div className="center"><LoaderCircle className="spin" /></div>
@@ -8197,14 +8204,17 @@ function CertificateSettings({ notify }) {
             <div className="panel certificate-settings-card" key={x.id}>
               <div className="certificate-card-icon"><ShieldCheck /></div>
               <div className="certificate-card-main">
-                <div className="certificate-card-title"><h3>{x.name}</h3><span className="badge success"><i />有效</span></div>
+                <div className="certificate-card-title"><h3>{x.name}</h3><span className={`badge ${x.status === "expired" ? "danger" : x.status === "expiring" ? "warning" : "success"}`}><i />{x.status === "expired" ? "已过期" : x.status === "expiring" ? `${x.days_left} 天后到期` : "有效"}</span></div>
                 <p title={x.domains.join("、")}>{x.domains.join("、")}</p>
                 <div className="certificate-card-meta">
                   <span>有效期至 <b>{time(x.expires_at)}</b></span>
                   <span>项目引用 <b>{x.references}</b></span>
                 </div>
               </div>
-              <button className="danger-button icon-only" disabled={busy || x.references > 0} title={x.references > 0 ? "证书正在被项目使用，不能删除" : "删除证书"} onClick={() => setDeleting(x)}><Trash2 /></button>
+              <div className="certificate-card-actions">
+                <button className="ghost icon-only" disabled={busy} title="更新证书" onClick={() => { setUpdating(x); setCertificate(null); setPrivateKey(null); setUploadKey((value) => value + 1); window.scrollTo({ top: 0, behavior: "smooth" }); }}><RefreshCw /></button>
+                <button className="danger-button icon-only" disabled={busy || x.references > 0} title={x.references > 0 ? "证书正在被项目使用，不能删除" : "删除证书"} onClick={() => setDeleting(x)}><Trash2 /></button>
+              </div>
             </div>
           ))}
         </div>

@@ -2560,16 +2560,25 @@ def _domain_matches_pattern(domain: str, pattern: str) -> bool:
 def _certificate_view(item: CertificateStore, db: Session | None = None) -> dict:
     domains = json.loads(item.domains_json or "[]")
     references = 0 if db is None else int(db.scalar(select(func.count()).select_from(ProjectDomainConfig).where(ProjectDomainConfig.certificate_id == item.id)) or 0)
-    return {"id": item.id, "name": item.name, "domains": domains, "expires_at": item.expires_at.isoformat(), "fingerprint": item.fingerprint, "references": references}
+    days_left = max(0, int((item.expires_at - datetime.now(timezone.utc)).total_seconds() // 86400))
+    status = "expired" if item.expires_at <= datetime.now(timezone.utc) else ("expiring" if days_left <= 30 else "valid")
+    return {"id": item.id, "name": item.name, "domains": domains, "expires_at": item.expires_at.isoformat(), "fingerprint": item.fingerprint, "references": references, "days_left": days_left, "status": status}
 
 
-def _save_shared_certificate(db: Session, name: str, certificate_pem: str, private_key_pem: str) -> CertificateStore:
+def _validated_certificate_material(certificate_pem: str, private_key_pem: str) -> tuple[x509.Certificate, list[str], str]:
     cert, domains, fingerprint = _certificate_metadata(certificate_pem)
+    if cert.not_valid_after_utc <= datetime.now(timezone.utc):
+        raise HTTPException(400, "SSL 证书已经过期，请上传新的有效证书")
     private_key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
     cert_public = cert.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
     key_public = private_key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
     if cert_public != key_public:
         raise HTTPException(400, "SSL 证书与私钥不匹配")
+    return cert, domains, fingerprint
+
+
+def _save_shared_certificate(db: Session, name: str, certificate_pem: str, private_key_pem: str) -> CertificateStore:
+    cert, domains, fingerprint = _validated_certificate_material(certificate_pem, private_key_pem)
     item = db.scalar(select(CertificateStore).where(CertificateStore.fingerprint == fingerprint))
     if not item:
         item = CertificateStore(fingerprint=fingerprint, name=name or domains[0])
@@ -2612,6 +2621,104 @@ async def upload_certificate(certificate: UploadFile = File(...), private_key: U
     except Exception:
         raise HTTPException(400, "证书或私钥无法解析，请上传有效的 PEM 文件")
     audit(db, user, "upload_certificate", "certificate", item.id, f"domains={item.domains_json}")
+    db.commit()
+    return _certificate_view(item, db)
+
+
+@app.put("/api/certificates/{certificate_id}")
+async def update_certificate(
+    certificate_id: str,
+    certificate: UploadFile = File(...),
+    private_key: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(require(Role.admin, Role.deployer)),
+):
+    item = db.get(CertificateStore, certificate_id)
+    if not item:
+        raise HTTPException(404, "证书不存在")
+    cert_raw, key_raw = await certificate.read(), await private_key.read()
+    if len(cert_raw) > 2_000_000 or len(key_raw) > 2_000_000:
+        raise HTTPException(400, "证书或私钥不能超过 2 MB")
+    try:
+        cert_text, key_text = cert_raw.decode(), key_raw.decode()
+        cert, domains, fingerprint = _validated_certificate_material(cert_text, key_text)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "证书或私钥无法解析，请上传有效的 PEM 文件")
+    duplicate = db.scalar(select(CertificateStore).where(
+        CertificateStore.fingerprint == fingerprint,
+        CertificateStore.id != certificate_id,
+    ))
+    if duplicate:
+        raise HTTPException(409, f"该证书已存在于证书库：{duplicate.name}")
+    configs = db.scalars(select(ProjectDomainConfig).where(ProjectDomainConfig.certificate_id == certificate_id)).all()
+    projects = {project.id: project for project in db.scalars(select(Project).where(Project.id.in_([value.project_id for value in configs]))).all()} if configs else {}
+    uncovered = [
+        projects[config.project_id].domain for config in configs
+        if projects.get(config.project_id) and projects[config.project_id].domain
+        and not any(_domain_matches_pattern(projects[config.project_id].domain, pattern) for pattern in domains)
+    ]
+    if uncovered:
+        raise HTTPException(400, "新证书不包含正在使用的域名：" + "、".join(sorted(set(uncovered))))
+
+    old_cert, old_key = decrypt(item.certificate_encrypted), decrypt(item.private_key_encrypted)
+    old_item = (item.name, item.domains_json, item.fingerprint, item.certificate_encrypted, item.private_key_encrypted, item.expires_at)
+    old_configs = {
+        config.project_id: (config.certificate_name, config.certificate_encrypted, config.private_key_encrypted)
+        for config in configs
+    }
+    processed: list[tuple[Project, ProjectDomainConfig, Deployment, Node, list[dict], list[tuple[str, int]]]] = []
+    try:
+        item.name = certificate.filename or item.name
+        item.domains_json = json.dumps(domains, ensure_ascii=False)
+        item.fingerprint = fingerprint
+        item.certificate_encrypted = encrypt(cert_text)
+        item.private_key_encrypted = encrypt(key_text)
+        item.expires_at = cert.not_valid_after_utc
+        for config in configs:
+            project = projects.get(config.project_id)
+            if not project:
+                continue
+            config.certificate_name = item.name
+            config.certificate_encrypted = encrypt(cert_text)
+            config.private_key_encrypted = encrypt(key_text)
+            latest = db.scalar(select(Deployment).where(
+                Deployment.project_id == project.id,
+                Deployment.status == DeployStatus.success,
+                Deployment.host_port.is_not(None),
+            ).order_by(desc(Deployment.created_at)).limit(1))
+            node = db.get(Node, latest.node_id) if latest else None
+            if not latest or not node or not config.https_enabled or not project.domain:
+                continue
+            groups = _runtime_service_gateway_routes(db, project, latest, node)
+            targets = _existing_project_gateway_targets(db, project.id) or _project_gateway_targets(db, latest, node)
+            latest.access_url = configure_platform_gateway(
+                db, latest, node, latest.host_port, project.domain,
+                http_port=config.http_port, https_enabled=True, https_port=config.https_port,
+                redirect_https=config.redirect_https, certificate=cert_text, private_key=key_text,
+                upstreams=targets, route_groups=groups or None, strategy=project.load_balance_strategy,
+            )
+            processed.append((project, config, latest, node, groups, targets))
+    except Exception as exc:
+        item.name, item.domains_json, item.fingerprint, item.certificate_encrypted, item.private_key_encrypted, item.expires_at = old_item
+        for config in configs:
+            old_config = old_configs[config.project_id]
+            config.certificate_name, config.certificate_encrypted, config.private_key_encrypted = old_config
+        db.flush()
+        for project, config, latest, node, groups, targets in reversed(processed):
+            try:
+                configure_platform_gateway(
+                    db, latest, node, latest.host_port, project.domain,
+                    http_port=config.http_port, https_enabled=True, https_port=config.https_port,
+                    redirect_https=config.redirect_https, certificate=old_cert, private_key=old_key,
+                    upstreams=targets, route_groups=groups or None, strategy=project.load_balance_strategy,
+                )
+            except Exception:
+                pass
+        db.rollback()
+        raise HTTPException(502, f"新证书未能应用，已保留旧证书：{str(exc)[:240]}")
+    audit(db, user, "update_certificate", "certificate", item.id, f"name={old_item[0]}->{item.name}; references={len(configs)}")
     db.commit()
     return _certificate_view(item, db)
 
