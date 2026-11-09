@@ -47,6 +47,12 @@ PLATFORM_NGINX_IMAGE = "nginx:1.30.3-alpine"
 PLATFORM_REDIS_IMAGE = "redis:7.4-alpine"
 PLATFORM_MYSQL_IMAGE = "mysql:8.4"
 PLATFORM_POSTGRES_IMAGE = "postgres:16"
+PLATFORM_NODE_BUILD_IMAGE = "node:22-bookworm-slim"
+PLATFORM_NODE_RUNTIME_IMAGE = "node:22-bookworm-slim"
+PLATFORM_IMAGE_VARIABLES = {
+    "YUNZHOU_NODE_BUILD_IMAGE": PLATFORM_NODE_BUILD_IMAGE,
+    "YUNZHOU_NODE_RUNTIME_IMAGE": PLATFORM_NODE_RUNTIME_IMAGE,
+}
 
 
 def enforce_nginx_pid_compatibility(dockerfile_text: str) -> str:
@@ -2834,6 +2840,17 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
         raise RuntimeError("AI 返回的部署方案缺少架构结论或部署类型")
     dockerfile_text = strip_generated_code_fence(plan.get("dockerfile") or "")
     compose_text = strip_generated_code_fence(plan.get("compose_yaml") or "")
+    resolved_platform_images = []
+    for variable, image in PLATFORM_IMAGE_VARIABLES.items():
+        pattern = rf"\$\{{{re.escape(variable)}(?::(?:-|\?)[^}}]*)?\}}"
+        updated = re.sub(pattern, image, compose_text)
+        if updated != compose_text:
+            resolved_platform_images.append(f"{variable}={image}")
+            compose_text = updated
+    if resolved_platform_images:
+        plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + [
+            "已使用平台推荐的固定 Node 镜像：" + "、".join(resolved_platform_images)
+        ]
     # Some models put a complete Compose document in the `dockerfile` JSON
     # property. Recover it when possible instead of sending YAML to Docker.
     if dockerfile_text and not valid_generated_dockerfile(dockerfile_text):
