@@ -5683,7 +5683,7 @@ def _route_groups_for_services(project: Project, service_targets: dict[str, list
                 "path": path,
                 "strip_prefix": bool(route.get("strip_prefix", False)),
             })
-    if default_service in service_targets:
+    if default_service in service_targets and default_service not in paths_by_service:
         paths_by_service.setdefault(default_service, []).append({"path": "/", "strip_prefix": False})
     # Compatibility fallback for analyses created before traffic_routes was
     # introduced.  Reuse only paths recorded by source analysis.  A missing

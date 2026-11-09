@@ -908,6 +908,65 @@ def detect_frontend_api_routes(path: str) -> dict:
     }
 
 
+def detect_frontend_public_base(path: str) -> dict:
+    """Detect a non-root frontend mount from production source evidence.
+
+    API prefixes and the frontend mount are different contracts.  A project
+    can request ``/app/api/v1`` while its static SPA itself must be served from
+    ``/app/``.  Only production dotenv/config evidence is accepted here; no
+    project-wide default is invented.
+    """
+    root = Path(path)
+    ignored = {".git", "node_modules", "target", "dist", "build", ".venv", "vendor"}
+    candidates: dict[str, dict] = {}
+
+    def add(value: str, score: int, source: str) -> None:
+        raw = str(value or "").strip().strip("'\"").split("?", 1)[0].split("#", 1)[0]
+        if not raw.startswith("/") or raw == "/":
+            return
+        normalized = "/" + raw.strip("/") + "/"
+        row = candidates.setdefault(normalized, {"path": normalized, "score": score, "evidence": []})
+        row["score"] = max(int(row["score"]), score)
+        if source not in row["evidence"]:
+            row["evidence"].append(source)
+
+    env_pattern = re.compile(
+        r"(?m)^\s*(?:VITE_APP_BASE|BASE_URL|PUBLIC_URL|VUE_APP_PUBLIC_PATH)\s*=\s*([^\r\n#]+)"
+    )
+    for env_file in root.rglob(".env*"):
+        if not env_file.is_file() or any(part in ignored for part in env_file.relative_to(root).parts):
+            continue
+        name = env_file.name.lower()
+        if "production" not in name and name not in {".env", ".env.local"}:
+            continue
+        relative = env_file.relative_to(root).as_posix()
+        text_value = env_file.read_text(encoding="utf-8", errors="replace")
+        for match in env_pattern.finditer(text_value):
+            add(match.group(1), 120 if "production" in name else 95, relative)
+
+    # A production Nginx static location corroborates the dotenv value.  It is
+    # deliberately not sufficient on its own because many repositories retain
+    # obsolete deployment examples beside the current application.
+    for config_file in root.rglob("*.conf"):
+        if not config_file.is_file() or any(part in ignored for part in config_file.relative_to(root).parts):
+            continue
+        relative = config_file.relative_to(root).as_posix()
+        text_value = config_file.read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r"location\s+(?:\^~\s+|=\s+)?(?P<path>/[^\s{]+)\s*\{(?P<body>[^{}]*)\}", text_value, re.I | re.S):
+            body = match.group("body")
+            if "proxy_pass" not in body and re.search(r"\b(?:root|alias|try_files)\b", body):
+                add(match.group("path"), 70, relative)
+
+    if not candidates:
+        return {"primary_path": "/", "evidence": []}
+    selected = max(candidates.values(), key=lambda row: (int(row["score"]), len(row["evidence"])))
+    # Require production environment evidence. This prevents an old Nginx
+    # sample from moving an otherwise root-hosted application unexpectedly.
+    if not any(".env" in source for source in selected["evidence"]):
+        return {"primary_path": "/", "evidence": []}
+    return {"primary_path": selected["path"], "evidence": list(selected["evidence"])}
+
+
 def optimize_staged_sources(path: str) -> list[str]:
     """Rewrite only the isolated release copy so nested build files use reachable mirrors."""
     root = Path(path)
@@ -2714,8 +2773,35 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
     """Validate and materialize an AI plan without allowing host-level escape hatches."""
     root = Path(path).resolve()
     detected_api = detect_frontend_api_routes(path)
+    detected_frontend_base = detect_frontend_public_base(path)
+    frontend_base = str(detected_frontend_base.get("primary_path") or "/")
     managed_api_prefix = str(detected_api.get("primary_path") or "")
     traffic_plan = plan.get("traffic_plan") if isinstance(plan.get("traffic_plan"), dict) else {}
+    if traffic_plan and frontend_base != "/":
+        roles = {
+            str(row.get("service") or ""): str(row.get("role") or "").lower()
+            for row in (traffic_plan.get("service_roles") or [])
+            if isinstance(row, dict)
+        }
+        frontend_service = next((name for name, role in roles.items() if role == "frontend"), "")
+        frontend_service = frontend_service or str(traffic_plan.get("default_service") or traffic_plan.get("entry_service") or "")
+        routes = [dict(row) for row in (traffic_plan.get("traffic_routes") or traffic_plan.get("routes") or []) if isinstance(row, dict)]
+        changed = False
+        for route in routes:
+            if str(route.get("service") or "") == frontend_service and str(route.get("path") or "/") == "/":
+                route["path"] = frontend_base
+                route["strip_prefix"] = True
+                changed = True
+        if frontend_service and not any(str(row.get("service") or "") == frontend_service for row in routes):
+            routes.append({"path": frontend_base, "service": frontend_service, "strip_prefix": True})
+            changed = True
+        if changed:
+            traffic_plan["traffic_routes"] = routes
+            plan["traffic_plan"] = traffic_plan
+            plan["access_path"] = frontend_base
+            plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + [
+                f"依据生产配置保留前端子路径 {frontend_base}（{'、'.join(detected_frontend_base.get('evidence') or [])}）"
+            ]
     # The AI plan is advisory; effective production source is authoritative.
     # Reconcile the route again at materialization time so a stale analysis or
     # contradictory model answer cannot generate a broken gateway config.
@@ -2922,6 +3008,10 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
         # the highest dotenv priority.  Use the prefix detected from this
         # repository/traffic plan; never inject a platform-wide fixed path.
         build = service.get("build")
+        if frontend_base != "/" and isinstance(build, dict):
+            args = build.get("args")
+            if isinstance(args, dict) and "VITE_APP_BASE" in args:
+                args["VITE_APP_BASE"] = frontend_base
         if isinstance(build, dict) and isinstance(build.get("dockerfile_inline"), str):
             inline = normalize_inline_dockerfile(build["dockerfile_inline"])
             inline = optimize_node_dependency_layer(root, inline)
