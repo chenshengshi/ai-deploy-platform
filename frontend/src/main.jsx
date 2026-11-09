@@ -8217,9 +8217,13 @@ function CertificateSettings({ notify }) {
               <div className="certificate-card-main">
                 <div className="certificate-card-title"><h3>{x.name}</h3><span className={`badge ${x.status === "expired" ? "danger" : x.status === "expiring" ? "warning" : "success"}`}><i />{x.status === "expired" ? "已过期" : x.status === "expiring" ? `${x.days_left} 天后到期` : "有效"}</span></div>
                 <p title={x.domains.join("、")}>{x.domains.join("、")}</p>
+                <div className="certificate-use-badges">
+                  {x.references > 0 && <span className="certificate-use-badge active">使用中 · {x.references} 个项目</span>}
+                  {x.auto_selected && <span className="certificate-use-badge default">自动匹配</span>}
+                  {!x.references && !x.auto_selected && <span className="certificate-use-badge history">历史 / 备用</span>}
+                </div>
                 <div className="certificate-card-meta">
                   <span>有效期至 <b>{time(x.expires_at)}</b></span>
-                  <span>项目引用 <b>{x.references}</b></span>
                 </div>
               </div>
               <div className="certificate-card-actions">
@@ -8234,12 +8238,12 @@ function CertificateSettings({ notify }) {
       {overlap && <Modal title="发现同域名证书" onClose={() => setOverlap(null)}>
         <div className="confirm-body">
           <div className="confirm-icon"><RefreshCw /></div>
-          <div><h4>证书库已有 {overlap.candidate.name}</h4><p>覆盖域名：{overlap.candidate.domains.join("、")}。更新原证书会保留项目关联；另存为新证书不会改变现有项目。</p></div>
+          <div><h4>证书库已有 {overlap.candidate.name}</h4><p>覆盖域名：{overlap.candidate.domains.join("、")}。{overlap.candidate.references > 0 ? `当前有 ${overlap.candidate.references} 个项目正在使用；` : "当前没有项目引用；"}更新当前证书会保留项目关联，另存新版本不会改变现有项目。</p></div>
         </div>
         <div className="modal-actions">
           <button className="ghost" disabled={busy} onClick={() => setOverlap(null)}>取消</button>
-          <button className="ghost" disabled={busy} onClick={() => upload("add")}>另存为新证书</button>
-          <button className="primary" disabled={busy} onClick={() => upload("replace")}>{busy && <LoaderCircle className="spin" />}更新原证书</button>
+          <button className="ghost" disabled={busy} onClick={() => upload("add")}>另存新版本</button>
+          <button className="primary" disabled={busy} onClick={() => upload("replace")}>{busy && <LoaderCircle className="spin" />}更新当前证书</button>
         </div>
       </Modal>}
     </>

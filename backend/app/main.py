@@ -2557,12 +2557,12 @@ def _domain_matches_pattern(domain: str, pattern: str) -> bool:
     return domain == pattern or (pattern.startswith("*.") and domain.endswith(pattern[1:]) and domain.count(".") == pattern.count("."))
 
 
-def _certificate_view(item: CertificateStore, db: Session | None = None) -> dict:
+def _certificate_view(item: CertificateStore, db: Session | None = None, auto_selected: bool = False) -> dict:
     domains = json.loads(item.domains_json or "[]")
     references = 0 if db is None else int(db.scalar(select(func.count()).select_from(ProjectDomainConfig).where(ProjectDomainConfig.certificate_id == item.id)) or 0)
     days_left = max(0, int((item.expires_at - datetime.now(timezone.utc)).total_seconds() // 86400))
     status = "expired" if item.expires_at <= datetime.now(timezone.utc) else ("expiring" if days_left <= 30 else "valid")
-    return {"id": item.id, "name": item.name, "domains": domains, "expires_at": item.expires_at.isoformat(), "fingerprint": item.fingerprint, "references": references, "days_left": days_left, "status": status}
+    return {"id": item.id, "name": item.name, "domains": domains, "expires_at": item.expires_at.isoformat(), "fingerprint": item.fingerprint, "references": references, "days_left": days_left, "status": status, "auto_selected": auto_selected}
 
 
 def _validated_certificate_material(certificate_pem: str, private_key_pem: str) -> tuple[x509.Certificate, list[str], str]:
@@ -2606,7 +2606,15 @@ def _matching_certificates(db: Session, domain: str) -> list[CertificateStore]:
 @app.get("/api/certificates")
 def list_certificates(domain: str = "", db: Session = Depends(get_db), _: User = Depends(current_user)):
     items = _matching_certificates(db, domain.strip().lower()) if domain.strip() else db.scalars(select(CertificateStore).order_by(CertificateStore.expires_at.desc())).all()
-    return [_certificate_view(item, db) for item in items]
+    auto_selected_ids = set()
+    for item in items:
+        for pattern in json.loads(item.domains_json or "[]"):
+            probe = f"certificate-check{pattern[1:]}" if pattern.startswith("*.") else pattern
+            matches = _matching_certificates(db, probe)
+            if matches:
+                auto_selected_ids.add(matches[0].id)
+    views = [_certificate_view(item, db, item.id in auto_selected_ids) for item in items]
+    return sorted(views, key=lambda value: (not bool(value["references"]), not value["auto_selected"], -datetime.fromisoformat(value["expires_at"]).timestamp()))
 
 
 @app.post("/api/certificates")
@@ -2635,9 +2643,10 @@ async def upload_certificate(
                 )
                 if overlaps:
                     exact_set = domain_set == {value.lower() for value in existing_domains}
-                    matches.append((0 if exact_set else 1, existing))
+                    references = int(db.scalar(select(func.count()).select_from(ProjectDomainConfig).where(ProjectDomainConfig.certificate_id == existing.id)) or 0)
+                    matches.append((0 if references else 1, 0 if exact_set else 1, -references, existing))
             if matches:
-                candidate = sorted(matches, key=lambda value: (value[0], -value[1].expires_at.timestamp()))[0][1]
+                candidate = sorted(matches, key=lambda value: (value[0], value[1], value[2], -value[3].expires_at.timestamp()))[0][3]
                 raise HTTPException(409, {
                     "code": "certificate_domain_overlap",
                     "message": "证书域名已存在，可更新原证书或另存为新证书",
