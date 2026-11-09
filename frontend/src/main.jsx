@@ -8132,6 +8132,7 @@ function CertificateSettings({ notify }) {
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState(null);
   const [updating, setUpdating] = useState(null);
+  const [overlap, setOverlap] = useState(null);
   const [uploadKey, setUploadKey] = useState(0);
   const load = () => {
     setItems(null);
@@ -8140,22 +8141,32 @@ function CertificateSettings({ notify }) {
       .catch((e) => { setItems([]); notify(e.message, "error"); });
   };
   useEffect(() => { load(); }, []);
-  const upload = async () => {
+  const upload = async (choice = "check") => {
     if (!certificate || !privateKey) return notify("请选择证书文件和对应私钥", "error");
     setBusy(true);
     try {
       const body = new FormData();
       body.append("certificate", certificate);
       body.append("private_key", privateKey);
-      await api(updating ? `/certificates/${updating.id}` : "/certificates", { method: updating ? "PUT" : "POST", body });
+      const target = updating || (choice === "replace" ? overlap?.candidate : null);
+      const path = target
+        ? `/certificates/${target.id}`
+        : `/certificates${choice === "add" ? "?allow_domain_overlap=true" : ""}`;
+      await api(path, { method: target ? "PUT" : "POST", body });
       setCertificate(null);
       setPrivateKey(null);
       setUploadKey((value) => value + 1);
-      notify(updating ? `证书已更新，并同步应用到 ${updating.references || 0} 个项目` : "证书已加入共享证书库，匹配的子域名将自动复用");
+      notify(target ? `证书已更新，并同步应用到 ${target.references || 0} 个项目` : "证书已加入共享证书库，匹配的子域名将自动复用");
       setUpdating(null);
+      setOverlap(null);
       load();
     } catch (e) {
-      notify(e.message, "error");
+      const detail = e.payload?.detail;
+      if (!updating && detail?.code === "certificate_domain_overlap" && detail.candidate) {
+        setOverlap(detail);
+      } else {
+        notify(e.message, "error");
+      }
     } finally {
       setBusy(false);
     }
@@ -8220,6 +8231,17 @@ function CertificateSettings({ notify }) {
         </div>
       ) : <Empty icon={KeyRound} text="证书库为空，上传第一份证书后项目可自动匹配" />}
       {deleting && <ConfirmDialog danger title="删除证书" text={`确定删除 ${deleting.name} 吗？此操作不会影响其他证书。`} confirmText="删除证书" onClose={() => setDeleting(null)} onConfirm={remove} />}
+      {overlap && <Modal title="发现同域名证书" onClose={() => setOverlap(null)}>
+        <div className="confirm-body">
+          <div className="confirm-icon"><RefreshCw /></div>
+          <div><h4>证书库已有 {overlap.candidate.name}</h4><p>覆盖域名：{overlap.candidate.domains.join("、")}。更新原证书会保留项目关联；另存为新证书不会改变现有项目。</p></div>
+        </div>
+        <div className="modal-actions">
+          <button className="ghost" disabled={busy} onClick={() => setOverlap(null)}>取消</button>
+          <button className="ghost" disabled={busy} onClick={() => upload("add")}>另存为新证书</button>
+          <button className="primary" disabled={busy} onClick={() => upload("replace")}>{busy && <LoaderCircle className="spin" />}更新原证书</button>
+        </div>
+      </Modal>}
     </>
   );
 }

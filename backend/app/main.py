@@ -2610,12 +2610,41 @@ def list_certificates(domain: str = "", db: Session = Depends(get_db), _: User =
 
 
 @app.post("/api/certificates")
-async def upload_certificate(certificate: UploadFile = File(...), private_key: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+async def upload_certificate(
+    certificate: UploadFile = File(...),
+    private_key: UploadFile = File(...),
+    allow_domain_overlap: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(require(Role.admin, Role.deployer)),
+):
     cert_raw, key_raw = await certificate.read(), await private_key.read()
     if len(cert_raw) > 2_000_000 or len(key_raw) > 2_000_000:
         raise HTTPException(400, "证书或私钥不能超过 2 MB")
     try:
-        item = _save_shared_certificate(db, certificate.filename or "SSL 证书", cert_raw.decode(), key_raw.decode())
+        cert_text, key_text = cert_raw.decode(), key_raw.decode()
+        _, domains, fingerprint = _validated_certificate_material(cert_text, key_text)
+        identical = db.scalar(select(CertificateStore).where(CertificateStore.fingerprint == fingerprint))
+        if not identical and not allow_domain_overlap:
+            domain_set = {value.lower() for value in domains}
+            matches = []
+            for existing in db.scalars(select(CertificateStore).order_by(CertificateStore.expires_at.desc())).all():
+                existing_domains = json.loads(existing.domains_json or "[]")
+                overlaps = any(
+                    _domain_matches_pattern(domain, pattern) or _domain_matches_pattern(pattern, domain)
+                    for domain in domains for pattern in existing_domains
+                )
+                if overlaps:
+                    exact_set = domain_set == {value.lower() for value in existing_domains}
+                    matches.append((0 if exact_set else 1, existing))
+            if matches:
+                candidate = sorted(matches, key=lambda value: (value[0], -value[1].expires_at.timestamp()))[0][1]
+                raise HTTPException(409, {
+                    "code": "certificate_domain_overlap",
+                    "message": "证书域名已存在，可更新原证书或另存为新证书",
+                    "candidate": _certificate_view(candidate, db),
+                    "matches": len(matches),
+                })
+        item = _save_shared_certificate(db, certificate.filename or "SSL 证书", cert_text, key_text)
     except HTTPException:
         raise
     except Exception:

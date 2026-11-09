@@ -25,8 +25,9 @@ export async function api(path, options = {}) {
       }
       if (!response.ok) {
         let detail = `请求失败 (${response.status})`
+        let payload = null
         try {
-          const payload = await response.json()
+          payload = await response.json()
           const raw = payload.detail
           if (Array.isArray(raw)) {
             detail = raw.map(item => item.msg || JSON.stringify(item)).join('；')
@@ -36,7 +37,10 @@ export async function api(path, options = {}) {
             detail = raw || detail
           }
         } catch {}
-        throw new Error(detail)
+        const error = new Error(detail)
+        error.status = response.status
+        error.payload = payload
+        throw error
       }
       return response.status === 204 ? null : response.json()
     } catch (error) {
