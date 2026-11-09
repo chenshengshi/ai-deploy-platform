@@ -263,7 +263,7 @@ const nav = [
 
 const modalStack = [];
 
-function Modal({ title, children, onClose, wide = false, className = "", closeOnMask = false, scrollRef = null, onScroll = null, headerActions = null }) {
+function Modal({ title, children, onClose, wide = false, drawer = false, className = "", closeOnMask = false, scrollRef = null, onScroll = null, headerActions = null }) {
   const box = useRef(null),
     scrollTop = useRef(0);
   const modalId = useRef(Symbol("modal"));
@@ -293,7 +293,7 @@ function Modal({ title, children, onClose, wide = false, className = "", closeOn
   return createPortal(
     (
     <div
-      className="modal-mask"
+      className={`modal-mask ${drawer ? "drawer-mask" : ""}`}
       onMouseDown={(e) => closeOnMask && e.target === e.currentTarget && onClose()}
     >
       <div
@@ -305,7 +305,7 @@ function Modal({ title, children, onClose, wide = false, className = "", closeOn
           scrollTop.current = e.currentTarget.scrollTop;
           onScroll?.(e);
         }}
-        className={`modal ${wide ? "wide" : ""} ${className}`.trim()}
+        className={`modal ${wide ? "wide" : ""} ${drawer ? "drawer" : ""} ${className}`.trim()}
         role="dialog"
         aria-modal="true"
       >
@@ -7777,7 +7777,7 @@ function UsersPage() {
   const [items, setItems] = useState([]),
     [show, setShow] = useState(false),
     [editing, setEditing] = useState(null),
-    [expandedUser, setExpandedUser] = useState(null),
+    [viewingUser, setViewingUser] = useState(null),
     [toast, setToast] = useState(null);
   const load = () => api("/users").then(setItems);
   const done = () => {
@@ -7842,11 +7842,11 @@ function UsersPage() {
                       className={"user-project-count " + (x.project_count ? "has-projects" : "")}
                       onClick={(event) => {
                         event.stopPropagation();
-                        setExpandedUser(expandedUser === x.id ? null : x.id);
+                        setViewingUser(x);
                       }}
                     >
                       {x.project_scope === "all" ? "全部" : `${x.project_count || 0} 个项目`}
-                      <ChevronRight className={expandedUser === x.id ? "expanded" : ""} />
+                      <ChevronRight />
                     </button>
                   </td>
                   <td>
@@ -7877,28 +7877,6 @@ function UsersPage() {
                     </button>
                   </td>
                 </tr>
-                {expandedUser === x.id && (
-                  <tr className="user-project-detail-row">
-                    <td colSpan="6">
-                      <div className="user-project-detail">
-                        <div className="user-project-detail-head">
-                          <b>{x.display_name || x.username} 可管理的项目</b>
-                          <span>{x.project_count || 0} 个</span>
-                        </div>
-                        {(x.projects || []).length ? (
-                          <div className="user-project-grid">
-                            {x.projects.map((project) => (
-                              <div key={project.id}>
-                                <span><b>{project.name}</b><small>{project.slug}</small></span>
-                                <em>{project.permission}</em>
-                              </div>
-                            ))}
-                          </div>
-                        ) : <div className="user-project-empty">暂未分配项目</div>}
-                      </div>
-                    </td>
-                  </tr>
-                )}
                 </React.Fragment>
               ))}
             </tbody>
@@ -7913,6 +7891,16 @@ function UsersPage() {
           onDone={done}
         />
       )}
+      {viewingUser && <Modal drawer closeOnMask title={`${viewingUser.display_name || viewingUser.username} · 可管理项目`} onClose={() => setViewingUser(null)}>
+        <div className="drawer-summary"><span>{viewingUser.project_scope === "all" ? "拥有全部项目权限" : `共 ${viewingUser.project_count || 0} 个项目`}</span><b>{roleText[viewingUser.role]}</b></div>
+        <div className="drawer-project-list">
+          {(viewingUser.projects || []).map((project) => <div key={project.id}>
+            <div><b>{project.name}</b><small>{project.slug}</small></div>
+            <em>{project.permission}</em>
+          </div>)}
+          {!(viewingUser.projects || []).length && <div className="drawer-project-empty">暂未分配项目</div>}
+        </div>
+      </Modal>}
     </>
   );
 }
@@ -8133,6 +8121,7 @@ function CertificateSettings({ notify }) {
   const [deleting, setDeleting] = useState(null);
   const [updating, setUpdating] = useState(null);
   const [overlap, setOverlap] = useState(null);
+  const [viewingProjects, setViewingProjects] = useState(null);
   const [uploadKey, setUploadKey] = useState(0);
   const load = () => {
     setItems(null);
@@ -8218,7 +8207,7 @@ function CertificateSettings({ notify }) {
                 <div className="certificate-card-title"><h3>{x.name}</h3><span className={`badge ${x.status === "expired" ? "danger" : x.status === "expiring" ? "warning" : "success"}`}><i />{x.status === "expired" ? "已过期" : x.status === "expiring" ? `${x.days_left} 天后到期` : "有效"}</span></div>
                 <p title={x.domains.join("、")}>{x.domains.join("、")}</p>
                 <div className="certificate-use-badges">
-                  {x.references > 0 && <span className="certificate-use-badge active">使用中 · {x.references} 个项目</span>}
+                  {x.references > 0 && <button type="button" className="certificate-use-badge active" onClick={() => setViewingProjects(x)}>使用中 · {x.references} 个项目 <ChevronRight /></button>}
                   {x.auto_selected && <span className="certificate-use-badge default">自动匹配</span>}
                   {!x.references && !x.auto_selected && <span className="certificate-use-badge history">历史 / 备用</span>}
                 </div>
@@ -8244,6 +8233,15 @@ function CertificateSettings({ notify }) {
           <button className="ghost" disabled={busy} onClick={() => setOverlap(null)}>取消</button>
           <button className="ghost" disabled={busy} onClick={() => upload("add")}>另存新版本</button>
           <button className="primary" disabled={busy} onClick={() => upload("replace")}>{busy && <LoaderCircle className="spin" />}更新当前证书</button>
+        </div>
+      </Modal>}
+      {viewingProjects && <Modal drawer closeOnMask title={`使用项目 · ${viewingProjects.name}`} onClose={() => setViewingProjects(null)}>
+        <div className="drawer-summary"><span>当前实际绑定</span><b>{viewingProjects.references} 个项目</b></div>
+        <div className="drawer-project-list">
+          {(viewingProjects.referenced_projects || []).map((project) => <div key={project.id}>
+            <div><b>{project.name}</b><small>{project.slug}</small></div>
+            <span>{project.domain}</span>
+          </div>)}
         </div>
       </Modal>}
     </>

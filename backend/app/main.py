@@ -2559,10 +2559,16 @@ def _domain_matches_pattern(domain: str, pattern: str) -> bool:
 
 def _certificate_view(item: CertificateStore, db: Session | None = None, auto_selected: bool = False) -> dict:
     domains = json.loads(item.domains_json or "[]")
-    references = 0 if db is None else int(db.scalar(select(func.count()).select_from(ProjectDomainConfig).where(ProjectDomainConfig.certificate_id == item.id)) or 0)
+    referenced_projects = []
+    if db is not None:
+        configs = db.scalars(select(ProjectDomainConfig).where(ProjectDomainConfig.certificate_id == item.id)).all()
+        project_ids = [config.project_id for config in configs]
+        projects = db.scalars(select(Project).where(Project.id.in_(project_ids)).order_by(Project.name)).all() if project_ids else []
+        referenced_projects = [{"id": project.id, "name": project.name, "slug": project.slug, "domain": project.domain or "未配置域名"} for project in projects]
+    references = len(referenced_projects)
     days_left = max(0, int((item.expires_at - datetime.now(timezone.utc)).total_seconds() // 86400))
     status = "expired" if item.expires_at <= datetime.now(timezone.utc) else ("expiring" if days_left <= 30 else "valid")
-    return {"id": item.id, "name": item.name, "domains": domains, "expires_at": item.expires_at.isoformat(), "fingerprint": item.fingerprint, "references": references, "days_left": days_left, "status": status, "auto_selected": auto_selected}
+    return {"id": item.id, "name": item.name, "domains": domains, "expires_at": item.expires_at.isoformat(), "fingerprint": item.fingerprint, "references": references, "referenced_projects": referenced_projects, "days_left": days_left, "status": status, "auto_selected": auto_selected}
 
 
 def _validated_certificate_material(certificate_pem: str, private_key_pem: str) -> tuple[x509.Certificate, list[str], str]:
