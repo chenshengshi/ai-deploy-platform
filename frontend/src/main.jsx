@@ -4176,6 +4176,9 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
   const [terminalBusy, setTerminalBusy] = useState(false);
   const [terminalConnected, setTerminalConnected] = useState(false);
   const [terminalHistory, setTerminalHistory] = useState([]);
+  const [terminalSearchActive, setTerminalSearchActive] = useState(false);
+  const [terminalSearchQuery, setTerminalSearchQuery] = useState("");
+  const [terminalSearchMatch, setTerminalSearchMatch] = useState("");
   const terminalInputRef = useRef(null);
   const runtimeLogRef = useRef(null);
   const fileUploadRef = useRef(null);
@@ -4190,6 +4193,7 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
   const terminalHistoryDraftRef = useRef("");
   const terminalSearchIndexRef = useRef(-1);
   const terminalSearchQueryRef = useRef("");
+  const terminalSearchDraftRef = useRef("");
   const focusTerminalIfHovered = () => {
     if (terminalHoveredRef.current) terminalInputRef.current?.focus();
   };
@@ -4343,6 +4347,29 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
     setTerminalOutput("");
     setTimeout(focusTerminalIfHovered, 0);
   };
+  const findTerminalHistoryMatch = (query, beforeIndex = terminalHistory.length) => {
+    const normalized = query.trim().toLowerCase();
+    for (let index = Math.min(beforeIndex - 1, terminalHistory.length - 1); index >= 0; index -= 1) {
+      if (!normalized || terminalHistory[index].toLowerCase().includes(normalized)) return { index, value: terminalHistory[index] };
+    }
+    return { index: -1, value: "" };
+  };
+  const updateTerminalReverseSearch = (query, beforeIndex = terminalHistory.length) => {
+    const found = findTerminalHistoryMatch(query, beforeIndex);
+    terminalSearchQueryRef.current = query;
+    terminalSearchIndexRef.current = found.index;
+    setTerminalSearchQuery(query);
+    setTerminalSearchMatch(found.value);
+  };
+  const finishTerminalReverseSearch = (accept = true) => {
+    setTerminalSearchActive(false);
+    setTerminalSearchQuery("");
+    setTerminalSearchMatch("");
+    terminalSearchQueryRef.current = "";
+    terminalSearchIndexRef.current = -1;
+    setTerminalCommand(accept && terminalSearchMatch ? terminalSearchMatch : terminalSearchDraftRef.current);
+    setTimeout(focusTerminalIfHovered, 0);
+  };
   const handleTerminalKeyDown = (event) => {
     const clearShortcut = event.ctrlKey && !event.altKey && !event.metaKey
       && (event.key.toLowerCase() === "l" || event.key === "/");
@@ -4356,26 +4383,24 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
       event.preventDefault();
       event.stopPropagation();
       if (!terminalHistory.length) return;
-      if (terminalSearchIndexRef.current < 0) {
-        terminalSearchQueryRef.current = terminalCommand.trim().toLowerCase();
-        terminalSearchIndexRef.current = terminalHistory.length;
-      }
-      const query = terminalSearchQueryRef.current;
-      let found = -1;
-      for (let index = terminalSearchIndexRef.current - 1; index >= 0; index -= 1) {
-        if (!query || terminalHistory[index].toLowerCase().includes(query)) { found = index; break; }
-      }
-      if (found < 0) {
-        terminalSearchIndexRef.current = terminalHistory.length;
-        for (let index = terminalHistory.length - 1; index >= 0; index -= 1) {
-          if (!query || terminalHistory[index].toLowerCase().includes(query)) { found = index; break; }
+      if (!terminalSearchActive) {
+        terminalSearchDraftRef.current = terminalCommand;
+        setTerminalSearchActive(true);
+        updateTerminalReverseSearch("", terminalHistory.length);
+      } else {
+        const before = terminalSearchIndexRef.current < 0 ? terminalHistory.length : terminalSearchIndexRef.current;
+        const found = findTerminalHistoryMatch(terminalSearchQueryRef.current, before);
+        if (found.index >= 0) {
+          terminalSearchIndexRef.current = found.index;
+          setTerminalSearchMatch(found.value);
         }
       }
-      if (found >= 0) {
-        terminalSearchIndexRef.current = found;
-        terminalHistoryIndexRef.current = found;
-        setTerminalCommand(terminalHistory[found]);
-      }
+    } else if (terminalSearchActive && event.key === "Escape") {
+      event.preventDefault();
+      finishTerminalReverseSearch(false);
+    } else if (terminalSearchActive && event.key === "Enter") {
+      event.preventDefault();
+      finishTerminalReverseSearch(true);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
       event.stopPropagation();
@@ -4841,8 +4866,8 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
             <div className="container-terminal-panel" onMouseEnter={() => { terminalHoveredRef.current = true; terminalInputRef.current?.focus(); }} onMouseLeave={() => { terminalHoveredRef.current = false; terminalInputRef.current?.blur(); }} onClick={() => { terminalHoveredRef.current = true; terminalInputRef.current?.focus(); }}>
               <div className="terminal-cwd"><span><i className={terminalConnected ? "terminal-online" : "terminal-offline"} />{terminalConnected ? "已连接" : "连接中…"}</span><code>{containerPath}</code></div>
               <div className="terminal-output-shell">
-                <pre ref={terminalOutputRef} className="logs container-terminal-output">{terminalOutput}<span className="terminal-live-prompt"><b>{containerPath} # </b>{terminalCommand}<i /></span></pre>
-                <input className="terminal-key-capture" aria-label="容器终端命令" title="↑↓ 历史命令；Ctrl+R 搜索历史；Tab 补全；Ctrl+L 或 Ctrl+/ 清屏" ref={terminalInputRef} value={terminalCommand} disabled={terminalBusy} autoFocus onChange={(event) => { setTerminalCommand(event.target.value); terminalHistoryIndexRef.current = -1; terminalSearchIndexRef.current = -1; terminalSearchQueryRef.current = ""; }} onKeyDown={handleTerminalKeyDown} />
+                <pre ref={terminalOutputRef} className="logs container-terminal-output">{terminalOutput}{terminalSearchActive ? <span className="terminal-reverse-search"><b>(reverse-i-search)`{terminalSearchQuery}`: </b>{terminalSearchMatch || "没有匹配命令"}<i /></span> : <span className="terminal-live-prompt"><b>{containerPath} # </b>{terminalCommand}<i /></span>}</pre>
+                <input className="terminal-key-capture" aria-label="容器终端命令" title="↑↓ 历史命令；Ctrl+R 搜索历史；Tab 补全；Ctrl+L 或 Ctrl+/ 清屏" ref={terminalInputRef} value={terminalSearchActive ? terminalSearchQuery : terminalCommand} disabled={terminalBusy} autoFocus onChange={(event) => { if (terminalSearchActive) updateTerminalReverseSearch(event.target.value, terminalHistory.length); else { setTerminalCommand(event.target.value); terminalHistoryIndexRef.current = -1; terminalSearchIndexRef.current = -1; terminalSearchQueryRef.current = ""; } }} onKeyDown={handleTerminalKeyDown} />
                 {terminalBusy && <LoaderCircle className="spin terminal-inline-busy" />}
               </div>
             </div>
