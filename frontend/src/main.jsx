@@ -3945,7 +3945,6 @@ function ProjectDetail({
             onRefresh={() => loadRuntime(false, true)}
             onGateway={openGatewaySnapshot}
             gatewayLoading={false}
-            onOpenData={() => setTab("data")}
             notify={notify}
             onOpen={(id) => {
               const found = deployments?.find((x) => x.id === id);
@@ -4150,7 +4149,7 @@ function ServiceScaleControl({ projectId, container, containers, servicePools, e
 
 const dataContainerPattern = /mysql|mariadb|postgres|redis|mongo|oracle|sqlserver|elasticsearch|opensearch|minio|rabbitmq|kafka|zookeeper|activemq|nacos|consul|etcd/i;
 
-function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, onGateway, gatewayLoading, onOpenData, onOpen, notify, scope = "application" }) {
+function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, onGateway, gatewayLoading, onOpen, notify, scope = "application" }) {
   const [restarting, setRestarting] = useState("");
   const [logTarget, setLogTarget] = useState(null);
   const [containerLogs, setContainerLogs] = useState("");
@@ -4645,7 +4644,6 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
           <span><Boxes /><b>共 {allRuntimeContainers.length} 个容器</b></span>
           <span>应用 {allApplicationContainers.length}</span>
           <span>数据资源 {allDataContainers.length}</span>
-          {allDataContainers.length > 0 && <button className="ghost" onClick={onOpenData}>管理数据资源 <ChevronRight /></button>}
         </div>
       )}
       {runtime.refresh_error && (
