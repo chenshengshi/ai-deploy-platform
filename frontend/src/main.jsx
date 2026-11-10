@@ -4168,6 +4168,7 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesUploading, setFilesUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null);
+  const [downloadProgress, setDownloadProgress] = useState(null);
   const [fileMenu, setFileMenu] = useState(null);
   const [deleteFileConfirm, setDeleteFileConfirm] = useState(null);
   const [fileDeleting, setFileDeleting] = useState(false);
@@ -4175,15 +4176,21 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
   const [terminalOutput, setTerminalOutput] = useState("容器终端已就绪。命令将在当前目录执行并记录审计日志。\n");
   const [terminalBusy, setTerminalBusy] = useState(false);
   const [terminalConnected, setTerminalConnected] = useState(false);
+  const [terminalHistory, setTerminalHistory] = useState([]);
   const terminalInputRef = useRef(null);
   const runtimeLogRef = useRef(null);
   const fileUploadRef = useRef(null);
   const uploadRequestRef = useRef(null);
+  const downloadRequestRef = useRef(null);
   const fileCacheRef = useRef(new Map());
   const fileRequestRef = useRef(0);
   const terminalOutputRef = useRef(null);
   const terminalSocketRef = useRef(null);
   const terminalHoveredRef = useRef(false);
+  const terminalHistoryIndexRef = useRef(-1);
+  const terminalHistoryDraftRef = useRef("");
+  const terminalSearchIndexRef = useRef(-1);
+  const terminalSearchQueryRef = useRef("");
   const focusTerminalIfHovered = () => {
     if (terminalHoveredRef.current) terminalInputRef.current?.focus();
   };
@@ -4284,10 +4291,27 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
   };
   const runContainerCommand = async () => {
     const command = terminalCommand.trim();
-    if (!logTarget || !command || terminalBusy) return;
+    if (!logTarget || terminalBusy) return;
+    if (!command) {
+      setTerminalOutput((value) => `${value}${value.endsWith("\n") ? "" : "\n"}${containerPath} # \n`);
+      setTimeout(focusTerminalIfHovered, 0);
+      return;
+    }
+    const nextHistory = [...terminalHistory, command].slice(-100);
+    setTerminalHistory(nextHistory);
+    terminalHistoryIndexRef.current = -1;
+    terminalHistoryDraftRef.current = "";
+    terminalSearchIndexRef.current = -1;
+    terminalSearchQueryRef.current = "";
     if (/^(?:clear|reset)$/i.test(command)) {
       setTerminalCommand("");
       setTerminalOutput("");
+      setTimeout(focusTerminalIfHovered, 0);
+      return;
+    }
+    if (/^history$/i.test(command)) {
+      setTerminalCommand("");
+      setTerminalOutput((value) => `${value}${value.endsWith("\n") ? "" : "\n"}${containerPath} # ${command}\n${nextHistory.map((item, index) => `${String(index + 1).padStart(4, " ")}  ${item}`).join("\n")}\n`);
       setTimeout(focusTerminalIfHovered, 0);
       return;
     }
@@ -4323,10 +4347,60 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
   const handleTerminalKeyDown = (event) => {
     const clearShortcut = event.ctrlKey && !event.altKey && !event.metaKey
       && (event.key.toLowerCase() === "l" || event.key === "/");
+    const reverseSearchShortcut = event.ctrlKey && !event.altKey && !event.metaKey
+      && event.key.toLowerCase() === "r";
     if (clearShortcut) {
       event.preventDefault();
       event.stopPropagation();
       clearTerminalScreen();
+    } else if (reverseSearchShortcut) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!terminalHistory.length) return;
+      if (terminalSearchIndexRef.current < 0) {
+        terminalSearchQueryRef.current = terminalCommand.trim().toLowerCase();
+        terminalSearchIndexRef.current = terminalHistory.length;
+      }
+      const query = terminalSearchQueryRef.current;
+      let found = -1;
+      for (let index = terminalSearchIndexRef.current - 1; index >= 0; index -= 1) {
+        if (!query || terminalHistory[index].toLowerCase().includes(query)) { found = index; break; }
+      }
+      if (found < 0) {
+        terminalSearchIndexRef.current = terminalHistory.length;
+        for (let index = terminalHistory.length - 1; index >= 0; index -= 1) {
+          if (!query || terminalHistory[index].toLowerCase().includes(query)) { found = index; break; }
+        }
+      }
+      if (found >= 0) {
+        terminalSearchIndexRef.current = found;
+        terminalHistoryIndexRef.current = found;
+        setTerminalCommand(terminalHistory[found]);
+      }
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!terminalHistory.length) return;
+      if (terminalHistoryIndexRef.current < 0) {
+        terminalHistoryDraftRef.current = terminalCommand;
+        terminalHistoryIndexRef.current = terminalHistory.length - 1;
+      } else if (terminalHistoryIndexRef.current > 0) {
+        terminalHistoryIndexRef.current -= 1;
+      }
+      terminalSearchIndexRef.current = -1;
+      setTerminalCommand(terminalHistory[terminalHistoryIndexRef.current]);
+    } else if (event.key === "ArrowDown") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (terminalHistoryIndexRef.current < 0) return;
+      if (terminalHistoryIndexRef.current < terminalHistory.length - 1) {
+        terminalHistoryIndexRef.current += 1;
+        setTerminalCommand(terminalHistory[terminalHistoryIndexRef.current]);
+      } else {
+        terminalHistoryIndexRef.current = -1;
+        setTerminalCommand(terminalHistoryDraftRef.current);
+      }
+      terminalSearchIndexRef.current = -1;
     } else if (event.key === "Tab") {
       event.preventDefault();
       event.stopPropagation();
@@ -4386,14 +4460,37 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
     if (containerTab === "terminal" && terminalOutputRef.current) terminalOutputRef.current.scrollTop = terminalOutputRef.current.scrollHeight;
   }, [terminalOutput, containerTab]);
   const downloadContainerPath = async (entry, archive = false) => {
-    if (!logTarget) return;
+    if (!logTarget || downloadProgress) return;
+    const controller = new AbortController();
+    downloadRequestRef.current = controller;
+    const fileName = (archive || entry.type === "directory") ? `${entry.name}.tar.gz` : entry.name;
+    setDownloadProgress({ name: fileName, loaded: 0, total: 0, percent: null });
     try {
-      const response = await fetch(`/api/deployments/${logTarget.deploymentId}/containers/${encodeURIComponent(logTarget.container.name)}/files/download?path=${encodeURIComponent(entry.path)}&archive=${archive || entry.type === "directory"}`, { headers: { Authorization: `Bearer ${token()}` } });
+      const response = await fetch(`/api/deployments/${logTarget.deploymentId}/containers/${encodeURIComponent(logTarget.container.name)}/files/download?path=${encodeURIComponent(entry.path)}&archive=${archive || entry.type === "directory"}`, { headers: { Authorization: `Bearer ${token()}` }, signal: controller.signal });
       if (!response.ok) throw new Error(`下载失败 (${response.status})`);
-      const blob = await response.blob();
+      const total = Number(response.headers.get("content-length")) || 0;
+      let loaded = 0;
+      let blob;
+      if (response.body?.getReader) {
+        const reader = response.body.getReader();
+        const chunks = [];
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          loaded += value.byteLength;
+          setDownloadProgress({ name: fileName, loaded, total, percent: total ? Math.min(99, Math.round((loaded / total) * 100)) : null });
+        }
+        blob = new Blob(chunks, { type: response.headers.get("content-type") || "application/octet-stream" });
+      } else {
+        blob = await response.blob();
+        loaded = blob.size;
+      }
+      setDownloadProgress({ name: fileName, loaded, total: total || loaded, percent: 100 });
       const url = URL.createObjectURL(blob);
-      const a = document.createElement("a"); a.href = url; a.download = (archive || entry.type === "directory") ? `${entry.name}.tar.gz` : entry.name; a.click(); URL.revokeObjectURL(url);
-    } catch (e) { notify?.(e.message, "error"); }
+      const a = document.createElement("a"); a.href = url; a.download = fileName; a.click(); URL.revokeObjectURL(url);
+    } catch (e) { if (e.name !== "AbortError") notify?.(e.message, "error"); }
+    finally { downloadRequestRef.current = null; setTimeout(() => setDownloadProgress(null), 600); }
   };
   const uploadContainerFiles = async (fileList) => {
     const selected = Array.from(fileList || []);
@@ -4747,7 +4844,7 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
               <div className="terminal-cwd"><span><i className={terminalConnected ? "terminal-online" : "terminal-offline"} />{terminalConnected ? "已连接" : "连接中…"}</span><code>{containerPath}</code></div>
               <div className="terminal-output-shell">
                 <pre ref={terminalOutputRef} className="logs container-terminal-output">{terminalOutput}<span className="terminal-live-prompt"><b>{containerPath} # </b>{terminalCommand}<i /></span></pre>
-                <input className="terminal-key-capture" aria-label="容器终端命令" title="Tab 补全；Ctrl+L 或 Ctrl+/ 清屏" ref={terminalInputRef} value={terminalCommand} disabled={terminalBusy} autoFocus onChange={(event) => setTerminalCommand(event.target.value)} onKeyDown={handleTerminalKeyDown} />
+                <input className="terminal-key-capture" aria-label="容器终端命令" title="↑↓ 历史命令；Ctrl+R 搜索历史；Tab 补全；Ctrl+L 或 Ctrl+/ 清屏" ref={terminalInputRef} value={terminalCommand} disabled={terminalBusy} autoFocus onChange={(event) => { setTerminalCommand(event.target.value); terminalHistoryIndexRef.current = -1; terminalSearchIndexRef.current = -1; terminalSearchQueryRef.current = ""; }} onKeyDown={handleTerminalKeyDown} />
                 {terminalBusy && <LoaderCircle className="spin terminal-inline-busy" />}
               </div>
             </div>
@@ -4760,6 +4857,7 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
                 <button className="ghost" onClick={() => loadContainerFiles(containerPath)}>{filesLoading ? <LoaderCircle className="spin" /> : <RefreshCw />}</button>
               </div>
               {uploadProgress && <div className="container-upload-progress"><span><b>{uploadProgress.name}</b><span><em>{uploadProgress.percent}%</em>{filesUploading && <button type="button" title="取消上传" onClick={() => uploadRequestRef.current?.abort()}><X />取消</button>}</span></span><i><u style={{ width: `${uploadProgress.percent}%` }} /></i></div>}
+              {downloadProgress && <div className="container-upload-progress"><span><b>下载：{downloadProgress.name}</b><span><em>{downloadProgress.percent == null ? containerFileSize(downloadProgress.loaded, "file") : `${downloadProgress.percent}%`}</em>{downloadProgress.percent !== 100 && <button type="button" title="取消下载" onClick={() => downloadRequestRef.current?.abort()}><X />取消</button>}</span></span><i><u className={downloadProgress.percent == null ? "indeterminate" : ""} style={downloadProgress.percent == null ? undefined : { width: `${downloadProgress.percent}%` }} /></i></div>}
               <div className="container-file-list terminal-file-list" onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }} onDrop={(event) => { event.preventDefault(); uploadContainerFiles(event.dataTransfer.files); }}>
                 <div className="terminal-file-header"><span>名称</span><span>大小</span><span>上次修改</span><span>所有者</span></div>
                 {containerFiles.map((entry) => <div key={entry.path} className="container-file-row terminal-file-row" title="右键查看更多操作" onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setFileMenu({ entry, x: Math.min(event.clientX, window.innerWidth - 170), y: Math.min(event.clientY, window.innerHeight - 110) }); }}>

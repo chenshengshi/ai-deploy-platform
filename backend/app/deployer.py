@@ -6254,6 +6254,40 @@ def central_build_and_distribute(
         generated_dockerfiles = [
             path for path in source_root.rglob(".yunzhou*.Dockerfile") if path.is_file()
         ]
+        # When a repository contains both the real frontend and an auxiliary
+        # documentation/demo site, building every package.json lets the first
+        # completed dist directory claim the frontend image.  The generated
+        # Dockerfile is the authoritative deployment plan, so prefer Node
+        # modules that it explicitly copies.  A broad ``COPY . .`` provides
+        # no module evidence and deliberately keeps the previous fallback.
+        referenced_node_manifests: list[Path] = []
+        generated_docker_text = "\n".join(
+            path.read_text(encoding="utf-8", errors="ignore")
+            for path in generated_dockerfiles
+        )
+        collapsed_docker_text = re.sub(r"\\\s*\r?\n\s*", " ", generated_docker_text)
+        for manifest in node_manifests:
+            relative_parent = manifest.parent.relative_to(source_root).as_posix()
+            if relative_parent == ".":
+                continue
+            escaped_parent = re.escape(relative_parent.rstrip("/"))
+            if re.search(
+                rf"(?im)^\s*(?:COPY|ADD)\s+[^\n]*?(?:^|[\s\"'])\.?/?{escaped_parent}(?:/|[\s\"'])",
+                collapsed_docker_text,
+            ):
+                referenced_node_manifests.append(manifest)
+        if referenced_node_manifests and len(referenced_node_manifests) < len(node_manifests):
+            skipped_modules = [
+                manifest.parent.relative_to(source_root).as_posix()
+                for manifest in node_manifests
+                if manifest not in referenced_node_manifests
+            ]
+            node_manifests = referenced_node_manifests
+            log(
+                deployment.id,
+                "[构建范围] 按发布方案仅构建正式前端模块；已排除文档/示例模块："
+                + "、".join(skipped_modules) + "。\n",
+            )
         for generated_dockerfile in generated_dockerfiles:
             context = generated_dockerfile.parent
             ensure_context_ignore(context)
@@ -9198,15 +9232,31 @@ def execute(deployment_id: str) -> None:
                                     raise RuntimeError("项目级数据服务配置校验失败：" + reconcile_out[-1200:])
                             log(dep.id, "[数据服务] 已核对项目级固定服务配置；配置有变化时仅重建容器，数据卷保持不变。\n")
                         data_health = (
-                            f"cd {shlex.quote(remote_dir)} && ok=0; "
-                            "for i in $(seq 1 60); do bad=0; "
+                            f"cd {shlex.quote(remote_dir)} && ok=0; stable=0; "
+                            "for i in $(seq 1 90); do bad=0; "
                             f"ids=$(docker compose -p {shlex.quote(data_project)} {data_args} ps -q); "
                             "[ -n \"$ids\" ] || bad=1; for id in $ids; do "
                             "state=$(docker inspect -f '{{.State.Status}}' $id 2>/dev/null); "
                             "health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $id 2>/dev/null); "
+                            "image=$(docker inspect -f '{{.Config.Image}}' $id 2>/dev/null); "
                             "[ \"$state\" = running ] || bad=1; "
-                            "[ \"$health\" = none ] || [ \"$health\" = healthy ] || bad=1; done; "
-                            "[ \"$bad\" -eq 0 ] && { ok=1; break; }; sleep 2; done; "
+                            "[ \"$health\" = none ] || [ \"$health\" = healthy ] || bad=1; "
+                            # The official MySQL/MariaDB entrypoint starts a
+                            # temporary server while importing init scripts.
+                            # mysqladmin can report that temporary instance as
+                            # healthy, then the entrypoint intentionally stops
+                            # it before starting the real server.  Starting the
+                            # application in that gap produces an intermittent
+                            # "connection refused" on every fresh project.
+                            "case \"$image\" in *mysql*|*mariadb*) logs=$(docker logs $id 2>&1); "
+                            "if printf '%s\\n' \"$logs\" | grep -Eqi 'temporary server started'; then "
+                            "printf '%s\\n' \"$logs\" | grep -Eqi 'init process done|ready for start up' || bad=1; fi;; esac; "
+                            "done; "
+                            # Require several consecutive healthy samples so
+                            # a restart boundary cannot be mistaken for
+                            # database readiness even on nonstandard images.
+                            "if [ \"$bad\" -eq 0 ]; then stable=$((stable+1)); else stable=0; fi; "
+                            "[ \"$stable\" -ge 4 ] && { ok=1; break; }; sleep 2; done; "
                             "[ \"$ok\" -eq 1 ]"
                         )
                         log(dep.id, "[数据服务检查] 正在核验项目级 MySQL/Redis 的运行状态、健康检查与托管凭据。\n")
