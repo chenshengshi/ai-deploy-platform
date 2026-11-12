@@ -8890,19 +8890,6 @@ def execute(deployment_id: str) -> None:
             if verification_paths:
                 log(dep.id, "[接口验证计划] 发布成功前必须核验：" + "、".join(dict.fromkeys(verification_paths)) + "\n")
             topology = analyze_repository_topology(work, build_type, build_file)
-            requires_api_verification = True
-            if build_type == "dockerfile" and not topology.get("backend_roots"):
-                dockerfile_text = (Path(work) / build_file).read_text(encoding="utf-8", errors="ignore")
-                runtime_from = re.findall(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]+)", dockerfile_text)
-                if runtime_from and "nginx" in runtime_from[-1].lower():
-                    requires_api_verification = False
-                    if verification_paths:
-                        log(
-                            dep.id,
-                            "[接口验证计划] 最终运行镜像为 Nginx 静态前端，且源码未识别到后端服务；"
-                            "接口路径仅保留为运行提示，不作为发布成功条件。\n",
-                        )
-                    verification_paths = []
             log(dep.id, "[架构分析] " + json.dumps(topology, ensure_ascii=False) + "\n")
             ai_checkpoint(dep.id, "识别项目", json.dumps({"dependencies": dependency_analysis, "topology": topology}, ensure_ascii=False))
             if topology["errors"]:
@@ -9738,12 +9725,11 @@ def execute(deployment_id: str) -> None:
             # actual dist here so a route discovered during gateway generation
             # (for example /frapi/) is also a mandatory success probe.
             postbuild_routes = detect_frontend_api_routes(work)
-            if requires_api_verification:
-                verification_paths.extend(
-                    str(route.get("path") or "")
-                    for route in (postbuild_routes.get("routes") or [])
-                    if isinstance(route, dict) and str(route.get("path") or "").startswith("/")
-                )
+            verification_paths.extend(
+                str(route.get("path") or "")
+                for route in (postbuild_routes.get("routes") or [])
+                if isinstance(route, dict) and str(route.get("path") or "").startswith("/")
+            )
             verification_paths = list(dict.fromkeys(verification_paths))
             if verification_paths:
                 log(dep.id, "[接口联合验证] " + "、".join(verification_paths) + " 必须同时无 5xx。\n")

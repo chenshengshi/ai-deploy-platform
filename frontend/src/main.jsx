@@ -9234,15 +9234,11 @@ function ExperienceSettings({ notify }) {
 }
 function DeploymentSettingsPanel({ notify }) {
   const [form, setForm] = useState(null),
-    [gatewayPorts, setGatewayPorts] = useState([]),
     [saving, setSaving] = useState(false),
     [registrySaving, setRegistrySaving] = useState(false);
   useEffect(() => {
-    Promise.all([api("/settings/deployment"), api("/settings/deployment/gateway-ports")])
-      .then(([settings, ports]) => {
-        setForm(settings);
-        setGatewayPorts(ports.items || []);
-      })
+    api("/settings/deployment")
+      .then(setForm)
       .catch((e) => notify(e.message, "error"));
   }, []);
   const save = async () => {
@@ -9551,24 +9547,6 @@ function DeploymentSettingsPanel({ notify }) {
               }
             />
           </Field>
-          <div className="gateway-port-usage">
-            <div className="gateway-port-usage-head">
-              <div><b>当前已使用端口</b><span>按端口从小到大排列</span></div>
-              <em>{gatewayPorts.length} 个</em>
-            </div>
-            {gatewayPorts.length ? (
-              <div className="gateway-port-usage-list">
-                {gatewayPorts.map((item) => (
-                  <div className="gateway-port-usage-row" key={`${item.port}-${item.project_id}`}>
-                    <strong>{item.port}</strong>
-                    <span title={item.project_name}>{item.project_name}</span>
-                    <small>{item.node_name}</small>
-                    <i className={item.status === "active" ? "active" : "reserved"}>{item.status === "active" ? "使用中" : "已预留"}</i>
-                  </div>
-                ))}
-              </div>
-            ) : <p className="gateway-port-usage-empty">当前端口范围内暂无项目占用</p>}
-          </div>
             </div>
           </section>
         </div>

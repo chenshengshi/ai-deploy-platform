@@ -8288,39 +8288,6 @@ def read_deployment_settings(db: Session = Depends(get_db), _: User = Depends(re
     return get_deployment_settings(db)
 
 
-@app.get("/api/settings/deployment/gateway-ports")
-def read_gateway_port_usage(db: Session = Depends(get_db), _: User = Depends(require(Role.admin))):
-    settings = get_deployment_settings(db)
-    rows = db.execute(
-        select(DeploymentPortReservation, Deployment, Project, Node)
-        .join(Deployment, Deployment.id == DeploymentPortReservation.deployment_id)
-        .join(Project, Project.id == Deployment.project_id)
-        .join(Node, Node.id == DeploymentPortReservation.node_id)
-        .where(
-            DeploymentPortReservation.service_name == "__gateway__",
-            DeploymentPortReservation.status.in_(["reserved", "active"]),
-            DeploymentPortReservation.host_port >= settings.external_port_start,
-            DeploymentPortReservation.host_port <= settings.external_port_end,
-        )
-        .order_by(DeploymentPortReservation.host_port.asc(), Project.name.asc())
-    ).all()
-    return {
-        "items": [
-            {
-                "port": reservation.host_port,
-                "status": reservation.status,
-                "project_id": project.id,
-                "project_name": project.name,
-                "project_code": project.project_key,
-                "node_name": node.name,
-                "release": deployment.release,
-                "purpose": "公网入口",
-            }
-            for reservation, deployment, project, node in rows
-        ]
-    }
-
-
 @app.put("/api/settings/deployment", response_model=DeploymentSettingsOut)
 def update_deployment_settings(body: DeploymentSettingsIn, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
     if body.per_node_concurrency > body.global_concurrency:
