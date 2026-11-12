@@ -40,6 +40,10 @@ class UserUpdate(BaseModel):
     active: bool | None = None
 
 
+class UserProjectsUpdate(BaseModel):
+    project_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
 class UserProjectSummary(BaseModel):
     id: str
     name: str

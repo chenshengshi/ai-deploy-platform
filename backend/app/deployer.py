@@ -6337,7 +6337,16 @@ def central_build_and_distribute(
                 ) or {}
             except Exception:
                 continue
-            for eager_name, eager_service in (eager_override.get("services") or {}).items():
+            # YAML files discovered beside the generated Compose snapshot may
+            # legitimately contain a scalar/list. Only Compose mappings can
+            # provide services; skipping other shapes keeps optional eager
+            # packaging from aborting the entire deployment.
+            if not isinstance(eager_override, dict):
+                continue
+            eager_services = eager_override.get("services") or {}
+            if not isinstance(eager_services, dict):
+                continue
+            for eager_name, eager_service in eager_services.items():
                 if not isinstance(eager_service, dict) or not isinstance(eager_service.get("build"), dict):
                     continue
                 eager_build = eager_service["build"]

@@ -63,6 +63,15 @@ class PasswordHistory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class ProjectAccess(Base):
+    __tablename__ = "project_access"
+    __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_project_access_project_user"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class SecurityConfig(Base):
     __tablename__ = "security_config"
     id: Mapped[str] = mapped_column(String(20), primary_key=True, default="default")
