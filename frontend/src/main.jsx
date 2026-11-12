@@ -1118,8 +1118,8 @@ function Top({ page, me, branding, onBrandingChange }) {
             onClose={(ok) => {
               setPassword(false);
               if (ok) {
-                window.alert("密码修改成功，请重新登录");
-                logout();
+                setSaved(true);
+                setTimeout(() => setSaved(false), 2500);
               }
             }}
           />
@@ -7019,8 +7019,8 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
             </div>
             <p>{aiFollowup?.summary || "正在读取日志并判断当前状态..."}</p>
             {(diagnosticAdvice || diagnosticFixPlan.length) && (
-              <details className="ai-diagnostic-details" open>
-                <summary>处理建议</summary>
+              <details className="ai-diagnostic-details">
+                <summary>查看修复方案</summary>
                 {diagnosticAdvice && !adviceRepeatedInPlan && <div>{diagnosticAdvice}</div>}
                 {diagnosticFixPlan.length > 0 && (
                   <ol>
@@ -7028,6 +7028,9 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
                   </ol>
                 )}
               </details>
+            )}
+            {aiFollowup?.next_step && (
+              <div className="ai-diagnostic-next"><b>下一步处理：</b>{aiFollowup.next_step}</div>
             )}
           </div>
         </div>
@@ -7949,7 +7952,7 @@ function UsersPage() {
             <tbody>
               {items.map((x) => (
                 <React.Fragment key={x.id}>
-                <tr>
+                <tr onClick={() => setEditing(x)}>
                   <td>
                     <b>{x.display_name || x.username}</b>
                     <small>@{x.username}</small>
@@ -8042,55 +8045,22 @@ function UserModal({ user, onClose, onDone }) {
           },
     ),
     [err, setErr] = useState(""),
-    [busy, setBusy] = useState(false),
-    [projects, setProjects] = useState([]),
-    [projectQuery, setProjectQuery] = useState(""),
-    [selectedProjects, setSelectedProjects] = useState(() => new Set((user?.projects || []).map((item) => item.id))),
-    [deleteConfirm, setDeleteConfirm] = useState(false),
-    [deleting, setDeleting] = useState(false);
-  useEffect(() => {
-    api("/projects").then(setProjects).catch((error) => setErr(error.message));
-  }, []);
-  const toggleProject = (projectId) => setSelectedProjects((current) => {
-    const next = new Set(current);
-    if (next.has(projectId)) next.delete(projectId); else next.add(projectId);
-    return next;
-  });
+    [busy, setBusy] = useState(false);
   const submit = async () => {
     setBusy(true);
     setErr("");
     try {
       const body = { ...f };
       if (editing && !body.password) delete body.password;
-      const savedUser = await api(editing ? `/users/${user.id}` : "/users", {
+      await api(editing ? `/users/${user.id}` : "/users", {
         method: editing ? "PATCH" : "POST",
         body: JSON.stringify(body),
       });
-      if (f.role !== "admin") {
-        await api(`/users/${savedUser.id}/projects`, {
-          method: "PUT",
-          body: JSON.stringify({ project_ids: [...selectedProjects] }),
-        });
-      }
       onDone();
     } catch (e) {
       setErr(e.message);
     } finally {
       setBusy(false);
-    }
-  };
-  const removeUser = async () => {
-    setDeleting(true);
-    setErr("");
-    try {
-      await api(`/users/${user.id}`, { method: "DELETE" });
-      setDeleteConfirm(false);
-      onDone();
-    } catch (error) {
-      setDeleteConfirm(false);
-      setErr(error.message);
-    } finally {
-      setDeleting(false);
     }
   };
   return (
@@ -8129,19 +8099,6 @@ function UserModal({ user, onClose, onDone }) {
             <option value="admin">管理员</option>
           </select>
         </Field>
-        {f.role !== "admin" && <Field label="可访问项目" hint={f.role === "viewer" ? "该用户只能查看勾选的项目" : "该用户可以管理和发布勾选的项目"}>
-          <div className="user-project-picker">
-            <label className="user-project-search"><Search /><input value={projectQuery} onChange={(event) => setProjectQuery(event.target.value)} placeholder="搜索项目名称或标识" /></label>
-            <div className="user-project-options">
-              {projects.filter((project) => `${project.name} ${project.slug}`.toLowerCase().includes(projectQuery.trim().toLowerCase())).map((project) => <label key={project.id} className={selectedProjects.has(project.id) ? "selected" : ""}>
-                <input type="checkbox" checked={selectedProjects.has(project.id)} onChange={() => toggleProject(project.id)} />
-                <span><b>{project.name}</b><small>{project.slug}</small></span>
-              </label>)}
-              {!projects.length && <div className="drawer-project-empty">暂无可分配项目</div>}
-            </div>
-            <small className="user-project-selected">已选择 {selectedProjects.size} 个项目</small>
-          </div>
-        </Field>}
         {editing && (
           <Field label="账号状态">
             <div className="seg">
@@ -8163,7 +8120,6 @@ function UserModal({ user, onClose, onDone }) {
       </div>
       {err && <div className="alert danger">{err}</div>}
       <div className="modal-actions">
-        {editing && user.role !== "admin" && <button className="ghost danger-text" disabled={busy || deleting} onClick={() => setDeleteConfirm(true)}><Trash2 />删除账号</button>}
         <button className="ghost" onClick={onClose}>
           取消
         </button>
@@ -8176,10 +8132,6 @@ function UserModal({ user, onClose, onDone }) {
           {editing ? "保存修改" : "创建用户"}
         </button>
       </div>
-      {deleteConfirm && <Modal title="删除用户账号" onClose={() => setDeleteConfirm(false)}>
-        <div className="delete-warning"><Trash2 /><div><b>确定删除“{user.display_name || user.username}”吗？</b><p>账号将无法登录；其创建的 {user.project_count || 0} 个项目会移交给当前管理员，项目、部署记录和运行服务不会删除。</p></div></div>
-        <div className="modal-actions"><button className="ghost" onClick={() => setDeleteConfirm(false)}>取消</button><button className="danger" disabled={deleting} onClick={removeUser}>{deleting ? <LoaderCircle className="spin" /> : <Trash2 />}确认删除账号</button></div>
-      </Modal>}
     </Modal>
   );
 }

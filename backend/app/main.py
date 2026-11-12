@@ -39,7 +39,7 @@ from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployer import cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
-from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectAccess, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
+from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
 from .proxy import get_proxy_config, proxy_for, proxy_with_auth, redact_proxy
 from .schemas import (
     AiConfigIn,
@@ -73,7 +73,6 @@ from .schemas import (
     TokenOut,
     UserCreate,
     UserOut,
-    UserProjectsUpdate,
     UserUpdate,
 )
 from .ssh import SSHNode, ensure_node_runtime, test_node
@@ -103,24 +102,19 @@ def _request_user(request: Request, db: Session) -> User | None:
 def _user_can_access_project(db: Session, user: User, project_id: str) -> bool:
     if user.role == Role.admin:
         return True
-    return bool(db.scalar(select(Project.id).where(
-        Project.id == project_id,
-        (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id)),
-    )))
+    owner_id = db.scalar(select(Project.owner_id).where(Project.id == project_id))
+    return owner_id == user.id
 
 
 def _user_can_access_deployment(db: Session, user: User, deployment_id: str) -> bool:
     if user.role == Role.admin:
         return True
-    project_id = db.scalar(
-        select(Project.id)
+    owner_id = db.scalar(
+        select(Project.owner_id)
         .join(Deployment, Deployment.project_id == Project.id)
-        .where(
-            Deployment.id == deployment_id,
-            (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id)),
-        )
+        .where(Deployment.id == deployment_id)
     )
-    return bool(project_id)
+    return owner_id == user.id
 
 
 @app.middleware("http")
@@ -876,11 +870,9 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
     deployment_query = select(Deployment)
     project_query = select(Project)
     if user.role != Role.admin:
-        accessible_project_ids = select(Project.id).where(
-            (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id))
-        )
-        deployment_query = deployment_query.where(Deployment.project_id.in_(accessible_project_ids))
-        project_query = project_query.where(Project.id.in_(accessible_project_ids))
+        owned_project_ids = select(Project.id).where(Project.owner_id == user.id)
+        deployment_query = deployment_query.where(Deployment.project_id.in_(owned_project_ids))
+        project_query = project_query.where(Project.owner_id == user.id)
     recent = db.scalars(deployment_query.order_by(desc(Deployment.created_at)).limit(8)).all()
     return {
         "projects": db.scalar(select(func.count()).select_from(project_query.subquery())) or 0,
@@ -900,14 +892,9 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require(Role.adm
     owned: dict[str, list[Project]] = {}
     for project in projects:
         owned.setdefault(project.owner_id, []).append(project)
-    shared: dict[str, list[Project]] = {}
-    project_by_id = {project.id: project for project in projects}
-    for access in db.scalars(select(ProjectAccess)).all():
-        if access.project_id in project_by_id:
-            shared.setdefault(access.user_id, []).append(project_by_id[access.project_id])
     result = []
     for item in users:
-        visible = projects if item.role == Role.admin else list({project.id: project for project in [*owned.get(item.id, []), *shared.get(item.id, [])]}.values())
+        visible = projects if item.role == Role.admin else owned.get(item.id, [])
         permission = "管理全部" if item.role == Role.admin else ("只读" if item.role == Role.viewer else "管理")
         result.append({
             "id": item.id,
@@ -926,29 +913,6 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require(Role.adm
             ],
         })
     return result
-
-
-@app.put("/api/users/{item_id}/projects")
-def update_user_projects(item_id: str, body: UserProjectsUpdate, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
-    item = db.get(User, item_id)
-    if not item:
-        raise HTTPException(404, "用户不存在")
-    if item.role == Role.admin:
-        raise HTTPException(400, "管理员默认拥有全部项目，无需单独分配")
-    project_ids = list(dict.fromkeys(body.project_ids))
-    existing_ids = set(db.scalars(select(Project.id).where(Project.id.in_(project_ids))).all()) if project_ids else set()
-    if len(existing_ids) != len(project_ids):
-        raise HTTPException(400, "包含不存在的项目")
-    owned_ids = set(db.scalars(select(Project.id).where(Project.owner_id == item.id)).all())
-    assigned_ids = existing_ids - owned_ids
-    for access in db.scalars(select(ProjectAccess).where(ProjectAccess.user_id == item.id)).all():
-        db.delete(access)
-    db.flush()
-    for project_id in assigned_ids:
-        db.add(ProjectAccess(project_id=project_id, user_id=item.id))
-    audit(db, user, "update_user_projects", "user", item.id, f"分配 {len(existing_ids)} 个项目")
-    db.commit()
-    return {"ok": True, "project_ids": project_ids}
 
 
 @app.post("/api/users", response_model=UserOut)
@@ -971,13 +935,6 @@ def update_user(item_id: str, body: UserUpdate, db: Session = Depends(get_db), u
     if not item:
         raise HTTPException(404, "用户不存在")
     changes = body.model_dump(exclude_unset=True)
-    if item.id == user.id:
-        if changes.get("active") is False:
-            raise HTTPException(400, "不能停用当前登录账号")
-        if changes.get("role") not in (None, Role.admin):
-            raise HTTPException(400, "不能修改当前管理员的角色")
-        if changes.get("password"):
-            raise HTTPException(400, "请从右上角使用“修改密码”，修改后需重新登录")
     if changes.get("username") and changes["username"] != item.username and db.scalar(select(User).where(User.username == changes["username"])):
         raise HTTPException(409, "用户名已存在")
     for key, value in changes.items():
@@ -992,28 +949,6 @@ def update_user(item_id: str, body: UserUpdate, db: Session = Depends(get_db), u
     db.commit()
     db.refresh(item)
     return item
-
-
-@app.delete("/api/users/{item_id}")
-def delete_user(item_id: str, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
-    item = db.get(User, item_id)
-    if not item:
-        raise HTTPException(404, "用户不存在")
-    if item.id == user.id:
-        raise HTTPException(400, "不能删除当前登录账号")
-    if item.role == Role.admin:
-        raise HTTPException(400, "管理员账号不能直接删除，请先调整角色")
-    username = item.username
-    transferred = 0
-    for project in db.scalars(select(Project).where(Project.owner_id == item.id)).all():
-        project.owner_id = user.id
-        transferred += 1
-    for deployment in db.scalars(select(Deployment).where(Deployment.requested_by == item.id)).all():
-        deployment.requested_by = user.id
-    audit(db, user, "delete_user", "user", item.id, f"删除账号 {username}，移交 {transferred} 个项目")
-    db.delete(item)
-    db.commit()
-    return {"ok": True, "transferred_projects": transferred}
 
 
 @app.post("/api/users/{item_id}/unlock", response_model=UserOut)
@@ -1383,7 +1318,7 @@ def test_git_connection(body: GitConnectionTest, db: Session = Depends(get_db), 
 def list_projects(db: Session = Depends(get_db), user: User = Depends(current_user)):
     query = select(Project)
     if user.role != Role.admin:
-        query = query.where((Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id)))
+        query = query.where(Project.owner_id == user.id)
     return db.scalars(query.order_by(desc(Project.created_at))).all()
 
 
@@ -4912,9 +4847,7 @@ def deployment_view(
 def list_deployments(project_id: str | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
     query = select(Deployment).order_by(desc(Deployment.created_at))
     if user.role != Role.admin:
-        query = query.where(Deployment.project_id.in_(select(Project.id).where(
-            (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id))
-        )))
+        query = query.where(Deployment.project_id.in_(select(Project.id).where(Project.owner_id == user.id)))
     if project_id:
         query = query.where(Deployment.project_id == project_id)
     deployments = db.scalars(query.limit(100)).all()
