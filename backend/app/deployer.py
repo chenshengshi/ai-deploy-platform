@@ -2992,7 +2992,25 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
         # while the application actually listens on 4300.
         return "dockerfile", relative, detect_container_port(path, relative) or container_port
     if not compose_text:
-        return prepare_build(path, "auto")
+        # A Compose decision describes the complete runtime topology.  Falling
+        # back to the repository's easiest single Dockerfile here can publish
+        # only a frontend while silently dropping APIs, databases, object
+        # storage and one-shot initializers.  That partial release may even
+        # pass an HTTP check, so it must be rejected before any remote state is
+        # changed.  Dockerfile plans may still use the deterministic fallback
+        # above; explicit Compose plans may not change architecture.
+        declared_services = [
+            str(row.get("name") or row.get("service") or "").strip()
+            for row in (plan.get("services") or [])
+            if isinstance(row, dict)
+        ]
+        declared_services = [name for name in declared_services if name]
+        detail = f"（计划服务：{'、'.join(declared_services)}）" if declared_services else ""
+        raise RuntimeError(
+            "分析结果要求多服务 Compose 部署，但没有生成可执行的 Compose 配置"
+            + detail
+            + "。平台已阻止降级为单容器发布，请补齐固定镜像版本或源码构建信息后重新分析。"
+        )
     # AI may occasionally promote a source-level optional variable to `${VAR:?}`.
     # Source code is authoritative: keep it optional so the application's own
     # fallback executes instead of repeatedly asking the user for fake values.
