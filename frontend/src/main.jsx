@@ -2621,6 +2621,7 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
   const [files, setFiles] = useState([]),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
+    [showRefreshConfirm, setShowRefreshConfirm] = useState(false),
     [editingRuntime, setEditingRuntime] = useState(false),
     [runtimeRows, setRuntimeRows] = useState([]);
   const beginRuntimeEdit = () => {
@@ -2681,6 +2682,27 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
       setBusy(false);
     }
   };
+  const refreshGitSource = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api(
+        `/projects/${project.id}/integration-analysis/background`,
+        { method: "POST" },
+      );
+      setShowRefreshConfirm(false);
+      notify?.(
+        `已开始拉取 ${project.git_branch || "main"} 分支并重新分析；当前运行版本不受影响`,
+        "success",
+      );
+      onDone?.({ ...project, source_analysis: result });
+    } catch (e) {
+      setError(e.message);
+      notify?.(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <div className="source-manager">
       <div className="project-config-intro">
@@ -2720,13 +2742,25 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
           <span>当前来源</span>
           <b>{project.source_type === "git" ? "Git 仓库" : "平台上传"}</b>
         </div>
-        <div>
+        <div className="source-location-card">
           <span>源码位置</span>
-          <b>
-            {project.source_type === "git"
-              ? project.git_url || "未配置"
-              : project.source_path}
-          </b>
+          <div className="source-location-row">
+            <b title={project.source_type === "git" ? project.git_url || "未配置" : project.source_path}>
+              {project.source_type === "git"
+                ? project.git_url || "未配置"
+                : project.source_path}
+            </b>
+            {project.source_type === "git" && canEdit && (
+              <button
+                className="ghost compact source-refresh-button"
+                disabled={busy || ["queued", "running"].includes(analysis?.status)}
+                onClick={() => setShowRefreshConfirm(true)}
+              >
+                <RefreshCw />
+                拉取最新代码
+              </button>
+            )}
+          </div>
         </div>
         <div>
           <span>内部项目标识</span>
@@ -2834,9 +2868,19 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
         </div>
       ) : (
         <div className="alert info">
-          Git 项目在下一次部署时会重新拉取配置的分支：
-          {project.git_branch || "main"}。
+          发布默认使用当前已分析源码；需要更新远程代码时，请先点击“拉取最新代码”。
         </div>
+      )}
+      {showRefreshConfirm && (
+        <ConfirmDialog
+          title="拉取最新代码"
+          text={`以远程 ${project.git_branch || "main"} 分支更新源码？`}
+          description="远程代码将覆盖平台源码缓存并重新分析；当前运行版本、平台配置和历史源码不会受影响。"
+          confirmText="确认拉取并分析"
+          busy={busy}
+          onClose={() => !busy && setShowRefreshConfirm(false)}
+          onConfirm={refreshGitSource}
+        />
       )}
     </div>
   );

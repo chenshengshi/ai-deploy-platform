@@ -3728,6 +3728,27 @@ tbody tr:last-child td {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.source-location-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.source-location-row > b {
+  flex: 1;
+  min-width: 0;
+}
+.source-refresh-button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 6px 9px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.source-refresh-button svg {
+  width: 13px;
+  height: 13px;
+}
 .source-upload {
   margin: 0 24px;
 }
