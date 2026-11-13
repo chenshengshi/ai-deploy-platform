@@ -40,6 +40,10 @@ class UserUpdate(BaseModel):
     active: bool | None = None
 
 
+class UserProjectsUpdate(BaseModel):
+    project_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
 class UserProjectSummary(BaseModel):
     id: str
     name: str
@@ -151,6 +155,7 @@ class ProjectCreate(BaseModel):
     domain: str | None = None
     env_text: str | None = None
     deployment_mode: Literal["managed_fresh", "preserve_integrations"] = "managed_fresh"
+    release_strategy: Literal["auto", "source_compose", "platform_generated"] = "auto"
 
 
 class ProjectUpdate(BaseModel):
@@ -162,6 +167,7 @@ class ProjectUpdate(BaseModel):
     replica_count: int | None = Field(default=None, ge=1, le=10)
     load_balance_strategy: Literal["round_robin", "least_conn", "ip_hash"] | None = None
     deployment_mode: Literal["managed_fresh", "preserve_integrations"] | None = None
+    release_strategy: Literal["auto", "source_compose", "platform_generated"] | None = None
     image_retention_count: int | None = Field(default=None, ge=1, le=100)
     git_url: str | None = None
     git_branch: str | None = Field(default=None, max_length=100)
@@ -186,8 +192,10 @@ class ProjectOut(ORM):
     replica_count: int
     load_balance_strategy: str
     deployment_mode: str
+    release_strategy: str = "auto"
     image_retention_count: int
     domain: str | None
+    visit_path: str = ""
     owner_id: str
     created_at: datetime
     source_analysis: dict | None = None
@@ -203,6 +211,7 @@ class DeployIn(BaseModel):
     replica_count: int | None = Field(default=None, ge=1, le=10)
     load_balance_strategy: Literal["round_robin", "least_conn", "ip_hash"] | None = None
     deployment_mode: Literal["managed_fresh", "preserve_integrations"] | None = None
+    release_strategy: Literal["auto", "source_compose", "platform_generated"] | None = None
     env_text: str | None = None
 
 

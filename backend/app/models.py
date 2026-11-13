@@ -63,6 +63,15 @@ class PasswordHistory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class ProjectAccess(Base):
+    __tablename__ = "project_access"
+    __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_project_access_project_user"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class SecurityConfig(Base):
     __tablename__ = "security_config"
     id: Mapped[str] = mapped_column(String(20), primary_key=True, default="default")
@@ -137,8 +146,18 @@ class Project(Base):
     replica_count: Mapped[int] = mapped_column(Integer, default=2)
     load_balance_strategy: Mapped[str] = mapped_column(String(32), default="round_robin")
     deployment_mode: Mapped[str] = mapped_column(String(32), default="managed_fresh")
+    release_strategy: Mapped[str] = mapped_column(
+        String(32),
+        default="auto",
+        comment="发布方式：auto 自动优先源码 Compose，source_compose 使用源码 Compose，platform_generated 使用平台生成方案",
+    )
     image_retention_count: Mapped[int] = mapped_column(Integer, default=5)
     domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    visit_path: Mapped[str] = mapped_column(
+        String(500),
+        default="",
+        comment="点击项目访问按钮时追加的站内路径；不参与 Nginx 路由转发",
+    )
     managed_env_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     env_text_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     integration_analysis_json: Mapped[str | None] = mapped_column(Text, nullable=True)

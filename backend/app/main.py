@@ -37,9 +37,9 @@ from .ai import analyze_backup_scope, analyze_delete_scope, analyze_project_depl
 from .auth import current_user, hash_password, require, token_for, verify_password
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
-from .deployer import cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
+from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
-from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
+from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectAccess, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
 from .proxy import get_proxy_config, proxy_for, proxy_with_auth, redact_proxy
 from .schemas import (
     AiConfigIn,
@@ -73,6 +73,7 @@ from .schemas import (
     TokenOut,
     UserCreate,
     UserOut,
+    UserProjectsUpdate,
     UserUpdate,
 )
 from .ssh import SSHNode, ensure_node_runtime, test_node
@@ -102,19 +103,24 @@ def _request_user(request: Request, db: Session) -> User | None:
 def _user_can_access_project(db: Session, user: User, project_id: str) -> bool:
     if user.role == Role.admin:
         return True
-    owner_id = db.scalar(select(Project.owner_id).where(Project.id == project_id))
-    return owner_id == user.id
+    return bool(db.scalar(select(Project.id).where(
+        Project.id == project_id,
+        (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id)),
+    )))
 
 
 def _user_can_access_deployment(db: Session, user: User, deployment_id: str) -> bool:
     if user.role == Role.admin:
         return True
-    owner_id = db.scalar(
-        select(Project.owner_id)
+    project_id = db.scalar(
+        select(Project.id)
         .join(Deployment, Deployment.project_id == Project.id)
-        .where(Deployment.id == deployment_id)
+        .where(
+            Deployment.id == deployment_id,
+            (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id)),
+        )
     )
-    return owner_id == user.id
+    return bool(project_id)
 
 
 @app.middleware("http")
@@ -412,6 +418,7 @@ def startup():
             connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS replica_count INTEGER NOT NULL DEFAULT 2"))
             connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS load_balance_strategy VARCHAR(32) NOT NULL DEFAULT 'round_robin'"))
             connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS deployment_mode VARCHAR(32) NOT NULL DEFAULT 'managed_fresh'"))
+            connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS release_strategy VARCHAR(32) NOT NULL DEFAULT 'auto'"))
             connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS managed_env_text TEXT"))
             connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS integration_analysis_json TEXT"))
             connection.execute(text("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS docker_proxy_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
@@ -420,6 +427,8 @@ def startup():
     # New optional columns must be migrated even after the original schema
     # marker already exists on long-running installations.
     with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS release_strategy VARCHAR(32) NOT NULL DEFAULT 'auto'"))
+        connection.execute(text("COMMENT ON COLUMN projects.release_strategy IS '发布方式：auto 自动优先源码 Compose，source_compose 使用源码 Compose，platform_generated 使用平台生成方案'"))
         # Service-level scaling was introduced after the original project
         # schema marker.  Keep these migrations outside ``schema_ready`` so
         # an existing installation cannot start with an older replicas table.
@@ -437,6 +446,8 @@ def startup():
         connection.execute(text("ALTER TABLE project_domain_configs ADD COLUMN IF NOT EXISTS proxy_read_timeout INTEGER NOT NULL DEFAULT 300"))
         connection.execute(text("ALTER TABLE project_domain_configs ADD COLUMN IF NOT EXISTS client_max_body_mb INTEGER NOT NULL DEFAULT 50"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS image_retention_count INTEGER NOT NULL DEFAULT 5"))
+        connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS visit_path VARCHAR(500) NOT NULL DEFAULT ''"))
+        connection.execute(text("COMMENT ON COLUMN projects.visit_path IS '点击项目访问按钮时追加的站内路径；不参与 Nginx 路由转发'"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS data_exposure_json TEXT NOT NULL DEFAULT '{}'"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS runtime_image_overrides_json TEXT NOT NULL DEFAULT '{}'"))
         connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_repositories_json TEXT NOT NULL DEFAULT '[]'"))
@@ -870,9 +881,11 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
     deployment_query = select(Deployment)
     project_query = select(Project)
     if user.role != Role.admin:
-        owned_project_ids = select(Project.id).where(Project.owner_id == user.id)
-        deployment_query = deployment_query.where(Deployment.project_id.in_(owned_project_ids))
-        project_query = project_query.where(Project.owner_id == user.id)
+        accessible_project_ids = select(Project.id).where(
+            (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id))
+        )
+        deployment_query = deployment_query.where(Deployment.project_id.in_(accessible_project_ids))
+        project_query = project_query.where(Project.id.in_(accessible_project_ids))
     recent = db.scalars(deployment_query.order_by(desc(Deployment.created_at)).limit(8)).all()
     return {
         "projects": db.scalar(select(func.count()).select_from(project_query.subquery())) or 0,
@@ -892,9 +905,14 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require(Role.adm
     owned: dict[str, list[Project]] = {}
     for project in projects:
         owned.setdefault(project.owner_id, []).append(project)
+    shared: dict[str, list[Project]] = {}
+    project_by_id = {project.id: project for project in projects}
+    for access in db.scalars(select(ProjectAccess)).all():
+        if access.project_id in project_by_id:
+            shared.setdefault(access.user_id, []).append(project_by_id[access.project_id])
     result = []
     for item in users:
-        visible = projects if item.role == Role.admin else owned.get(item.id, [])
+        visible = projects if item.role == Role.admin else list({project.id: project for project in [*owned.get(item.id, []), *shared.get(item.id, [])]}.values())
         permission = "管理全部" if item.role == Role.admin else ("只读" if item.role == Role.viewer else "管理")
         result.append({
             "id": item.id,
@@ -913,6 +931,29 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require(Role.adm
             ],
         })
     return result
+
+
+@app.put("/api/users/{item_id}/projects")
+def update_user_projects(item_id: str, body: UserProjectsUpdate, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
+    item = db.get(User, item_id)
+    if not item:
+        raise HTTPException(404, "用户不存在")
+    if item.role == Role.admin:
+        raise HTTPException(400, "管理员默认拥有全部项目，无需单独分配")
+    project_ids = list(dict.fromkeys(body.project_ids))
+    existing_ids = set(db.scalars(select(Project.id).where(Project.id.in_(project_ids))).all()) if project_ids else set()
+    if len(existing_ids) != len(project_ids):
+        raise HTTPException(400, "包含不存在的项目")
+    owned_ids = set(db.scalars(select(Project.id).where(Project.owner_id == item.id)).all())
+    assigned_ids = existing_ids - owned_ids
+    for access in db.scalars(select(ProjectAccess).where(ProjectAccess.user_id == item.id)).all():
+        db.delete(access)
+    db.flush()
+    for project_id in assigned_ids:
+        db.add(ProjectAccess(project_id=project_id, user_id=item.id))
+    audit(db, user, "update_user_projects", "user", item.id, f"分配 {len(existing_ids)} 个项目")
+    db.commit()
+    return {"ok": True, "project_ids": project_ids}
 
 
 @app.post("/api/users", response_model=UserOut)
@@ -935,6 +976,13 @@ def update_user(item_id: str, body: UserUpdate, db: Session = Depends(get_db), u
     if not item:
         raise HTTPException(404, "用户不存在")
     changes = body.model_dump(exclude_unset=True)
+    if item.id == user.id:
+        if changes.get("active") is False:
+            raise HTTPException(400, "不能停用当前登录账号")
+        if changes.get("role") not in (None, Role.admin):
+            raise HTTPException(400, "不能修改当前管理员的角色")
+        if changes.get("password"):
+            raise HTTPException(400, "请从右上角使用“修改密码”，修改后需重新登录")
     if changes.get("username") and changes["username"] != item.username and db.scalar(select(User).where(User.username == changes["username"])):
         raise HTTPException(409, "用户名已存在")
     for key, value in changes.items():
@@ -949,6 +997,28 @@ def update_user(item_id: str, body: UserUpdate, db: Session = Depends(get_db), u
     db.commit()
     db.refresh(item)
     return item
+
+
+@app.delete("/api/users/{item_id}")
+def delete_user(item_id: str, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
+    item = db.get(User, item_id)
+    if not item:
+        raise HTTPException(404, "用户不存在")
+    if item.id == user.id:
+        raise HTTPException(400, "不能删除当前登录账号")
+    if item.role == Role.admin:
+        raise HTTPException(400, "管理员账号不能直接删除，请先调整角色")
+    username = item.username
+    transferred = 0
+    for project in db.scalars(select(Project).where(Project.owner_id == item.id)).all():
+        project.owner_id = user.id
+        transferred += 1
+    for deployment in db.scalars(select(Deployment).where(Deployment.requested_by == item.id)).all():
+        deployment.requested_by = user.id
+    audit(db, user, "delete_user", "user", item.id, f"删除账号 {username}，移交 {transferred} 个项目")
+    db.delete(item)
+    db.commit()
+    return {"ok": True, "transferred_projects": transferred}
 
 
 @app.post("/api/users/{item_id}/unlock", response_model=UserOut)
@@ -1318,7 +1388,7 @@ def test_git_connection(body: GitConnectionTest, db: Session = Depends(get_db), 
 def list_projects(db: Session = Depends(get_db), user: User = Depends(current_user)):
     query = select(Project)
     if user.role != Role.admin:
-        query = query.where(Project.owner_id == user.id)
+        query = query.where((Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id)))
     return db.scalars(query.order_by(desc(Project.created_at))).all()
 
 
@@ -2066,6 +2136,7 @@ def analyze_project_integrations(item_id: str, db: Session = Depends(get_db), us
         # the slower model call for unusual integrations that static evidence
         # cannot classify.
         root = Path(source)
+        source_compose = _complete_source_compose(root)
         config_text = ""
         config_names = {"application.yml", "application.yaml", "application.properties", ".env", ".env.example", "bootstrap.yml", "bootstrap.yaml", "package.json", "pom.xml", "build.gradle", "requirements.txt", "go.mod", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
         for path in root.rglob("*"):
@@ -2123,6 +2194,25 @@ def analyze_project_integrations(item_id: str, db: Session = Depends(get_db), us
         except Exception as exc:
             plan = None
             plan_error = str(exc)
+        # Use the same deterministic Compose decision for analysis display and
+        # actual publishing.  Previously publishing could discover a complete
+        # source Compose later while the settings page still showed the stale
+        # AI conclusion "platform generated".
+        if source_compose:
+            source_compose_path, _ = source_compose
+            source_primary_file = source_compose_path.relative_to(root).as_posix()
+            if plan is None:
+                plan = {
+                    "summary": "检测到完整源码 Compose，发布时保留源码服务拓扑",
+                    "deployment_kind": "compose",
+                    "services": [],
+                }
+            plan["deployment_kind"] = "compose"
+            plan["primary_file"] = source_primary_file
+            plan["source_compose_authoritative"] = True
+            plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + [
+                f"检测到完整源码 Compose，发布时保留全部服务、依赖、初始化任务和数据卷：{source_primary_file}"
+            ]
         # AI is an enhancement, not a single point of failure for publishing.
         # When the configured upstream is unavailable, keep the deterministic
         # source scan (including an empty result) and allow the user to retry
@@ -2781,6 +2871,25 @@ def delete_certificate(certificate_id: str, db: Session = Depends(get_db), user:
     return {"ok": True}
 
 
+def _normalize_visit_path(value: object) -> str:
+    """Normalize the optional page opened by the UI's visit action.
+
+    This is deliberately separate from gateway routing: it changes only the
+    browser destination and never participates in health checks or proxying.
+    """
+    visit_path = str(value or "").strip()
+    if not visit_path or visit_path == "/":
+        return ""
+    if len(visit_path) > 500 or "://" in visit_path or "\\" in visit_path or "\r" in visit_path or "\n" in visit_path:
+        raise HTTPException(400, "访问入口格式不正确")
+    if not visit_path.startswith("/"):
+        visit_path = f"/{visit_path}"
+    parsed = urlsplit(visit_path)
+    if parsed.scheme or parsed.netloc:
+        raise HTTPException(400, "访问入口只能填写站内路径")
+    return visit_path
+
+
 @app.get("/api/projects/{item_id}/domain-config")
 def get_project_domain_config(item_id: str, db: Session = Depends(get_db), _: User = Depends(current_user)):
     item = db.get(Project, item_id)
@@ -2840,6 +2949,7 @@ def get_project_domain_config(item_id: str, db: Session = Depends(get_db), _: Us
         custom_routes = []
     return {
         "domain": item.domain or "",
+        "visit_path": item.visit_path or "",
         "http_port": config.http_port if config else deployment_settings.default_domain_http_port,
         "https_enabled": config.https_enabled if config else False,
         "https_port": config.https_port if config else deployment_settings.default_domain_https_port,
@@ -2871,7 +2981,13 @@ def get_project_gateway_preview(item_id: str, db: Session = Depends(get_db), _: 
         Deployment.status == DeployStatus.success,
     ).order_by(desc(Deployment.created_at)).limit(1))
     if not latest:
-        return {"generated": False, "message": "项目尚无成功运行的版本，部署完成后才会生成网关配置", "routes": [], "config": ""}
+        return {
+            "generated": False,
+            "message": "项目尚无成功运行的版本，部署完成后才会生成网关配置",
+            "visit_path": item.visit_path or "",
+            "routes": [],
+            "config": "",
+        }
     node = db.get(Node, latest.node_id)
     if not node:
         raise HTTPException(404, "部署节点不存在")
@@ -2916,6 +3032,7 @@ def get_project_gateway_preview(item_id: str, db: Session = Depends(get_db), _: 
         except Exception as exc:
             return {
                 "generated": False, "message": f"网关配置读取失败：{exc}", "mode": mode,
+                "visit_path": item.visit_path or "",
                 "routes": routes, "config": "", "config_path": filename,
             }
     return {
@@ -2923,6 +3040,7 @@ def get_project_gateway_preview(item_id: str, db: Session = Depends(get_db), _: 
         "message": "平台当前正在使用的配置" if generated_config else "尚未找到已生效的网关配置文件",
         "mode": mode,
         "access_url": latest.access_url,
+        "visit_path": item.visit_path or "",
         "gateway_node": gateway.name if gateway else None,
         "gateway_address": (gateway.public_address or gateway.host) if gateway else None,
         "domain": item.domain or "",
@@ -2962,6 +3080,7 @@ def update_project_gateway_policy(
         raise HTTPException(400, "网关超时或上传大小格式不正确")
     if not 1 <= timeout <= 3600 or not 1 <= upload_mb <= 2048:
         raise HTTPException(400, "网关超时或上传大小超出允许范围")
+    visit_path = _normalize_visit_path(body.get("visit_path", item.visit_path or ""))
 
     latest = db.scalar(select(Deployment).where(
         Deployment.project_id == item_id,
@@ -2996,6 +3115,7 @@ def update_project_gateway_policy(
         config.custom_routes_json = json.dumps(normalized_routes, ensure_ascii=False)
     config.proxy_read_timeout = timeout
     config.client_max_body_mb = upload_mb
+    item.visit_path = visit_path
     db.add(config)
     db.flush()
     if latest and node:
@@ -3157,6 +3277,7 @@ async def save_project_domain_config(
     custom_routes_json: str = Form(default="[]"),
     proxy_read_timeout: int = Form(default=300),
     client_max_body_mb: int = Form(default=50),
+    visit_path: str = Form(default=""),
     certificate_id: str = Form(default=""),
     certificate: UploadFile | None = File(default=None),
     private_key: UploadFile | None = File(default=None),
@@ -3177,6 +3298,7 @@ async def save_project_domain_config(
         raise HTTPException(400, "网关模式不正确")
     if not 1 <= proxy_read_timeout <= 3600 or not 1 <= client_max_body_mb <= 2048:
         raise HTTPException(400, "网关超时或上传大小超出允许范围")
+    visit_path = _normalize_visit_path(visit_path)
     try:
         custom_routes = json.loads(custom_routes_json or "[]")
     except Exception:
@@ -3252,6 +3374,7 @@ async def save_project_domain_config(
     # configure_platform_gateway refreshes these authoritative values so a
     # deployment finishing concurrently cannot restore an older HTTPS state.
     item.domain = domain or None
+    item.visit_path = visit_path
     config.http_port = http_port
     config.https_enabled = https_enabled
     config.https_port = https_port
@@ -3326,6 +3449,8 @@ def update_project(item_id: str, body: ProjectUpdate, db: Session = Depends(get_
         item.load_balance_strategy = body.load_balance_strategy
     if "deployment_mode" in fields_set and body.deployment_mode is not None:
         item.deployment_mode = body.deployment_mode
+    if "release_strategy" in fields_set and body.release_strategy is not None:
+        item.release_strategy = body.release_strategy
     if "image_retention_count" in fields_set and body.image_retention_count is not None:
         item.image_retention_count = body.image_retention_count
     if "git_url" in fields_set:
@@ -4162,7 +4287,7 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
         project.env_text_encrypted = encrypt(env_text.strip() + "\n" if env_text.strip() else "")
     for field in (
         "name", "domain", "container_port", "host_port", "load_balance_enabled",
-        "replica_count", "load_balance_strategy", "deployment_mode",
+        "replica_count", "load_balance_strategy", "deployment_mode", "release_strategy",
     ):
         if field in submitted:
             setattr(project, field, getattr(body, field))
@@ -4193,9 +4318,34 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
     return item
 
 
+def compact_docker_pull_log(section: str) -> str:
+    """Collapse terminal-style Docker layer refreshes into one latest row per layer."""
+    lines = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", section).replace("\r", "\n").splitlines()
+    visible: list[str] = []
+    latest: dict[tuple[str, str], str] = {}
+    order: list[tuple[str, str]] = []
+    progress_pattern = re.compile(
+        r"^(?:\[[^\n]+?\]\s*)*([0-9a-f]{12})\s+(Downloading|Extracting)\s+\[.*",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        match = progress_pattern.match(line.strip())
+        if not match:
+            visible.append(line)
+            continue
+        key = (match.group(1), match.group(2).lower())
+        if key not in latest:
+            order.append(key)
+        latest[key] = line
+    if latest:
+        visible.append("[镜像下载进度（每层仅保留最新状态）]")
+        visible.extend(latest[key] for key in order)
+    return "\n".join(visible).strip()
+
+
 def compact_stage_log(section: str) -> str:
     """Keep live Docker progress readable without altering downloadable logs."""
-    lines = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", section).splitlines()
+    lines = compact_docker_pull_log(section).splitlines()
     visible: list[str] = []
     latest_progress: tuple[str, str] | None = None
     compose_progress: dict[str, str] = {}
@@ -4847,7 +4997,9 @@ def deployment_view(
 def list_deployments(project_id: str | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
     query = select(Deployment).order_by(desc(Deployment.created_at))
     if user.role != Role.admin:
-        query = query.where(Deployment.project_id.in_(select(Project.id).where(Project.owner_id == user.id)))
+        query = query.where(Deployment.project_id.in_(select(Project.id).where(
+            (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id))
+        )))
     if project_id:
         query = query.where(Deployment.project_id == project_id)
     deployments = db.scalars(query.limit(100)).all()
@@ -4882,7 +5034,12 @@ def download_deployment_log(item_id: str, db: Session = Depends(get_db), _: User
     filename = f"{project.slug if project else 'deployment'}-{item.release or item.id[:8]}.log"
     path = Path(settings.upload_root) / "deployment-logs" / f"{item.id}.log"
     if path.is_file():
-        return FileResponse(path, filename=filename, media_type="text/plain; charset=utf-8")
+        content = compact_docker_pull_log(path.read_text(encoding="utf-8", errors="replace"))
+        return Response(
+            content=content,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
     # Older records predate append-only files; return their retained database
     # log instead of making the download action fail.
     return Response(
@@ -7282,6 +7439,17 @@ def stop(item_id: str, db: Session = Depends(get_db), user: User = Depends(requi
                         db.delete(replica)
             db.flush()
         output = stop_deployment(item, db.get(Project, item.project_id), db.get(Node, item.node_id), preserve_runtime=bool(protected_runtime))
+        if protected_runtime:
+            # The candidate may have temporarily stopped the previous release
+            # to obtain an exclusive application volume. Cancellation must be
+            # self-healing: re-apply the immutable successful release and wait
+            # until its published endpoint is ready before reporting success.
+            protected_project = db.get(Project, protected_runtime.project_id)
+            protected_node = db.get(Node, protected_runtime.node_id)
+            restored = start_deployment(
+                protected_runtime, protected_project, protected_node, db,
+            )
+            output += "；已核验并恢复原线上版本（" + restored + "）"
         if not protected_runtime:
             output += f"；已停止并清理 {len(removed_replica_names)} 个应用副本，固定 Service 配置已保留"
         # A release-level stop controls only this version's application

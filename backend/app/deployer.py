@@ -322,13 +322,36 @@ def tracked_run(
     channel_stream = stream
     if stream and stream_channel:
         label = stream_label or stream_channel
+        docker_progress_buckets: dict[tuple[str, str], int] = {}
         log(deployment_id, f"[构建通道] {stream_channel}|{label}|开始|{datetime.now(timezone.utc).isoformat()}\n")
 
         def channel_stream(chunk: str) -> None:
             cleaned = ANSI_RE.sub("", str(chunk or "")).replace("\r", "\n")
+            readable: list[str] = []
+            for raw_line in cleaned.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                progress = re.match(
+                    r"^([0-9a-f]{12})\s+(Downloading|Extracting)\s+\[.*?\]\s+"
+                    r"([0-9.]+)([kMGT]?B)/([0-9.]+)([kMGT]?B)",
+                    line,
+                    re.IGNORECASE,
+                )
+                if progress:
+                    layer, state, current, current_unit, total, total_unit = progress.groups()
+                    unit_scale = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+                    current_bytes = float(current) * unit_scale.get(current_unit.upper(), 1)
+                    total_bytes = float(total) * unit_scale.get(total_unit.upper(), 1)
+                    bucket = min(10, int((current_bytes / total_bytes) * 10)) if total_bytes else 0
+                    key = (layer, state.lower())
+                    if docker_progress_buckets.get(key) == bucket:
+                        continue
+                    docker_progress_buckets[key] = bucket
+                readable.append(line)
             stamped = "".join(
                 f"[{datetime.now(timezone.utc).isoformat()}][构建:{stream_channel}] {line}\n"
-                for line in cleaned.splitlines() if line.strip()
+                for line in readable
             )
             if stamped:
                 stream(stamped)
@@ -1107,6 +1130,38 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
     error = (previous_error or "").lower()
     changed: list[str] = []
     root = Path(path)
+    # User-defined Spring String placeholders usually describe optional
+    # business integrations (sync.*, sms.*, oss.*, callback.*, and so on).
+    # Give every member of those namespaces an empty default in the isolated
+    # release copy up front. This prevents a deployment from failing once per
+    # missing sibling property while keeping infrastructure connections strict.
+    strict_spring_namespaces = {
+        "spring", "datasource", "database", "db", "mysql", "mariadb",
+        "postgres", "redis", "mongo", "mongodb", "minio", "s3",
+    }
+    strict_value = re.compile(
+        r'(@Value\(\s*["\']\$\{)'
+        r'([A-Za-z][A-Za-z0-9_-]*)'
+        r'(\.[A-Za-z0-9_.-]+)'
+        r'(\}["\']\s*\)\s*(?:private|protected|public)\s+String\s+)',
+        re.MULTILINE,
+    )
+
+    def default_optional_string(match: re.Match) -> str:
+        namespace = match.group(2)
+        if namespace.lower() in strict_spring_namespaces:
+            return match.group(0)
+        return f"{match.group(1)}{namespace}{match.group(3)}:{match.group(4)}"
+
+    for source_file in root.rglob("*.java"):
+        if any(part in {".git", "target", "build"} for part in source_file.parts):
+            continue
+        original = source_file.read_text(encoding="utf-8", errors="replace")
+        repaired = strict_value.sub(default_optional_string, original)
+        if repaired == original:
+            continue
+        source_file.write_text(repaired, encoding="utf-8")
+        changed.append(source_file.relative_to(root).as_posix())
     generated_dockerfiles = list(root.rglob("Dockerfile*")) + list(root.rglob(".yunzhou*.Dockerfile"))
     generated_dockerfiles = list(dict.fromkeys(generated_dockerfiles))
     # Gradle's official distribution endpoint is extremely slow on the
@@ -2018,6 +2073,32 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
     )
     if placeholder_match:
         placeholder = placeholder_match.group(1).strip()
+        # A project may contain an optional outbound feature whose String
+        # properties were written as strict Spring @Value placeholders. Once
+        # a real startup failure proves one member is absent, repair the whole
+        # feature namespace in the disposable release copy so deployment does
+        # not fail repeatedly on sibling keys. Core database/cache namespaces
+        # are deliberately excluded and remain strict configuration errors.
+        namespace = placeholder.split(".", 1)[0] if "." in placeholder else ""
+        if namespace and namespace.lower() not in strict_spring_namespaces:
+            annotation = re.compile(
+                r'(@Value\(\s*["\']\$\{)'
+                + re.escape(namespace)
+                + r'(\.[A-Za-z0-9_.-]+)(\}["\']\s*\)\s*'
+                  r'(?:private|protected|public)\s+String\s+)',
+                re.MULTILINE,
+            )
+            for source_file in root.rglob("*.java"):
+                if any(part in {".git", "target", "build"} for part in source_file.parts):
+                    continue
+                original = source_file.read_text(encoding="utf-8", errors="replace")
+                repaired = annotation.sub(r"\1" + namespace + r"\2:\3", original)
+                if repaired == original:
+                    continue
+                source_file.write_text(repaired, encoding="utf-8")
+                relative = source_file.relative_to(root).as_posix()
+                if relative not in changed:
+                    changed.append(relative)
         if re.search(r"(?:url|uri)$", placeholder, re.I):
             env_key = re.sub(r"[^A-Za-z0-9]", "_", placeholder).upper()
             fallback_url = "http://127.0.0.1:9/"
@@ -2831,7 +2912,47 @@ def prune_undeclared_development_services(compose: dict, plan: dict) -> list[str
     return removed
 
 
-def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int | None]:
+def _complete_source_compose(root: Path) -> tuple[Path, str] | None:
+    """Return a complete repository-owned Compose topology when available.
+
+    AI remains useful for explaining and repairing a deployment, but it must
+    not rename or omit services from a production Compose file supplied by the
+    project.  Generated Yunzhou files are deliberately excluded here.
+    """
+    source_names = COMPOSE_NAMES[:4]
+    ignored = {".git", "node_modules", "target", "dist", "build", "vendor"}
+    candidates: list[Path] = []
+    for name in source_names:
+        direct = root / name
+        if direct.is_file():
+            candidates.append(direct)
+        for candidate in root.rglob(name):
+            relative = candidate.relative_to(root)
+            if len(relative.parts) <= 4 and not any(part in ignored for part in relative.parts):
+                candidates.append(candidate)
+    for candidate in sorted(set(candidates), key=lambda item: (len(item.relative_to(root).parts), item.as_posix())):
+        try:
+            document = yaml.safe_load(candidate.read_text(encoding="utf-8", errors="replace")) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        services = document.get("services") if isinstance(document, dict) else None
+        if not isinstance(services, dict) or len(services) < 2:
+            continue
+        if any(not isinstance(service, dict) or not (service.get("image") or service.get("build")) for service in services.values()):
+            continue
+        application_services = [
+            name for name in services
+            if not any(token in str(name).lower() for token in ("mysql", "mariadb", "postgres", "mongo", "redis", "minio", "rustfs", "init"))
+        ]
+        if not application_services:
+            continue
+        return candidate, candidate.read_text(encoding="utf-8", errors="replace")
+    return None
+
+
+def materialize_ai_deployment_plan(
+    path: str, plan: dict, release_strategy: str = "auto"
+) -> tuple[str, str, int | None]:
     """Validate and materialize an AI plan without allowing host-level escape hatches."""
     root = Path(path).resolve()
     detected_api = detect_frontend_api_routes(path)
@@ -2891,11 +3012,25 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
             if candidate:
                 managed_api_prefix = candidate
                 break
+    source_compose = None if release_strategy == "platform_generated" else _complete_source_compose(root)
+    if release_strategy == "source_compose" and not source_compose:
+        raise RuntimeError("项目选择了按源码 Compose 发布，但当前源码中未检测到可直接运行的完整 Docker Compose")
     kind = str(plan.get("deployment_kind") or "").strip().lower()
-    if not str(plan.get("summary") or "").strip() or kind not in {"compose", "dockerfile"}:
+    if not source_compose and (
+        not str(plan.get("summary") or "").strip() or kind not in {"compose", "dockerfile"}
+    ):
         raise RuntimeError("AI 返回的部署方案缺少架构结论或部署类型")
     dockerfile_text = strip_generated_code_fence(plan.get("dockerfile") or "")
     compose_text = strip_generated_code_fence(plan.get("compose_yaml") or "")
+    if source_compose:
+        source_path, compose_text = source_compose
+        kind = "compose"
+        dockerfile_text = ""
+        plan["primary_file"] = source_path.relative_to(root).as_posix()
+        plan["source_compose_authoritative"] = True
+        plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + [
+            f"检测到完整源码 Compose，保留其全部服务、依赖、初始化任务和数据卷：{plan['primary_file']}"
+        ]
     resolved_platform_images = []
     for variable, image in PLATFORM_IMAGE_VARIABLES.items():
         pattern = rf"\$\{{{re.escape(variable)}(?::(?:-|\?)[^}}]*)?\}}"
@@ -3020,6 +3155,59 @@ def materialize_ai_deployment_plan(path: str, plan: dict) -> tuple[str, str, int
     services = compose.get("services") if isinstance(compose, dict) else None
     if not isinstance(services, dict) or not services:
         raise RuntimeError("AI 生成的 Compose 没有可运行服务")
+    if source_compose:
+        # Published ports in repository Compose files are normally intended
+        # for a developer workstation and can collide across projects.  Keep
+        # every internal port and service relationship, but let the platform
+        # publish exactly one verified gateway below.
+        for service in services.values():
+            if isinstance(service, dict):
+                exposed = [str(value) for value in (service.get("expose") or [])]
+                for mapping in service.get("ports") or []:
+                    if isinstance(mapping, dict):
+                        target = str(mapping.get("target") or "").strip()
+                    else:
+                        raw = str(mapping).split("/", 1)[0]
+                        target = raw.rsplit(":", 1)[-1].strip()
+                    if target.isdigit() and target not in exposed:
+                        exposed.append(target)
+                if exposed:
+                    service["expose"] = exposed
+                service.pop("ports", None)
+        gateway = next((name for name in services if str(name).lower() in {"nginx", "gateway", "proxy"}), "")
+        if not gateway:
+            gateway = max(
+                services,
+                key=lambda name: (
+                    int(any(token in str(name).lower() for token in ("web", "front", "ui"))),
+                    int("nginx" in yaml.safe_dump(services[name], allow_unicode=True).lower()),
+                ),
+            )
+        source_roles = []
+        for name in services:
+            lowered = str(name).lower()
+            if name == gateway:
+                role = "app"
+            elif any(token in lowered for token in ("mysql", "mariadb", "postgres", "mongo", "redis", "minio", "rustfs")) and "init" not in lowered:
+                role = "data"
+            elif "init" in lowered:
+                role = "worker"
+            elif any(token in lowered for token in ("web", "front", "ui")):
+                role = "frontend"
+            else:
+                role = "backend"
+            source_roles.append({"service": name, "role": role, "scalable": name == gateway})
+        traffic_plan = {
+            "service_roles": source_roles,
+            "default_service": gateway,
+            "traffic_routes": [{"path": "/", "service": gateway, "strip_prefix": False}],
+        }
+        plan["traffic_plan"] = traffic_plan
+        # Carry the topology decision with the executable artifact.  Later
+        # packaging stages may be resumed with a deployment plan loaded from
+        # an older analysis; the materialized Compose is the final authority.
+        compose["x-yunzhou-source-compose"] = True
+        compose["x-yunzhou-entry-service"] = gateway
     removed_helpers = prune_undeclared_development_services(compose, plan)
     if removed_helpers:
         plan["safe_repairs"] = list(plan.get("safe_repairs") or []) + [
@@ -4014,20 +4202,26 @@ def preflight_ai_deployment_plan(
             ),
         )
         effective_plan, automatic_repairs = adapt_plan_to_current_integrations(plan, project)
-        build_type, build_file, detected_port = materialize_ai_deployment_plan(str(rehearsal), effective_plan)
+        build_type, build_file, detected_port = materialize_ai_deployment_plan(
+            str(rehearsal), effective_plan, getattr(project, "release_strategy", "auto") or "auto"
+        )
         # Reuse only bounded repair classifiers implemented by the platform.
         # The previous failure is evidence, never a command or model prompt.
         safe_repairs = apply_safe_build_repairs(str(rehearsal), previous_error, project.deployment_mode)
         managed_integrations: list[str] = []
         generated_secrets: list[str] = []
-        if build_type == "compose" and project.deployment_mode == "managed_fresh":
-            # Analysis must exercise the same managed-service preparation as a
-            # real deployment. Otherwise platform-owned credentials (Redis,
-            # MySQL, MinIO, etc.) are incorrectly shown as user configuration
-            # and a valid project is blocked before the worker can generate
-            # them. All file changes happen in the disposable rehearsal copy;
-            # only generated managed values are retained on the project.
+        if build_type == "compose":
+            # Analysis must exercise the same integration reconciliation as a
+            # real deployment for every deployment mode. In particular, an
+            # external MySQL selection is a final decision: an AI/source plan
+            # must not reintroduce a mysql/db service during preflight. This
+            # also keeps the stored preflight topology consistent with the
+            # files that are eventually deployed.
             managed_integrations = reconcile_managed_integrations(project, str(rehearsal), build_file)
+            # This helper generates only platform-owned credentials and skips
+            # third-party integration prefixes, so it is safe for a mixed
+            # preserve-integrations plan (for example external MySQL plus a
+            # platform-managed Redis) as well as managed-fresh deployments.
             generated_secrets = ensure_managed_secrets(project, str(rehearsal), build_file)
         missing = required_compose_variables(
             str(rehearsal), build_file, effective_project_environment(project)
@@ -5374,6 +5568,38 @@ def prepare_compose_image_override(
     compose_changed = False
     root = Path(work)
     traffic_plan = _project_traffic_plan(project, deployment_plan)
+    source_compose_authoritative = bool(document.get("x-yunzhou-source-compose"))
+    if source_compose_authoritative:
+        actual_services = document.get("services") or {}
+        marked_entry = str(document.get("x-yunzhou-entry-service") or "").strip()
+        if marked_entry not in actual_services:
+            marked_entry = next(
+                (name for name in actual_services if str(name).lower() in {"nginx", "gateway", "proxy"}),
+                "",
+            )
+        if not marked_entry and actual_services:
+            marked_entry = max(
+                actual_services,
+                key=lambda name: (
+                    int(any(token in str(name).lower() for token in ("web", "front", "ui"))),
+                    int("nginx" in yaml.safe_dump(actual_services[name], allow_unicode=True).lower()),
+                    -int(any(token in str(name).lower() for token in ("mysql", "postgres", "mongo", "redis", "minio", "rustfs", "init"))),
+                ),
+            )
+        # Only the source gateway is published.  Every other service keeps its
+        # original Compose DNS name and remains reachable on the project
+        # network, so init jobs and multi-backend applications cannot be
+        # mistaken for separate public entry points by stale AI metadata.
+        traffic_plan = {
+            "service_roles": [
+                {"service": name, "role": "app" if name == marked_entry else "internal", "scalable": name == marked_entry}
+                for name in actual_services
+            ],
+            "default_service": marked_entry,
+            "traffic_routes": [{"path": "/", "service": marked_entry, "strip_prefix": False}] if marked_entry else [],
+        }
+        if isinstance(deployment_plan, dict):
+            deployment_plan["traffic_plan"] = traffic_plan
     service_roles = _traffic_service_roles(traffic_plan)
     routed_services = {
         str(route.get("service") or route.get("target_service") or "").strip()
@@ -5750,6 +5976,138 @@ def split_compose_runtime(
         networks[app_egress_key] = None
         service["networks"] = networks
         app_services[name] = service
+
+    # A source Nginx configuration may reference a compact/legacy upstream
+    # hostname (for example ``wmsapi``) while the Compose service is named
+    # ``wms-api`` or ``backend``.  apply_safe_build_repairs adds the unique
+    # network alias before this split.  Preserve startup ordering here as well:
+    # without it Nginx can start before Docker has attached the target service
+    # to the network, fail DNS resolution and enter a needless restart loop.
+    alias_targets: dict[str, set[str]] = {}
+    for target_name, target_service in app_services.items():
+        target_networks = target_service.get("networks") or {}
+        if not isinstance(target_networks, dict):
+            continue
+        for network_config in target_networks.values():
+            if not isinstance(network_config, dict):
+                continue
+            for alias in network_config.get("aliases") or []:
+                normalized_alias = re.sub(r"[^a-z0-9]", "", str(alias).lower())
+                if normalized_alias:
+                    alias_targets.setdefault(normalized_alias, set()).add(target_name)
+
+    nginx_upstream_pattern = re.compile(
+        r"(?im)\b(?:proxy_pass\s+https?://|server\s+)"
+        r"([a-z][a-z0-9_-]*)(?::(\d+))?"
+    )
+
+    def service_target_ports(service: dict) -> set[int]:
+        """Return container-side ports declared by one Compose service."""
+        result: set[int] = set()
+        for exposed in service.get("expose") or []:
+            match = re.match(r"(\d+)", str(exposed))
+            if match:
+                result.add(int(match.group(1)))
+        for mapping in service.get("ports") or []:
+            if isinstance(mapping, dict):
+                target = mapping.get("target")
+                if str(target or "").isdigit():
+                    result.add(int(target))
+                continue
+            value = str(mapping).split("/", 1)[0]
+            target = value.rsplit(":", 1)[-1]
+            if target.isdigit():
+                result.add(int(target))
+        return result
+    source_root = Path(work)
+    nginx_files: list[Path] = []
+    for pattern in ("**/nginx.conf", "**/*.nginx.conf", "**/conf.d/*.conf"):
+        nginx_files.extend(source_root.glob(pattern))
+    for config_file in dict.fromkeys(nginx_files):
+        try:
+            config_text = config_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        upstream_refs = {(host, int(port) if port else None) for host, port in nginx_upstream_pattern.findall(config_text)}
+        if not upstream_refs:
+            continue
+
+        # Prefer the service whose build context contains the Nginx file.  If
+        # source layout is unusual, use a unique Nginx/frontend/web service.
+        gateway_candidates: list[str] = []
+        for candidate_name, candidate_service in app_services.items():
+            build = candidate_service.get("build")
+            context = build.get("context") if isinstance(build, dict) else build
+            context_path = (source_root / str(context or ".")).resolve()
+            try:
+                if config_file.resolve().is_relative_to(context_path):
+                    gateway_candidates.append(candidate_name)
+            except (OSError, ValueError):
+                continue
+        if len(gateway_candidates) != 1:
+            named_candidates = [
+                name for name, service in app_services.items()
+                if any(token in f"{name} {service.get('image', '')}".lower()
+                       for token in ("nginx", "frontend", "front-end", "web", "ui"))
+            ]
+            gateway_candidates = named_candidates if len(named_candidates) == 1 else []
+        if len(gateway_candidates) != 1:
+            continue
+
+        gateway_name = gateway_candidates[0]
+        gateway = app_services[gateway_name]
+        dependencies: set[str] = set()
+        for host, upstream_port in upstream_refs:
+            normalized_host = re.sub(r"[^a-z0-9]", "", host.lower())
+            matches = set(alias_targets.get(normalized_host) or set())
+            matches.update(
+                name for name in app_services
+                if re.sub(r"[^a-z0-9]", "", str(name).lower()) == normalized_host
+            )
+            matches.discard(gateway_name)
+            # Names frequently change during platform normalization. Resolve
+            # an otherwise unknown upstream from objective runtime evidence:
+            # its container port and the set of non-gateway services. This is
+            # safe only when the result is unique; multi-backend ambiguity is
+            # deliberately left unresolved for preflight to report.
+            if not matches and upstream_port:
+                matches = {
+                    name for name, service in app_services.items()
+                    if name != gateway_name and upstream_port in service_target_ports(service)
+                }
+            if not matches:
+                non_gateway = set(app_services) - {gateway_name}
+                if len(non_gateway) == 1:
+                    matches = non_gateway
+            if len(matches) == 1:
+                target_name = next(iter(matches))
+                dependencies.add(target_name)
+                target = app_services[target_name]
+                target_networks = target.get("networks") or {}
+                if isinstance(target_networks, list):
+                    target_networks = {name: {} for name in target_networks}
+                if not isinstance(target_networks, dict):
+                    target_networks = {}
+                shared = target_networks.get(network_key)
+                if not isinstance(shared, dict):
+                    shared = {}
+                aliases = list(shared.get("aliases") or [])
+                if host not in aliases:
+                    aliases.append(host)
+                shared["aliases"] = aliases
+                target_networks[network_key] = shared
+                target["networks"] = target_networks
+                alias_targets.setdefault(normalized_host, set()).add(target_name)
+        if not dependencies:
+            continue
+        depends = gateway.get("depends_on")
+        if isinstance(depends, dict):
+            for dependency in dependencies:
+                depends.setdefault(dependency, {"condition": "service_started"})
+        else:
+            depends_list = list(depends or []) if isinstance(depends, list) else []
+            depends_list.extend(sorted(dependencies - set(depends_list)))
+            gateway["depends_on"] = depends_list
 
     common = {key: copy.deepcopy(document[key]) for key in ("configs", "secrets") if key in document}
     data_document = {
@@ -6148,6 +6506,13 @@ def central_build_and_distribute(
         pnpm_cache_dir = (build_policy.pnpm_cache_dir if build_policy else "") or "/root/.local/share/pnpm/store"
         yarn_cache_dir = (build_policy.yarn_cache_dir if build_policy else "") or "/root/.cache/yarn"
         pip_cache_dir = (build_policy.pip_cache_dir if build_policy else "") or "/root/.cache/pip"
+        maven_cache_env = f"-e MAVEN_OPTS={shlex.quote('-Dmaven.repo.local=' + maven_cache_dir)} "
+        gradle_cache_env = f"-e GRADLE_USER_HOME={shlex.quote(gradle_cache_dir)} "
+        node_cache_env = (
+            f"-e npm_config_cache={shlex.quote(npm_cache_dir)} "
+            f"-e YARN_CACHE_FOLDER={shlex.quote(yarn_cache_dir)} "
+        )
+        pip_cache_env = f"-e PIP_CACHE_DIR={shlex.quote(pip_cache_dir)} "
         cache_dirs = " ".join(
             shlex.quote(f"{cache_root}/{name}")
             for name in ("maven", "gradle", "pnpm", "npm", "yarn", "pip", "nuget", "go-mod", "go-build")
@@ -6573,6 +6938,7 @@ def central_build_and_distribute(
                         f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                         f"-v {shlex.quote(str(pom.parent))}:/workspace "
                         f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                        f"{maven_cache_env}"
                         f"-w /workspace {shlex.quote(maven_image)} sh -lc "
                         + shlex.quote(f"mvn -B {module_arg}-DskipTests package")
                     )
@@ -6624,6 +6990,7 @@ def central_build_and_distribute(
                                 f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                                 f"-v {shlex.quote(str(pom.parent))}:/workspace "
                                 f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                                f"{maven_cache_env}"
                                 f"-w /workspace {shlex.quote(maven_image)} sh -lc {shlex.quote(repackage)}"
                             )
                             log(deployment.id, f"[平台构建] 普通 JAR 按 Spring Boot {boot_version} 自动重打包并校验。\n")
@@ -6698,7 +7065,7 @@ def central_build_and_distribute(
                 )
             elif (package_dir / "yarn.lock").is_file() or manager_hint.startswith("yarn"):
                 manager = "yarn"
-                install = "yarn install --frozen-lockfile --prefer-offline --network-timeout 600000" + ("; yarn build" if build_script else " --ignore-scripts")
+                install = f"yarn install --cache-folder {shlex.quote(yarn_cache_dir)} --frozen-lockfile --prefer-offline --network-timeout 600000" + ("; yarn build" if build_script else " --ignore-scripts")
             else:
                 manager = "npm"
                 # Keep the checkout's node_modules between releases. npm's
@@ -6761,6 +7128,7 @@ def central_build_and_distribute(
                 f"-v {shlex.quote(cache_root + '/pnpm' + ':' + pnpm_cache_dir)} "
                 f"-v {shlex.quote(cache_root + '/npm' + ':' + npm_cache_dir)} "
                 f"-v {shlex.quote(cache_root + '/yarn' + ':' + yarn_cache_dir)} "
+                f"{node_cache_env}"
                 f"{node_modules_mount}"
                 f"-w /workspace {node_image} sh -lc "
                 + shlex.quote("set -e; trap 'rm -rf .pnpm-store' EXIT; " + install)
@@ -6861,6 +7229,7 @@ def central_build_and_distribute(
                     # /root/.gradle is otherwise ignored and every release
                     # downloads the wrapper and dependencies again.
                     f"-v {shlex.quote(cache_root + '/gradle' + ':' + gradle_cache_dir)} "
+                    f"{gradle_cache_env}"
                     f"-w /workspace {shlex.quote(gradle_helper_image)} sh -lc "
                     + shlex.quote(compile_script)
                 )
@@ -7225,7 +7594,7 @@ def central_build_and_distribute(
                                   f"pnpm install --store-dir {shlex.quote(pnpm_cache_dir)} --frozen-lockfile; pnpm run build"
                     elif package_manager.startswith("yarn") or (has_yarn_lock and not has_package_lock):
                         manager = "yarn"
-                        install = "yarn install --frozen-lockfile --prefer-offline --network-timeout 600000; yarn build"
+                        install = f"yarn install --cache-folder {shlex.quote(yarn_cache_dir)} --frozen-lockfile --prefer-offline --network-timeout 600000; yarn build"
                     else:
                         manager = "npm"
                         install = "npm install --prefer-offline --no-audit --no-fund; npm run build"
@@ -7259,6 +7628,7 @@ def central_build_and_distribute(
                             f"-v {shlex.quote(cache_root + '/pnpm' + ':' + pnpm_cache_dir)} "
                             f"-v {shlex.quote(cache_root + '/npm' + ':' + npm_cache_dir)} "
                             f"-v {shlex.quote(cache_root + '/yarn' + ':' + yarn_cache_dir)} "
+                            f"{node_cache_env}"
                             f"{node_modules_mount}"
                             f"-w /workspace {shlex.quote(node_match.group(1))} sh -lc "
                             + shlex.quote("set -e; trap 'rm -rf .pnpm-store' EXIT; " + install)
@@ -7312,6 +7682,7 @@ def central_build_and_distribute(
                         f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                         f"-v {shlex.quote(context_key)}:/workspace "
                         f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                        f"{maven_cache_env}"
                         f"-w /workspace {shlex.quote(maven_image)} "
                         f"mvn {settings_arg}-B {maven_file_arg}package -DskipTests"
                     )
@@ -7353,6 +7724,7 @@ def central_build_and_distribute(
                                 f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                                 f"-v {shlex.quote(context_key)}:/workspace "
                                 f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                                f"{maven_cache_env}"
                                 f"-w /workspace {shlex.quote(maven_image)} "
                                 f"mvn {settings_arg}-B -f {shlex.quote(maven_file)} "
                                 f"org.springframework.boot:spring-boot-maven-plugin:{shlex.quote(boot_version)}:repackage "
@@ -7380,6 +7752,7 @@ def central_build_and_distribute(
                             f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                             f"-v {shlex.quote(context_key)}:/workspace "
                             f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                            f"{maven_cache_env}"
                             f"-w /workspace {shlex.quote(maven_match.group(1))} "
                             f"mvn -B {maven_file_arg}package -DskipTests"
                         )
@@ -7400,6 +7773,7 @@ def central_build_and_distribute(
                                     f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                                     f"-v {shlex.quote(context_key)}:/workspace "
                                     f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                                    f"{maven_cache_env}"
                                     f"-w /workspace {shlex.quote(maven_match.group(1))} "
                                     f"mvn -B -f {shlex.quote(maven_file)} "
                                     f"org.springframework.boot:spring-boot-maven-plugin:{shlex.quote(boot_version)}:repackage "
@@ -7616,6 +7990,7 @@ def central_build_and_distribute(
                     f"-v {shlex.quote(cache_root + '/pnpm' + ':' + pnpm_cache_dir)} "
                     f"-v {shlex.quote(cache_root + '/npm' + ':' + npm_cache_dir)} "
                     f"-v {shlex.quote(cache_root + '/yarn' + ':' + yarn_cache_dir)} "
+                    f"{node_cache_env}"
                     "-w /workspace node:16.20.2 sh -lc "
                     + shlex.quote(
                         "set -e; corepack enable; corepack prepare pnpm@8.15.9 --activate; "
@@ -7658,6 +8033,7 @@ def central_build_and_distribute(
                     f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
                     f"-v {shlex.quote(builder_dir)}:/workspace "
                     f"-v {shlex.quote(cache_root + '/maven' + ':' + maven_cache_dir)} "
+                    f"{maven_cache_env}"
                     "-w /workspace maven:3.8.8-eclipse-temurin-8 "
                     "mvn -s /workspace/.yunzhou.maven-settings.xml -B -f WMSCloud/pom.xml "
                     "-pl ruoyi-admin -am package -DskipTests"
@@ -7728,11 +8104,19 @@ def central_build_and_distribute(
                     and re.search(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(?:node|nginx):", docker_text)
                     and ("web" in lower_name or "front" in lower_name or "ui" in lower_name or "nginx" in docker_text.lower())
                 )
-                if is_frontend and wms_dist.is_dir():
+                if is_frontend and wms_dist.is_dir() and wms_dist.is_relative_to(context):
                     artifact_values = [wms_dist.relative_to(context).as_posix()]
                     output_kind = "wms-frontend"
                 elif is_backend and wms_jars:
-                    artifact_values = [path.relative_to(context).as_posix() for path in wms_jars]
+                    # A Compose build can only COPY files below its own build
+                    # context.  Multi-module repositories also contain many
+                    # library JARs in sibling modules; feeding those paths to
+                    # relative_to() both crashes packaging and risks selecting
+                    # a non-executable dependency as the application image.
+                    context_jars = [path for path in wms_jars if path.is_relative_to(context)]
+                    if not context_jars:
+                        continue
+                    artifact_values = [path.relative_to(context).as_posix() for path in context_jars]
                     output_kind = "wms-backend"
                 else:
                     continue
@@ -7747,14 +8131,11 @@ def central_build_and_distribute(
                     )
                     copied = [artifact_values[0]]
                 else:
-                    # Prefer the executable application module, then the
-                    # largest JAR. Never copy a library module merely because
-                    # its path sorts last.
+                    # Select by executable evidence, never by a project/module
+                    # name. This remains valid when users rename services or
+                    # deploy a completely different multi-module project.
                     jar_candidates = [context / value for value in artifact_values]
-                    selected_jar = next(
-                        (path for path in jar_candidates if "ruoyi-admin" in path.as_posix().lower()),
-                        max(jar_candidates, key=lambda path: (path.stat().st_size, path.as_posix())),
-                    )
+                    selected_jar = max(jar_candidates, key=_executable_jar_score)
                     java_match = re.search(
                         r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]*(?:temurin|openjdk)[^\s]*)",
                         docker_text,
@@ -8042,10 +8423,13 @@ def central_build_and_distribute(
                         destination_rel = destination.relative_to(artifact_context).as_posix()
                         command = (
                             f"docker run --rm {proxy_run_args} --label yunzhou.deployment={shlex.quote(deployment.id)} "
-                            f"-v {shlex.quote(str(artifact_context))}:/workspace -w /workspace "
+                            f"-v {shlex.quote(str(artifact_context))}:/workspace "
+                            f"-v {shlex.quote(cache_root + '/pip' + ':' + pip_cache_dir)} "
+                            f"{pip_cache_env}"
+                            "-w /workspace "
                             f"{shlex.quote(python_image)} sh -lc "
                             + shlex.quote(
-                                f"pip install --no-cache-dir -r {requirements_rel} --target {destination_rel}"
+                                f"pip install --cache-dir {shlex.quote(pip_cache_dir)} -r {requirements_rel} --target {destination_rel}"
                             )
                         )
                         code, output = tracked_run(
@@ -8801,7 +9185,9 @@ def execute(deployment_id: str) -> None:
                 required_user_config = ai_plan.get("required_user_config") or []
                 if required_user_config:
                     log(dep.id, "[配置清单] 以下配置不能安全自动填写：" + json.dumps(required_user_config, ensure_ascii=False) + "\n")
-                build_type, build_file, detected_port = materialize_ai_deployment_plan(work, ai_plan)
+                build_type, build_file, detected_port = materialize_ai_deployment_plan(
+                    work, ai_plan, getattr(project, "release_strategy", "auto") or "auto"
+                )
                 log(dep.id, "[AI规划] " + json.dumps({
                     "provider": ai_plan.get("provider"), "requested_model": ai_plan.get("requested_model"),
                     "actual_model": ai_plan.get("model"), "summary": ai_plan.get("summary"),
@@ -8814,7 +9200,15 @@ def execute(deployment_id: str) -> None:
                 log(dep.id, "[登录信息] " + json.dumps(login_info, ensure_ascii=False) + "\n")
             else:
                 log(dep.id, "[AI规划] 当前未配置可用 AI，使用平台本地识别器生成兼容方案。\n")
-                build_type, build_file, detected_port = prepare_build(work, project.build_type)
+                release_strategy = getattr(project, "release_strategy", "auto") or "auto"
+                source_compose = None if release_strategy == "platform_generated" else _complete_source_compose(Path(work))
+                if source_compose or release_strategy == "source_compose":
+                    build_type, build_file, detected_port = materialize_ai_deployment_plan(
+                        work, {}, release_strategy
+                    )
+                    log(dep.id, "[发布方式] AI 暂不可用，已按项目设置继续使用完整源码 Compose。\n")
+                else:
+                    build_type, build_file, detected_port = prepare_build(work, project.build_type)
             if build_type == "compose":
                 compose_path = Path(work) / build_file
                 compose_source = compose_path.read_text(encoding="utf-8", errors="ignore")
@@ -9924,9 +10318,26 @@ def stop_deployment(deployment: Deployment, project: Project, node: Node, *, pre
         target_stop = stop_tracked_process_groups(ssh, deployment.id)
         if preserve_runtime:
             # This branch cancels an unfinished candidate while an older
-            # verified release keeps serving traffic. The candidate owns no
-            # runtime, but its port reservations must still be released or
-            # later deployments gradually exhaust the node's port pool.
+            # verified release keeps serving traffic. A candidate can already
+            # have reached ``compose up`` (and can have pre-empted an old app
+            # that owns an exclusive project volume), so it is incorrect to
+            # assume that it owns no runtime. Remove only this release-scoped
+            # Compose project. The caller then verifies/restarts the protected
+            # successful release. Never use a project-wide name here.
+            compose_project = deployment_compose_project_name(deployment, project)
+            candidate_name = shlex.quote(deployment.container_name or "")
+            compose_label = shlex.quote(f"com.docker.compose.project={compose_project}")
+            code, cleanup_output = ssh.run(
+                f"ids=$(docker ps -aq --filter label={compose_label}); "
+                f"[ -z \"$ids\" ] || docker rm -f $ids >/dev/null; "
+                + (f"docker rm -f {candidate_name} >/dev/null 2>&1 || true; " if deployment.container_name else "")
+                + "true",
+                timeout=120,
+            )
+            if code:
+                raise RuntimeError("候选版本容器清理失败：" + cleanup_output[-800:])
+            # Candidate reservations must also be released or later
+            # deployments gradually exhaust the node's port pool.
             with SessionLocal() as reservation_db:
                 for reservation in reservation_db.scalars(select(DeploymentPortReservation).where(
                     DeploymentPortReservation.deployment_id == deployment.id,
@@ -9934,7 +10345,7 @@ def stop_deployment(deployment: Deployment, project: Project, node: Node, *, pre
                 )).all():
                     reservation.status = "released"
                 reservation_db.commit()
-            return f"该记录已被更新版本接管，仅终止本记录的部署进程；当前运行容器已保留（构建节点 {builder_stop}；目标节点 {target_stop}）"
+            return f"已终止本记录的部署进程并清理候选版本容器；线上版本不受影响（构建节点 {builder_stop}；目标节点 {target_stop}）"
         if deployment.image_name:
             code, out = ssh.run(f"docker rm -f {shlex.quote(deployment.container_name or '')} 2>&1 || true")
         else:

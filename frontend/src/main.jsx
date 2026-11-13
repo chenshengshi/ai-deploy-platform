@@ -644,8 +644,48 @@ function validPort(value) {
   const port = Number(value);
   return Number.isInteger(port) && port >= 1 && port <= 65535;
 }
+function withVisitPath(baseUrl, visitPath) {
+  const entry = String(visitPath || "").trim();
+  if (!baseUrl || !entry || entry === "/") return baseUrl;
+  try {
+    const url = new URL(baseUrl, window.location.origin);
+    const parsed = new URL(entry.startsWith("/") ? entry : `/${entry}`, url.origin);
+    url.pathname = parsed.pathname;
+    url.search = parsed.search;
+    url.hash = parsed.hash;
+    return url.toString();
+  } catch {
+    return `${String(baseUrl).replace(/\/+$/, "")}/${entry.replace(/^\/+/, "")}`;
+  }
+}
 function time(v) {
-  return v ? new Date(v).toLocaleString("zh-CN") : "—";
+  return v ? new Date(v).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "—";
+}
+const shanghaiLogClock = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Shanghai",
+  hour12: false,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
+function formatLogTime(raw) {
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  const parts = Object.fromEntries(
+    shanghaiLogClock.formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+function displayLog(text) {
+  return String(text || "").replace(
+    /\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\]/g,
+    (_matched, raw) => `[${formatLogTime(raw)}]`,
+  );
 }
 async function copyText(text) {
   if (!text) throw new Error("没有可复制的内容");
@@ -677,7 +717,7 @@ function containerFileSize(bytes, type) {
 function containerFileTime(seconds) {
   if (!seconds) return "时间未知";
   return new Date(Number(seconds) * 1000).toLocaleString("zh-CN", {
-    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+    timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
   });
 }
 function HighlightedLogs({ text, query }) {
@@ -1741,7 +1781,7 @@ function Projects({ me }) {
             const openPrimary = async (event) => {
               event.stopPropagation();
               if (state.kind === "online" && state.deployment?.access_url) {
-                window.open(state.deployment.access_url, "_blank", "noopener,noreferrer");
+                window.open(withVisitPath(state.deployment.access_url, x.visit_path), "_blank", "noopener,noreferrer");
                 return;
               }
               if (state.kind === "stopped" && state.deployment && me.role !== "viewer") {
@@ -3064,6 +3104,7 @@ function ProjectDetail({
     [envText, setEnvText] = useState(""),
     [managedEnvText, setManagedEnvText] = useState(""),
     [deploymentMode, setDeploymentMode] = useState(project.deployment_mode || "managed_fresh"),
+    [releaseStrategy, setReleaseStrategy] = useState(project.release_strategy || "auto"),
     [sourceAnalysis] = useState(project.initial_analysis || null),
     [integrationAnalysis, setIntegrationAnalysis] = useState(project.source_analysis || null),
     [integrationLoading, setIntegrationLoading] = useState(false),
@@ -3071,6 +3112,18 @@ function ProjectDetail({
     [replicaCount, setReplicaCount] = useState(project.load_balance_enabled ? (project.replica_count || 2) : 1),
     [loadBalanceStrategy, setLoadBalanceStrategy] = useState(project.load_balance_strategy || "round_robin"),
     [msg, setMsg] = useState("");
+  const deploymentPlan = integrationAnalysis?.deployment_plan || {};
+  const composePrimaryFile = String(deploymentPlan.primary_file || "");
+  const sourceComposeAvailable = Boolean(
+    deploymentPlan.source_compose_authoritative || (
+      integrationAnalysis?.deployment_kind === "compose" &&
+      composePrimaryFile &&
+      !composePrimaryFile.startsWith(".yunzhou")
+    ),
+  );
+  const effectiveReleaseStrategy = releaseStrategy === "auto"
+    ? (sourceComposeAvailable ? "source_compose" : "platform_generated")
+    : releaseStrategy;
   const runtimePendingRef = useRef(false);
   const integrationPendingRef = useRef(false);
   const envValues = useMemo(() => Object.fromEntries(
@@ -3298,6 +3351,7 @@ function ProjectDetail({
           container_port: containerPort ? Number(containerPort) : null,
           host_port: hostPort ? Number(hostPort) : null,
           deployment_mode: deploymentMode,
+          release_strategy: releaseStrategy,
         }),
       });
       await api(`/projects/${project.id}/environment`, {
@@ -3357,6 +3411,7 @@ function ProjectDetail({
           load_balance_enabled: false,
           replica_count: 1,
           deployment_mode: deploymentMode,
+          release_strategy: releaseStrategy,
           env_text: envText,
         }),
       });
@@ -3727,6 +3782,27 @@ function ProjectDetail({
             </Field>
             </div>
           </details>
+          {canEdit && (
+            <section className="release-strategy-panel">
+              <div className="integration-head">
+                <div><b>发布方式</b><small>决定优先沿用源码编排，还是由平台重新生成运行方案。</small></div>
+                {sourceComposeAvailable && <span>已识别 {composePrimaryFile || "Docker Compose"}</span>}
+              </div>
+              <div className={`release-strategy-options ${sourceComposeAvailable ? "" : "single"}`}>
+                {sourceComposeAvailable && (
+                  <button className={effectiveReleaseStrategy === "source_compose" ? "selected" : ""} onClick={() => setReleaseStrategy("source_compose")}>
+                    <Boxes />
+                    <span><b>按源码 Compose 发布</b><small>保留源码服务、依赖关系、初始化任务和数据卷；平台只补充端口、网络与运行参数。</small></span>
+                    <em>推荐</em>
+                  </button>
+                )}
+                <button className={effectiveReleaseStrategy === "platform_generated" ? "selected" : ""} onClick={() => setReleaseStrategy("platform_generated")}>
+                  <Bot />
+                  <span><b>平台自动生成</b><small>{sourceComposeAvailable ? "忽略源码 Compose，由平台根据分析结果重新生成部署文件。" : "未检测到可直接运行的完整 Compose，由平台自动生成部署文件。"}</small></span>
+                </button>
+              </div>
+            </section>
+          )}
           {canEdit && (
             <section className="deployment-integrations">
               <div className="integration-head">
@@ -5589,12 +5665,17 @@ function ProjectDeploymentGroup({
 
 function GatewayGeneratedConfigModal({ preview, loading, onClose, onRefresh, onSettings, notify }) {
   const upstreams = [...new Set((preview.routes || []).flatMap((route) => route.targets || []))];
+  const visitPath = preview.visit_path || "/";
+  const displayedConfig = preview.config
+    ? `# 点击“访问”时打开：${visitPath}\n# 此项只控制打开页面，不改变下方 Nginx 转发规则。\n${preview.config}`
+    : "";
   const rows = [
     ["网关节点", [preview.gateway_node, preview.gateway_address].filter(Boolean).join(" · ") || "—"],
     ["接入方式", "平台 Nginx 网关 · 单实例"],
     ["配置文件", preview.config_path || "—"],
     ["内网回源", upstreams.length ? upstreams.map((value) => `http://${value}/`).join("、") : "—"],
     ["访问域名", preview.domain || "平台自动分配地址"],
+    ["访问入口", preview.visit_path ? `${preview.visit_path}（点击访问时打开）` : "/（根地址）"],
     ["HTTP 端口", preview.http_port || 80],
     ["SSL / HTTPS", preview.https_enabled ? `已启用 · 端口 ${preview.https_port || 443}${preview.certificate_name ? ` · ${preview.certificate_name}` : ""}` : "未启用"],
     ["路由生成", preview.mode === "custom" ? "自定义路由" : "平台自动生成"],
@@ -5603,13 +5684,13 @@ function GatewayGeneratedConfigModal({ preview, loading, onClose, onRefresh, onS
   return <Modal className="gateway-snapshot-modal" title="平台网关配置" onClose={onClose}>
     <div className="gateway-snapshot-rows">{rows.map(([label, value]) => <div key={label}><span>{label}</span><b>{value}</b></div>)}</div>
     <div className="gateway-config-guidance">
-      <ShieldCheck /><span>{preview.config ? "配置由平台自动维护，发布时会重新生成。需要调整转发规则，请使用“网关设置”，不要直接修改服务器文件。" : (preview.message || "部署成功后，平台会自动生成并应用 Nginx 配置。")}</span>
+      <ShieldCheck /><span>{preview.config ? `配置由平台自动维护，发布时会重新生成。访问入口 ${visitPath} 仅用于点击“访问”后的打开地址，不是额外的代理规则。` : (preview.message || "部署成功后，平台会自动生成并应用 Nginx 配置。")}</span>
     </div>
     <div className="gateway-snapshot-code-head"><b>{preview.config ? "自动生成的 Nginx 配置" : "配置操作"}</b><span />
       {onSettings && <button className="ghost" onClick={onSettings}><Settings />网关设置</button>}
       <button className="ghost" disabled={loading} onClick={onRefresh}>{loading ? <LoaderCircle className="spin" /> : <RefreshCw />}刷新</button>
     </div>
-    {preview.config && <pre className="gateway-snapshot-code">{preview.config}</pre>}
+    {displayedConfig && <pre className="gateway-snapshot-code">{displayedConfig}</pre>}
   </Modal>;
 }
 
@@ -5643,6 +5724,7 @@ function GatewayPolicyModal({ projectId, onClose, onSaved, notify }) {
         method: "PUT",
         body: JSON.stringify({
           gateway_mode: form.gateway_mode || "auto",
+          visit_path: form.visit_path || "",
           custom_routes: form.custom_routes || [],
           proxy_read_timeout: Number(form.proxy_read_timeout) || 300,
           client_max_body_mb: Number(form.client_max_body_mb) || 50,
@@ -5660,6 +5742,9 @@ function GatewayPolicyModal({ projectId, onClose, onSaved, notify }) {
           <button className={form.gateway_mode !== "custom" ? "on" : ""} onClick={() => selectMode("auto")}>平台自动生成（推荐）</button>
           <button className={form.gateway_mode === "custom" ? "on" : ""} onClick={() => selectMode("custom")}>自定义路由</button>
         </div>
+      </Field>
+      <Field label="访问入口" hint="点击“访问”时打开的页面；留空打开根地址">
+        <input value={form.visit_path || ""} placeholder="例如 /login、/admin（可留空）" onChange={(event) => set("visit_path", event.target.value)} />
       </Field>
       <div className="gateway-policy-limits">
         <Field label="请求超时（秒）"><PortInput min="1" max="3600" value={form.proxy_read_timeout} onChange={(value) => set("proxy_read_timeout", value)} /></Field>
@@ -5694,6 +5779,7 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
       https_port: 443,
       redirect_https: true,
       gateway_mode: "auto",
+      visit_path: "",
       custom_routes: [],
       proxy_read_timeout: 300,
       client_max_body_mb: 50,
@@ -5708,6 +5794,7 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
     [selectedCertificateId, setSelectedCertificateId] = useState(null),
     [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false),
+    [resetConfirm, setResetConfirm] = useState(false),
     [error, setError] = useState("");
   useEffect(() => {
     Promise.all([api(`/projects/${deployment.project_id}/domain-config`), api("/certificates")])
@@ -5741,6 +5828,7 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
       body.append("https_port", String(form.https_port || 443));
       body.append("redirect_https", String(form.redirect_https));
       body.append("gateway_mode", form.gateway_mode || "auto");
+      body.append("visit_path", form.visit_path || "");
       body.append("custom_routes_json", JSON.stringify(form.custom_routes || []));
       body.append("proxy_read_timeout", String(form.proxy_read_timeout || 300));
       body.append("client_max_body_mb", String(form.client_max_body_mb || 50));
@@ -5764,7 +5852,6 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
     }
   };
   const resetToDefault = async () => {
-    if (!window.confirm("确定清空当前域名与 HTTPS 配置，恢复为系统自动分配的访问地址吗？\n\n证书库中的证书不会被删除。")) return;
     setBusy(true);
     setError("");
     try {
@@ -5775,11 +5862,12 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
       body.append("https_port", "443");
       body.append("redirect_https", "false");
       body.append("gateway_mode", "auto");
+      body.append("visit_path", "");
       body.append("custom_routes_json", "[]");
       body.append("proxy_read_timeout", "300");
       body.append("client_max_body_mb", "50");
       const result = await api(`/projects/${deployment.project_id}/domain-config`, { method: "POST", body });
-      setForm((current) => ({ ...current, domain: "", http_port: 80, https_enabled: false, https_port: 443, redirect_https: false, gateway_mode: "auto", custom_routes: [], proxy_read_timeout: 300, client_max_body_mb: 50, has_certificate: false, certificate_name: null, certificate_id: null }));
+      setForm((current) => ({ ...current, domain: "", visit_path: "", http_port: 80, https_enabled: false, https_port: 443, redirect_https: false, gateway_mode: "auto", custom_routes: [], proxy_read_timeout: 300, client_max_body_mb: 50, has_certificate: false, certificate_name: null, certificate_id: null }));
       setCertificate(null);
       setPrivateKey(null);
       setSelectedCertificateId(null);
@@ -5790,6 +5878,7 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
       setError(e.message);
     } finally {
       setBusy(false);
+      setResetConfirm(false);
     }
   };
   return (
@@ -5921,7 +6010,7 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
           </div>
           {error && <div className="alert danger">{error}</div>}
           <div className="modal-actions">
-            <button className="ghost danger-text" disabled={busy} onClick={resetToDefault}>
+            <button className="ghost danger-text" disabled={busy} onClick={() => setResetConfirm(true)}>
               恢复默认配置
             </button>
             <span className="modal-action-spacer" />
@@ -5944,6 +6033,16 @@ function ProjectDomainModal({ deployment, onClose, onSaved, notify }) {
               保存并应用配置
             </button>
           </div>
+          {resetConfirm && <ConfirmDialog
+            title="恢复默认访问配置"
+            text="清空当前域名、HTTPS 和访问入口？"
+            description="项目将恢复使用平台自动分配的根地址，证书库中的证书不会删除。"
+            confirmText="确认恢复"
+            danger
+            busy={busy}
+            onClose={() => !busy && setResetConfirm(false)}
+            onConfirm={resetToDefault}
+          />}
         </>
       )}
     </Modal>
@@ -6422,6 +6521,20 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
   const displayedStageLog = buildChannel === "all" || !selectedBuildStream
     ? activeStage?.log
     : selectedBuildStream.log;
+  const activeStageDisplayTitle = (() => {
+    const raw = activeStage?.log || "";
+    if (activeStage?.key === "build" && selectedBuildStream) {
+      return selectedBuildStream.label || activeStage?.title || "构建应用";
+    }
+    if (activeStage?.key !== "start" || activeStage?.status !== "running") {
+      return activeStage?.title || "部署日志";
+    }
+    if (/\b(?:Pulling|Downloading|Extracting|Pull complete)\b|正在拉取.*镜像|数据服务镜像/.test(raw)) {
+      return "拉取运行镜像";
+    }
+    if (/health|健康检查|等待.*就绪/i.test(raw)) return "等待服务就绪";
+    return activeStage?.title || "启动服务";
+  })();
   const followingLatest = followStageLog && followDetailScroll;
   useEffect(() => {
     if (!followingLatest) return;
@@ -7000,7 +7113,7 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
             }}
             className="logs service-log"
           >
-            {loadingLogs ? "正在读取日志..." : serviceLogs}
+            {loadingLogs ? "正在读取日志..." : displayLog(serviceLogs)}
           </pre>
         </Modal>
       )}
@@ -7089,7 +7202,7 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
               )}
             </span>
             <div>
-              <b>{step.title}</b>
+              <b>{step.key === activeStage?.key ? activeStageDisplayTitle : step.title}</b>
               <small>
                 {step.status === "success"
                   ? (step.skipped ? "无需构建" : "已完成")
@@ -7111,7 +7224,7 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
       <div className="pipeline-log-pane">
       <div className="stage-log-head">
         <div className="stage-log-title">
-          <b>{activeStage?.title || "部署日志"}</b>
+          <b>{activeStageDisplayTitle}</b>
           {activeStage?.skipped
             ? <span>处理方式：复用预构建镜像</span>
             : activeStage?.duration_seconds !== null && activeStage?.duration_seconds !== undefined && (
@@ -7171,18 +7284,31 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
           ))}
         </div>
       )}
-      <pre
-        ref={stageLogRef}
-        onScroll={(event) => {
-          const element = event.currentTarget;
-          setFollowStageLog(element.scrollHeight - element.scrollTop - element.clientHeight < 36);
-        }}
-        className="logs stage-log"
-      >
-        {stageLoading
-          ? "正在读取该阶段日志..."
-          : displayedStageLog || (activeStage?.status === "waiting" ? "等待该步骤开始..." : "该阶段没有产生日志")}
-      </pre>
+      {!stageLoading && !displayLog(displayedStageLog) && activeStage?.status === "success" ? (
+        <div className="stage-result-summary">
+          <CheckCircle2 />
+          <div>
+            <b>{activeStageDisplayTitle}已完成</b>
+            <span>{activeStage?.key === "build" && /分发/.test(activeStageDisplayTitle)
+              ? "运行镜像已送达目标节点并完成校验，无额外错误日志。"
+              : "该步骤已正常完成，无需展示额外日志。"}</span>
+          </div>
+          {activeStage?.duration_seconds !== null && activeStage?.duration_seconds !== undefined && <em>{stageDuration(activeStage.duration_seconds)}</em>}
+        </div>
+      ) : (
+        <pre
+          ref={stageLogRef}
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            setFollowStageLog(element.scrollHeight - element.scrollTop - element.clientHeight < 36);
+          }}
+          className="logs stage-log"
+        >
+          {stageLoading
+            ? "正在读取该阶段日志..."
+            : displayLog(displayedStageLog) || (activeStage?.status === "waiting" ? "等待该步骤开始..." : "暂无日志明细")}
+        </pre>
+      )}
       </div>
       </div>
       </div>}
@@ -7952,7 +8078,7 @@ function UsersPage() {
             <tbody>
               {items.map((x) => (
                 <React.Fragment key={x.id}>
-                <tr onClick={() => setEditing(x)}>
+                <tr>
                   <td>
                     <b>{x.display_name || x.username}</b>
                     <small>@{x.username}</small>
@@ -8027,6 +8153,7 @@ function UsersPage() {
 }
 function UserModal({ user, onClose, onDone }) {
   const editing = !!user;
+  const initialProjectIds = useMemo(() => (user?.projects || []).map((item) => item.id).sort(), [user]);
   const [f, setF] = useState(
       editing
         ? {
@@ -8045,22 +8172,64 @@ function UserModal({ user, onClose, onDone }) {
           },
     ),
     [err, setErr] = useState(""),
-    [busy, setBusy] = useState(false);
+    [busy, setBusy] = useState(false),
+    [projects, setProjects] = useState([]),
+    [projectQuery, setProjectQuery] = useState(""),
+    [selectedProjects, setSelectedProjects] = useState(() => new Set(initialProjectIds)),
+    [deleteConfirm, setDeleteConfirm] = useState(false),
+    [deleting, setDeleting] = useState(false);
+  useEffect(() => {
+    api("/projects").then(setProjects).catch((error) => setErr(error.message));
+  }, []);
+  const selectedProjectIds = [...selectedProjects].sort();
+  const hasChanges = !editing ||
+    f.username !== user.username ||
+    f.display_name !== (user.display_name || "") ||
+    f.password.length > 0 ||
+    f.role !== user.role ||
+    f.active !== user.active ||
+    selectedProjectIds.join("|") !== initialProjectIds.join("|");
+  const toggleProject = (projectId) => setSelectedProjects((current) => {
+    const next = new Set(current);
+    if (next.has(projectId)) next.delete(projectId); else next.add(projectId);
+    return next;
+  });
   const submit = async () => {
+    if (editing && !hasChanges) return;
     setBusy(true);
     setErr("");
     try {
       const body = { ...f };
       if (editing && !body.password) delete body.password;
-      await api(editing ? `/users/${user.id}` : "/users", {
+      const savedUser = await api(editing ? `/users/${user.id}` : "/users", {
         method: editing ? "PATCH" : "POST",
         body: JSON.stringify(body),
       });
+      if (f.role !== "admin") {
+        await api(`/users/${savedUser.id}/projects`, {
+          method: "PUT",
+          body: JSON.stringify({ project_ids: selectedProjectIds }),
+        });
+      }
       onDone();
     } catch (e) {
       setErr(e.message);
     } finally {
       setBusy(false);
+    }
+  };
+  const removeUser = async () => {
+    setDeleting(true);
+    setErr("");
+    try {
+      await api(`/users/${user.id}`, { method: "DELETE" });
+      setDeleteConfirm(false);
+      onDone();
+    } catch (error) {
+      setDeleteConfirm(false);
+      setErr(error.message);
+    } finally {
+      setDeleting(false);
     }
   };
   return (
@@ -8099,6 +8268,19 @@ function UserModal({ user, onClose, onDone }) {
             <option value="admin">管理员</option>
           </select>
         </Field>
+        {f.role !== "admin" && <Field label="可访问项目" hint={f.role === "viewer" ? "该用户只能查看勾选的项目" : "该用户可以管理和发布勾选的项目"}>
+          <div className="user-project-picker">
+            <label className="user-project-search"><Search /><input value={projectQuery} onChange={(event) => setProjectQuery(event.target.value)} placeholder="搜索项目名称或标识" /></label>
+            <div className="user-project-options">
+              {projects.filter((project) => `${project.name} ${project.slug}`.toLowerCase().includes(projectQuery.trim().toLowerCase())).map((project) => <label key={project.id} className={selectedProjects.has(project.id) ? "selected" : ""}>
+                <input type="checkbox" checked={selectedProjects.has(project.id)} onChange={() => toggleProject(project.id)} />
+                <span><b>{project.name}</b><small>{project.slug}</small></span>
+              </label>)}
+              {!projects.length && <div className="drawer-project-empty">暂无可分配项目</div>}
+            </div>
+            <small className="user-project-selected">已选择 {selectedProjects.size} 个项目</small>
+          </div>
+        </Field>}
         {editing && (
           <Field label="账号状态">
             <div className="seg">
@@ -8120,18 +8302,23 @@ function UserModal({ user, onClose, onDone }) {
       </div>
       {err && <div className="alert danger">{err}</div>}
       <div className="modal-actions">
+        {editing && user.role !== "admin" && <button className="ghost danger-text" disabled={busy || deleting} onClick={() => setDeleteConfirm(true)}><Trash2 />删除账号</button>}
         <button className="ghost" onClick={onClose}>
           取消
         </button>
         <button
           className="primary"
-          disabled={busy || !f.username || (!editing && f.password.length < 8)}
+          disabled={busy || !f.username || (!editing && f.password.length < 8) || (editing && !hasChanges)}
           onClick={submit}
         >
           {busy && <LoaderCircle className="spin" />}
           {editing ? "保存修改" : "创建用户"}
         </button>
       </div>
+      {deleteConfirm && <Modal title="删除用户账号" onClose={() => setDeleteConfirm(false)}>
+        <div className="delete-warning"><Trash2 /><div><b>确定删除“{user.display_name || user.username}”吗？</b><p>账号将无法登录；其创建的 {user.project_count || 0} 个项目会移交给当前管理员，项目、部署记录和运行服务不会删除。</p></div></div>
+        <div className="modal-actions"><button className="ghost" onClick={() => setDeleteConfirm(false)}>取消</button><button className="danger" disabled={deleting} onClick={removeUser}>{deleting ? <LoaderCircle className="spin" /> : <Trash2 />}确认删除账号</button></div>
+      </Modal>}
     </Modal>
   );
 }
