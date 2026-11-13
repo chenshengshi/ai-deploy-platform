@@ -610,6 +610,20 @@ def main():
                 deployment_id, _node_id = active.pop(future)
                 try:
                     future.result()
+                except Exception as exc:
+                    # A deployment normally records its own failure. Keep the
+                    # worker alive when an unexpected exception escapes that
+                    # boundary, and make sure the task does not stay running.
+                    print(f"deployment {deployment_id} failed unexpectedly: {exc}", flush=True)
+                    with SessionLocal() as db:
+                        failed = db.get(Deployment, deployment_id)
+                        if failed and failed.status in {DeployStatus.queued, DeployStatus.running}:
+                            message = f"后台执行异常：{exc}"
+                            failed.status = DeployStatus.failed
+                            failed.error = message
+                            failed.log_text = ((failed.log_text or "") + f"\n[执行异常] {message}\n")[-200_000:]
+                            failed.finished_at = datetime.now(timezone.utc)
+                            db.commit()
                 finally:
                     with SessionLocal() as db:
                         completed = db.get(Deployment, deployment_id)

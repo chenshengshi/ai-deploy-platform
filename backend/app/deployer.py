@@ -3376,6 +3376,41 @@ def required_compose_variables(path: str, compose_file: str, env_text: str | Non
     return found
 
 
+def ensure_managed_build_variables(project: Project, source_path: str, compose_file: str) -> list[str]:
+    """Fill variables emitted by the platform's own generated build files.
+
+    These values are build implementation details, not deployment credentials.
+    They must therefore never be presented to the user as missing configuration.
+    Prefer the exact package-manager version declared by the repository and use
+    the same conservative version as the generated Dockerfile fallback.
+    """
+    compose_source = (Path(source_path) / compose_file).read_text(encoding="utf-8", errors="ignore")
+    referenced = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}", compose_source))
+    current_lines = (project.managed_env_text or "").splitlines()
+    current_values = environment_values(project.managed_env_text)
+    generated = []
+
+    if "YUNZHOU_PNPM_VERSION" in referenced and not current_values.get("YUNZHOU_PNPM_VERSION"):
+        version = "8.15.9"
+        candidates = sorted(Path(source_path).rglob("package.json"), key=lambda item: len(item.parts))
+        for package_file in candidates:
+            try:
+                package_meta = json.loads(package_file.read_text(encoding="utf-8", errors="ignore"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            manager = str(package_meta.get("packageManager") or "").strip()
+            match = re.fullmatch(r"pnpm@([0-9]+(?:\.[0-9]+){1,2})(?:\+.*)?", manager, re.I)
+            if match:
+                version = match.group(1)
+                break
+        current_lines.append(f"YUNZHOU_PNPM_VERSION={version}")
+        generated.append(f"YUNZHOU_PNPM_VERSION={version}")
+
+    if generated:
+        project.managed_env_text = "\n".join(current_lines).strip() + "\n"
+    return generated
+
+
 def effective_project_environment(project: Project) -> str:
     """Render one deterministic Compose environment with dependencies first.
 
@@ -6130,6 +6165,61 @@ def split_compose_runtime(
         "services": app_services,
         "networks": app_networks,
     }
+    # Source Compose files occasionally contain an application dependency in
+    # one direction while the platform adds the reverse edge for an Nginx
+    # upstream alias. Docker Compose rejects that otherwise valid topology as
+    # a dependency cycle. Dependencies are startup hints (service discovery is
+    # provided by the network), so remove only edges that close a cycle and
+    # keep all remaining source ordering intact.
+    def break_dependency_cycles(services: dict) -> None:
+        def dependency_names(service: dict) -> list[str]:
+            depends = service.get("depends_on")
+            if isinstance(depends, dict):
+                return [str(name) for name in depends if name in services]
+            if isinstance(depends, list):
+                return [str(name) for name in depends if name in services]
+            return []
+
+        while True:
+            visiting: list[str] = []
+            visited: set[str] = set()
+            cycle_edge: tuple[str, str] | None = None
+
+            def visit(name: str) -> bool:
+                nonlocal cycle_edge
+                if name in visiting:
+                    return True
+                if name in visited:
+                    return False
+                visiting.append(name)
+                for dependency in dependency_names(services[name]):
+                    if dependency in visiting:
+                        cycle_edge = (name, dependency)
+                        return True
+                    if visit(dependency):
+                        return True
+                visiting.pop()
+                visited.add(name)
+                return False
+
+            if not any(visit(name) for name in services if name not in visited):
+                return
+            if not cycle_edge:
+                return
+            source, target = cycle_edge
+            depends = services[source].get("depends_on")
+            if isinstance(depends, dict):
+                depends.pop(target, None)
+                if not depends:
+                    services[source].pop("depends_on", None)
+            elif isinstance(depends, list):
+                remaining = [name for name in depends if str(name) != target]
+                if remaining:
+                    services[source]["depends_on"] = remaining
+                else:
+                    services[source].pop("depends_on", None)
+
+    break_dependency_cycles(app_services)
     # Keep application-owned volumes (uploads, generated files, etc.) while
     # excluding database volumes, which belong solely to the data stack.
     app_volume_names = set()
@@ -9287,6 +9377,10 @@ def execute(deployment_id: str) -> None:
                 if managed_integrations:
                     db.commit()
                     log(dep.id, "[托管服务] 未勾选外部服务，平台已自动补齐：" + "、".join(managed_integrations) + "\n")
+                managed_build_variables = ensure_managed_build_variables(project, work, build_file)
+                if managed_build_variables:
+                    db.commit()
+                    log(dep.id, "[构建配置] 平台已按源码自动补齐：" + "、".join(managed_build_variables) + "\n")
                 generated_secrets = ensure_managed_secrets(project, work, build_file)
                 if generated_secrets:
                     db.commit()

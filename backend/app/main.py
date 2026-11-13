@@ -2192,8 +2192,17 @@ def analyze_project_integrations(item_id: str, db: Session = Depends(get_db), us
         try:
             plan = analyze_project_deployment(db, item, source)
         except Exception as exc:
+            # Model/deployment analysis is allowed to fall back to the local
+            # detector.  SQLAlchemy, however, leaves the whole session in a
+            # failed transaction after any database error.  Continuing with
+            # that poisoned session used to make the later audit INSERT fail
+            # and hide the first, useful error from the user.
             plan = None
             plan_error = str(exc)
+            db.rollback()
+            item = db.get(Project, item_id)
+            if not item:
+                raise HTTPException(404, "项目不存在")
         # Use the same deterministic Compose decision for analysis display and
         # actual publishing.  Previously publishing could discover a complete
         # source Compose later while the settings page still showed the stale
@@ -2408,8 +2417,10 @@ def analyze_project_integrations(item_id: str, db: Session = Depends(get_db), us
         db.commit()
         return result
     except HTTPException:
+        db.rollback()
         raise
     except Exception as exc:
+        db.rollback()
         raise HTTPException(502, f"AI 分析现有集成失败：{exc}")
     finally:
         if cleanup_root:
@@ -2547,6 +2558,7 @@ def analyze_project_integrations_background(item_id: str, tasks: BackgroundTasks
     }
     item.integration_analysis_json = json.dumps(state, ensure_ascii=False)
     db.commit()
+    tasks.add_task(run_project_integration_analysis, item.id, user.id)
     return state
 
 
