@@ -196,10 +196,13 @@ function Login({ onDone, branding }) {
   };
   const submit = async (e) => {
     e.preventDefault();
+    const submitted = new FormData(e.currentTarget);
+    const username = String(submitted.get("username") || form.username || "").trim();
+    const password = String(submitted.get("password") || form.password || "");
     setBusy(true);
     setErr("");
     try {
-      await login(form.username, form.password);
+      await login(username, password);
       onDone();
     } catch (x) {
       setErr(x.message || "登录失败，请检查账号和密码");
@@ -225,8 +228,13 @@ function Login({ onDone, branding }) {
         <label>
           用户名
           <input
+            id="login-username"
+            name="username"
+            type="text"
             value={form.username}
             autoComplete="username"
+            autoCapitalize="none"
+            spellCheck={false}
             aria-invalid={Boolean(err)}
             onChange={(e) => updateField("username", e.target.value)}
           />
@@ -234,6 +242,8 @@ function Login({ onDone, branding }) {
         <label>
           密码
           <input
+            id="login-password"
+            name="password"
             type="password"
             value={form.password}
             autoComplete="current-password"
@@ -242,7 +252,7 @@ function Login({ onDone, branding }) {
           />
         </label>
         {err && <div className="login-error" role="alert">{err}</div>}
-        <button className="primary full" disabled={busy}>
+        <button type="submit" className="primary full" disabled={busy}>
           {busy ? <LoaderCircle className="spin" /> : <KeyRound />}{busy ? "登录中..." : "登录"}
         </button>
       </form>

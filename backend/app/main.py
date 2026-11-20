@@ -5007,14 +5007,46 @@ def deployment_view(
 
 @app.get("/api/deployments")
 def list_deployments(project_id: str | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    access_condition = None
     query = select(Deployment).order_by(desc(Deployment.created_at))
     if user.role != Role.admin:
-        query = query.where(Deployment.project_id.in_(select(Project.id).where(
+        access_condition = Deployment.project_id.in_(select(Project.id).where(
             (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id))
-        )))
+        ))
+        query = query.where(access_condition)
     if project_id:
         query = query.where(Deployment.project_id == project_id)
     deployments = db.scalars(query.limit(100)).all()
+
+    # The project cards need both the newest attempt and the currently online
+    # successful release. A global LIMIT alone can hide those rows when one
+    # project has a long deployment history, making a healthy project appear
+    # failed because only an old failure remains in the client cache.
+    if not project_id:
+        def ranked_ids(status: DeployStatus | None = None):
+            ranked_query = select(
+                Deployment.id.label("deployment_id"),
+                func.row_number().over(
+                    partition_by=Deployment.project_id,
+                    order_by=Deployment.created_at.desc(),
+                ).label("row_number"),
+            )
+            if access_condition is not None:
+                ranked_query = ranked_query.where(access_condition)
+            if status is not None:
+                ranked_query = ranked_query.where(Deployment.status == status)
+            ranked = ranked_query.subquery()
+            return select(ranked.c.deployment_id).where(ranked.c.row_number == 1)
+
+        summary_ids = ranked_ids().union(ranked_ids(DeployStatus.success))
+        summary_rows = db.scalars(
+            select(Deployment)
+            .where(Deployment.id.in_(summary_ids))
+            .order_by(desc(Deployment.created_at))
+        ).all()
+        known_ids = {item.id for item in deployments}
+        deployments.extend(item for item in summary_rows if item.id not in known_ids)
+        deployments.sort(key=lambda item: item.created_at, reverse=True)
     ids = [item.id for item in deployments]
     reservations: dict[str, list[DeploymentPortReservation]] = {}
     if ids:
