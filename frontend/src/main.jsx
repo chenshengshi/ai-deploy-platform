@@ -1732,6 +1732,15 @@ function Chat() {
           deployImmediately={false}
           guidedActions
           onClose={() => setShowUpload(false)}
+          onBackground={({ project: pendingProject, nodeId }) => {
+            setShowUpload(false);
+            if (pendingProject?.id) setProject(pendingProject.id);
+            if (nodeId) setNode(nodeId);
+            setMessages((items) => [...items, {
+              who: "ai",
+              text: `项目“${pendingProject?.name || "未命名项目"}”已转到后台继续分析，完成后将自动部署。`,
+            }]);
+          }}
           onDone={({ project: p, deployment, nodeId, autoDeploy }) => {
             setShowUpload(false);
             if (nodeId) setNode(nodeId);
@@ -2049,7 +2058,7 @@ function Projects({ me }) {
     </>
   );
 }
-function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guidedActions = false }) {
+function ProjectModal({ onClose, onDone, onBackground, notify, deployImmediately = false, guidedActions = false }) {
   const [form, setForm] = useState({
       name: "",
       slug: "",
@@ -2073,6 +2082,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
     [node, setNode] = useState(""),
     [processingStage, setProcessingStage] = useState(""),
     [createdProject, setCreatedProject] = useState(null),
+    [sourceSubmitted, setSourceSubmitted] = useState(false),
     [showPrivate, setShowPrivate] = useState(false),
     [credential, setCredential] = useState({
       name: "",
@@ -2313,6 +2323,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
           );
         }
       }
+      setSourceSubmitted(true);
       if (shouldDeploy) {
         localStorage.setItem(pendingAutoDeployKey, JSON.stringify({
           projectId: p.id,
@@ -2340,8 +2351,16 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
       setProcessingStage("");
     }
   };
+  const closeModal = () => {
+    if (busy && !sourceSubmitted) return;
+    if (busy && sourceSubmitted && onBackground) {
+      onBackground({ project: createdProject, nodeId: node });
+      return;
+    }
+    onClose();
+  };
   return (
-    <Modal title={deployImmediately ? "上传并部署项目" : "添加项目并分析源码"} onClose={busy ? () => {} : onClose} wide className="project-create-modal">
+    <Modal title={deployImmediately ? "上传并部署项目" : "添加项目并分析源码"} onClose={closeModal} wide className="project-create-modal">
       <div className={`project-create-body ${busy ? "is-processing" : ""}`}>
       <div className="quick-deploy">
         <Field
@@ -2661,8 +2680,8 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
       {err && createdProject && <div className="project-create-retry-note">项目已安全保留，再次点击不会重复创建项目。</div>}
       </div>
       <div className="modal-actions">
-        <button className="ghost" disabled={busy} onClick={onClose}>
-          取消
+        <button className="ghost" disabled={busy && !sourceSubmitted} onClick={closeModal}>
+          {busy ? (sourceSubmitted ? "转到后台" : "正在上传") : "取消"}
         </button>
         {guidedActions ? (
           <>
