@@ -6353,8 +6353,9 @@ def prepare_runtime_bundle(
 def validate_runtime_only_dockerfiles(work: str, build_file: str, compose_override: str | None = None) -> None:
     """Ensure image packaging cannot compile source a second time.
 
-    Repository Dockerfiles are evidence only.  By this point every effective
-    Compose build must point at a platform-generated, runtime-only Dockerfile.
+    Runtime-labelled Dockerfiles must never compile source. Complete generated
+    compatibility builds remain valid for applications whose frontend and
+    backend cannot be separated into independent runtime images safely.
     """
     root = Path(work)
     services: dict[str, dict] = {}
@@ -6388,7 +6389,15 @@ def validate_runtime_only_dockerfiles(work: str, build_file: str, compose_overri
             problems.append(f"{service_name}：找不到 {dockerfile.name}")
             continue
         content = dockerfile.read_text(encoding="utf-8", errors="ignore")
-        if compile_pattern.search(content):
+        # A generated ``*.runtime.Dockerfile`` is a hard runtime-only
+        # contract.  ``.yunzhou.ai.Dockerfile`` can still be a complete
+        # compatibility build for a single-container application (for
+        # example Python API + compiled React UI).  Rejecting that fallback
+        # leaves otherwise valid projects undeployable when their artifacts
+        # cannot be split safely; allow it to build once instead of failing
+        # before Docker starts.
+        runtime_contract = dockerfile.name.endswith(".runtime.Dockerfile")
+        if runtime_contract and compile_pattern.search(content):
             problems.append(f"{service_name}：{dockerfile.name} 仍包含源码编译命令")
     if problems:
         raise RuntimeError(
@@ -6494,6 +6503,13 @@ def central_build_and_distribute(
         "CRM_JWT_SECRET": "build-placeholder",
     }
     build_env.update({
+        # Build-tool settings are not secrets and must never receive the
+        # generic placeholder.  A placeholder used as PIP_INDEX_URL makes pip
+        # treat it as a local directory, so every valid dependency appears to
+        # be missing and an automatic retry repeats the same failure.
+        "PIP_INDEX_URL": "https://pypi.tuna.tsinghua.edu.cn/simple/",
+        "NPM_REGISTRY": "https://registry.npmmirror.com/",
+        "APT_MIRROR": "https://mirrors.tuna.tsinghua.edu.cn",
         "YUNZHOU_MYSQL_HOST": "127.0.0.1",
         "YUNZHOU_MYSQL_PORT": "3306",
         "YUNZHOU_MYSQL_DATABASE": "build",

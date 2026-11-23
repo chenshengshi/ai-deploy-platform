@@ -2647,8 +2647,33 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [showRefreshConfirm, setShowRefreshConfirm] = useState(false),
+    [editingBranch, setEditingBranch] = useState(false),
+    [branchDraft, setBranchDraft] = useState(project.git_branch || "main"),
     [editingRuntime, setEditingRuntime] = useState(false),
     [runtimeRows, setRuntimeRows] = useState([]);
+  useEffect(() => {
+    if (!editingBranch) setBranchDraft(project.git_branch || "main");
+  }, [project.git_branch, editingBranch]);
+  const saveGitBranch = async () => {
+    const branch = branchDraft.trim();
+    if (!branch) return;
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await api(`/projects/${project.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ git_branch: branch }),
+      });
+      setEditingBranch(false);
+      onDone?.(updated);
+      notify?.(`源码分支已改为 ${branch}，可点击“拉取最新代码”重新分析`, "success");
+    } catch (e) {
+      setError(e.message);
+      notify?.(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
   const beginRuntimeEdit = () => {
     setRuntimeRows((analysis?.runtime_services || []).map((row) => ({ ...row })));
     setEditingRuntime(true);
@@ -2786,6 +2811,28 @@ function ProjectSourceManager({ project, analysis, canEdit, notify, onDone }) {
               </button>
             )}
           </div>
+          {project.source_type === "git" && (
+            <div className="source-branch-row">
+              <span>当前分支</span>
+              {editingBranch ? (
+                <>
+                  <input
+                    value={branchDraft}
+                    autoFocus
+                    onChange={(e) => setBranchDraft(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && saveGitBranch()}
+                  />
+                  <button className="primary compact" disabled={busy || !branchDraft.trim()} onClick={saveGitBranch}>保存</button>
+                  <button className="ghost compact" disabled={busy} onClick={() => { setBranchDraft(project.git_branch || "main"); setEditingBranch(false); }}>取消</button>
+                </>
+              ) : (
+                <>
+                  <code>{project.git_branch || "默认分支"}</code>
+                  {canEdit && <button className="ghost compact" disabled={busy || ["queued", "running"].includes(analysis?.status)} onClick={() => setEditingBranch(true)}>修改分支</button>}
+                </>
+              )}
+            </div>
+          )}
         </div>
         <div>
           <span>内部项目标识</span>
