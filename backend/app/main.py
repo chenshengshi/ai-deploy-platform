@@ -3563,6 +3563,44 @@ def _invalidate_registry_catalog_cache() -> None:
         _registry_catalog_cache = None
 
 
+def _registry_result_for_user(result: dict, db: Session, user: User) -> dict:
+    """Apply project authorization after reading the shared registry cache."""
+    scoped = copy.deepcopy(result)
+    if user.role != Role.admin:
+        accessible_ids = set(db.scalars(select(Project.id).where(
+            (Project.owner_id == user.id) |
+            Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id))
+        )).all())
+        scoped["repositories"] = [
+            item for item in scoped.get("repositories", [])
+            if item.get("project_id") in accessible_ids
+        ]
+    repositories = scoped.get("repositories", [])
+    scoped["repository_count"] = len(repositories)
+    scoped["project_count"] = len({item.get("project_id") for item in repositories if item.get("project_id")})
+    scoped["tag_count"] = sum(int(item.get("tag_count") or 0) for item in repositories)
+    return scoped
+
+
+def _registry_project_for_name(db: Session, repository: str) -> Project | None:
+    tail = repository.split("/", 1)[-1]
+    projects = db.scalars(select(Project).where(Project.slug.is_not(None))).all()
+    return next((
+        project for project in sorted(projects, key=lambda item: len(item.slug or ""), reverse=True)
+        if tail == project.slug or tail.startswith((project.slug or "") + "-")
+    ), None)
+
+
+def _require_registry_write_access(db: Session, user: User, repository: str) -> None:
+    if user.role == Role.admin:
+        return
+    if user.role != Role.deployer:
+        raise HTTPException(403, "只读账号不能删除镜像")
+    project = _registry_project_for_name(db, repository)
+    if not project or not _user_can_access_project(db, user, project.id):
+        raise HTTPException(403, "无权删除其他项目的镜像")
+
+
 def _registry_version_detail(name: str, tag: str) -> dict:
     response = _registry_request("GET", f"/{quote(name, safe='/')}/manifests/{quote(tag, safe='')}", headers={"Accept": REGISTRY_MANIFEST_ACCEPT})
     manifest = response.json()
@@ -3586,13 +3624,13 @@ def _registry_version_detail(name: str, tag: str) -> dict:
 
 
 @app.get("/api/images")
-def list_image_repository(refresh: bool = False, db: Session = Depends(get_db), _: User = Depends(require(Role.admin, Role.deployer))):
+def list_image_repository(refresh: bool = False, db: Session = Depends(get_db), user: User = Depends(current_user)):
     global _registry_catalog_cache
     if not refresh:
         with _registry_catalog_guard:
             cached = _registry_catalog_cache
             if cached and time.monotonic() - cached[0] <= _REGISTRY_CACHE_TTL:
-                return copy.deepcopy(cached[1])
+                return _registry_result_for_user(cached[1], db, user)
     names = _registry_request("GET", "/_catalog?n=100").json().get("repositories") or []
     tags_by_name = {}
     with ThreadPoolExecutor(max_workers=min(12, max(1, len(names)))) as pool:
@@ -3638,14 +3676,15 @@ def list_image_repository(refresh: bool = False, db: Session = Depends(get_db), 
     result = {"repositories": repositories, "repository_count": len(repositories), "project_count": project_count, "tag_count": sum(x["tag_count"] for x in repositories), "endpoint": policy.registry_endpoint}
     with _registry_catalog_guard:
         _registry_catalog_cache = (time.monotonic(), copy.deepcopy(result))
-    return result
+    return _registry_result_for_user(result, db, user)
 
 
 @app.delete("/api/images")
-def delete_image_tag(body: dict, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
+def delete_image_tag(body: dict, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     repository, tag = str(body.get("repository") or "").strip(), str(body.get("tag") or "").strip()
     if not re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*", repository) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
         raise HTTPException(400, "仓库或标签无效")
+    _require_registry_write_access(db, user, repository)
     protected_releases, running_refs = _protected_registry_releases(db)
     reason = _registry_tag_protection_reason(repository, tag, protected_releases, running_refs)
     if reason:
@@ -3722,7 +3761,7 @@ def _registry_tag_protection_reason(repository: str, tag: str, protected: dict[s
 
 
 @app.post("/api/images/bulk-delete")
-def bulk_delete_image_repositories(body: dict, db: Session = Depends(get_db), user: User = Depends(require(Role.admin))):
+def bulk_delete_image_repositories(body: dict, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     raw_names = body.get("repositories") or []
     if not isinstance(raw_names, list) or not raw_names or len(raw_names) > 100:
         raise HTTPException(400, "请选择 1 至 100 个镜像仓库")
@@ -3730,6 +3769,8 @@ def bulk_delete_image_repositories(body: dict, db: Session = Depends(get_db), us
     repository_pattern = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*")
     if any(not repository_pattern.fullmatch(name) for name in repositories):
         raise HTTPException(400, "包含无效的镜像仓库名称")
+    for repository in repositories:
+        _require_registry_write_access(db, user, repository)
     catalog = set(_registry_request("GET", "/_catalog?n=1000").json().get("repositories") or [])
     missing = [name for name in repositories if name not in catalog]
     protected_releases, running_refs = _protected_registry_releases(db)

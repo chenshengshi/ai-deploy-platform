@@ -922,9 +922,7 @@ function App() {
       </div>
     );
   if (!me) return <Login onDone={load} branding={branding} />;
-  const allowed = (item) => item[0] === "images"
-    ? me.role !== "viewer"
-    : !["nodes", "users", "settings"].includes(item[0]) || me.role === "admin";
+  const allowed = (item) => !["nodes", "users", "settings"].includes(item[0]) || me.role === "admin";
   return (
     <div className="app">
       <aside>
@@ -7843,6 +7841,7 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
 }
 
 function ImageRepository({ me }) {
+  const canDelete = me.role === "admin" || me.role === "deployer";
   const [data, setData] = useState({ repositories: [], repository_count: 0, tag_count: 0, endpoint: "yunzhou.hub:5000" }),
     [loading, setLoading] = useState(true),
     [query, setQuery] = useState(""),
@@ -7997,13 +7996,13 @@ function ImageRepository({ me }) {
         <div><ShieldCheck /><span><b>运行中</b><small>平台私有仓库</small></span></div>
       </div>
       <div className="image-repository-filters">
-        {me.role === "admin" && <label className="registry-select-all" title="选择当前筛选结果"><input type="checkbox" checked={allFilteredSelected} onChange={toggleAllFiltered} /></label>}
+        {canDelete && <label className="registry-select-all" title="选择当前筛选结果"><input type="checkbox" checked={allFilteredSelected} onChange={toggleAllFiltered} /></label>}
         <Search /><input placeholder="搜索镜像仓库" value={query} onChange={(event) => setQuery(event.target.value)} />
-        {me.role === "admin" && selectedRepositories.size > 0 && <button className="danger-button registry-bulk-action" disabled={bulkBusy} onClick={previewBulkDelete}>{bulkBusy ? <LoaderCircle className="spin" /> : <Trash2 />}删除所选（{selectedRepositories.size}）</button>}
+        {canDelete && selectedRepositories.size > 0 && <button className="danger-button registry-bulk-action" disabled={bulkBusy} onClick={previewBulkDelete}>{bulkBusy ? <LoaderCircle className="spin" /> : <Trash2 />}删除所选（{selectedRepositories.size}）</button>}
       </div>
       <div className="registry-list">
-        {projectGroups.map((group) => <div key={group.key} className={`registry-row ${me.role === "admin" ? "selectable" : ""} ${group.repositories.every((item) => selectedRepositories.has(item.name)) ? "selected" : ""}`} role="button" tabIndex="0" onClick={() => setSelectedProject(group)} onKeyDown={(event) => { if (event.key === "Enter") setSelectedProject(group); }}>
-          {me.role === "admin" && <input className="registry-row-checkbox" type="checkbox" checked={group.repositories.every((item) => selectedRepositories.has(item.name))} onClick={(event) => event.stopPropagation()} onChange={() => {
+        {projectGroups.map((group) => <div key={group.key} className={`registry-row ${canDelete ? "selectable" : ""} ${group.repositories.every((item) => selectedRepositories.has(item.name)) ? "selected" : ""}`} role="button" tabIndex="0" onClick={() => setSelectedProject(group)} onKeyDown={(event) => { if (event.key === "Enter") setSelectedProject(group); }}>
+          {canDelete && <input className="registry-row-checkbox" type="checkbox" checked={group.repositories.every((item) => selectedRepositories.has(item.name))} onClick={(event) => event.stopPropagation()} onChange={() => {
             const allSelected = group.repositories.every((item) => selectedRepositories.has(item.name));
             setSelectedRepositories((previous) => {
               const next = new Set(previous);
@@ -8041,7 +8040,7 @@ function ImageRepository({ me }) {
           const pullCommand = `docker pull ${data.endpoint || "yunzhou.hub:5000"}/${selected.name}:${tag.tag}`;
           return <div key={tag.tag}><span><Tag /><b>{tag.tag}</b></span><code title={tag.digest}>{tag.digest ? tag.digest.slice(0, 22) + "…" : "—"}</code><span>{size(tag.size_bytes)}</span><span className="registry-time">{tag.created_at ? time(tag.created_at) : "时间未知"}</span>
             <button className={`icon copy-action ${copied === key ? "copied" : ""}`} title="复制 docker pull 命令" onClick={() => copyPullCommand(key, pullCommand)}>{copied === key ? <ShieldCheck /> : <Copy />}</button>
-            {me.role === "admin" && <button className="icon danger" disabled={busy === key} onClick={() => setDeleting({ repository: selected.name, tag: tag.tag })}>{busy === key ? <LoaderCircle className="spin" /> : <Trash2 />}</button>}
+            {canDelete && <button className="icon danger" disabled={busy === key} onClick={() => setDeleting({ repository: selected.name, tag: tag.tag })}>{busy === key ? <LoaderCircle className="spin" /> : <Trash2 />}</button>}
           </div>})}</div>
       </Modal>}
       {deleting && <Modal onClose={() => setDeleting(null)} title="删除镜像版本">
