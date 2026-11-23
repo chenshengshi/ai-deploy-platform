@@ -2497,6 +2497,33 @@ tbody tr:last-child td {
 .user-delete-confirm .modal-actions { padding-top: 13px; }
 .user-delete-confirm .danger-button { display: inline-flex; align-items: center; gap: 7px; }
 .user-delete-confirm .danger-button svg { width: 16px; height: 16px; }
+.modal.user-account-modal {
+  width: min(640px, calc(100vw - 32px));
+  max-width: 640px;
+  max-height: min(82vh, 760px);
+}
+.user-account-modal .modal-head { padding: 15px 20px; }
+.user-account-modal .user-account-form {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 14px;
+  padding: 16px 20px;
+}
+.user-account-modal .field { gap: 5px; }
+.user-account-modal .field > span { font-size: 11px; }
+.user-account-modal .field small { font-size: 9px; line-height: 1.35; }
+.user-account-modal .field input,
+.user-account-modal .field select { min-height: 38px; padding: 8px 10px; font-size: 13px; }
+.user-account-modal .user-project-field { grid-column: 1 / -1; }
+.user-account-modal .user-project-picker { padding: 9px; }
+.user-account-modal .user-project-options { max-height: 150px; }
+.user-account-modal .user-project-options > label { padding: 7px 9px; }
+.user-account-modal > .alert { margin: 0 20px 10px; }
+.user-account-modal > .modal-actions { padding: 12px 20px; }
+@media (max-width: 680px) {
+  .modal.user-account-modal { width: calc(100vw - 24px); max-width: calc(100vw - 24px); }
+  .user-account-modal .user-account-form { grid-template-columns: 1fr; }
+  .user-account-modal .user-project-field { grid-column: auto; }
+}
 .drop-box {
   background: #fafaff;
   border-color: #8c85ff;

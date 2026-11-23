@@ -8353,8 +8353,8 @@ function UserModal({ user, onClose, onDone }) {
     }
   };
   return (
-    <Modal title={editing ? "编辑用户账号" : "添加用户"} onClose={onClose}>
-      <div className="form-grid one">
+    <Modal title={editing ? "编辑用户账号" : "添加用户"} className="user-account-modal" onClose={onClose}>
+      <div className="form-grid user-account-form">
         <Field label="登录账号">
           <input
             value={f.username}
@@ -8388,7 +8388,7 @@ function UserModal({ user, onClose, onDone }) {
             <option value="admin">管理员</option>
           </select>
         </Field>
-        {f.role !== "admin" && <Field label="可访问项目" hint={f.role === "viewer" ? "该用户只能查看勾选的项目" : "该用户可以管理和发布勾选的项目"}>
+        {f.role !== "admin" && <div className="user-project-field"><Field label="可访问项目" hint={f.role === "viewer" ? "该用户只能查看勾选的项目" : "该用户可以管理和发布勾选的项目"}>
           <div className="user-project-picker">
             <label className="user-project-search"><Search /><input value={projectQuery} onChange={(event) => setProjectQuery(event.target.value)} placeholder="搜索项目名称或标识" /></label>
             <div className="user-project-options">
@@ -8400,7 +8400,7 @@ function UserModal({ user, onClose, onDone }) {
             </div>
             <small className="user-project-selected">已选择 {selectedProjects.size} 个项目</small>
           </div>
-        </Field>}
+        </Field></div>}
         {editing && (
           <Field label="账号状态">
             <div className="seg">
