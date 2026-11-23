@@ -1807,6 +1807,40 @@ tbody tr:last-child td {
   border-radius: 8px;
   border: 1px solid #dce1e8;
 }
+.login-password-field {
+  position: relative;
+  display: block;
+}
+.login-password-field input {
+  width: 100%;
+  padding-right: 44px;
+}
+.login-card .login-password-toggle {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  display: grid;
+  width: 34px;
+  height: 34px;
+  margin: 0;
+  padding: 0;
+  place-items: center;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #7c8798;
+  cursor: pointer;
+}
+.login-card .login-password-toggle:hover,
+.login-card .login-password-toggle:focus-visible {
+  background: #f1f3ff;
+  color: #554ae8;
+}
+.login-card .login-password-toggle svg {
+  width: 18px;
+  height: 18px;
+}
 .login-card input[aria-invalid="true"] {
   border-color: #e45a66;
   box-shadow: 0 0 0 3px #e45a6618;

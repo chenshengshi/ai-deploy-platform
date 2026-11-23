@@ -20,6 +20,8 @@ import {
   Copy,
   Database,
   Download,
+  Eye,
+  EyeOff,
   ExternalLink,
   FileArchive,
   FolderGit2,
@@ -188,6 +190,7 @@ function BrandLogo({ branding, large = false }) {
 
 function Login({ onDone, branding }) {
   const [form, setForm] = useState({ username: "admin", password: "" });
+  const [showPassword, setShowPassword] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const updateField = (field, value) => {
@@ -241,15 +244,27 @@ function Login({ onDone, branding }) {
         </label>
         <label>
           密码
-          <input
-            id="login-password"
-            name="password"
-            type="password"
-            value={form.password}
-            autoComplete="current-password"
-            aria-invalid={Boolean(err)}
-            onChange={(e) => updateField("password", e.target.value)}
-          />
+          <span className="login-password-field">
+            <input
+              id="login-password"
+              name="password"
+              type={showPassword ? "text" : "password"}
+              value={form.password}
+              autoComplete="current-password"
+              aria-invalid={Boolean(err)}
+              onChange={(e) => updateField("password", e.target.value)}
+            />
+            <button
+              type="button"
+              className="login-password-toggle"
+              aria-label={showPassword ? "隐藏密码" : "显示密码"}
+              aria-pressed={showPassword}
+              title={showPassword ? "隐藏密码" : "显示密码"}
+              onClick={() => setShowPassword((current) => !current)}
+            >
+              {showPassword ? <EyeOff /> : <Eye />}
+            </button>
+          </span>
         </label>
         {err && <div className="login-error" role="alert">{err}</div>}
         <button type="submit" className="primary full" disabled={busy}>
