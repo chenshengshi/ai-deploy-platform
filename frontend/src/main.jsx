@@ -8867,7 +8867,7 @@ function SettingsPage() {
     ["certificates", "证书管理", KeyRound],
     ["retained", "保留数据卷", Boxes],
     ["security", "安全设置", ShieldCheck],
-    ["audit", "操作记录", Activity],
+    ["audit", "日志审计", Activity],
     ["system", "系统信息", Activity],
   ];
   return (
@@ -9675,10 +9675,13 @@ function AuditSettings() {
   const [auditUsers, setAuditUsers] = useState([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(null);
+  const [kind, setKind] = useState("operation");
   const load = () => {
     setItems(null);
+    const params = new URLSearchParams({ category: kind });
+    if (query.trim()) params.set("q", query.trim());
     Promise.all([
-      api(`/audit${query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ""}`),
+      api(`/audit?${params.toString()}`),
       api("/users"),
     ])
       .then(([logs, users]) => { setAuditUsers(users); setItems(logs); })
@@ -9686,7 +9689,7 @@ function AuditSettings() {
   };
   useEffect(() => {
     load();
-  }, []);
+  }, [kind]);
   const operatorFor = (entry) => {
     if (!entry.user_id) return { name: entry.user_name || "系统任务", username: "" };
     const matched = auditUsers.find((user) => user.id === entry.user_id);
@@ -9724,6 +9727,9 @@ function AuditSettings() {
     update_ai_experience: "调整 AI 经验",
     export_ai_experiences: "导出 AI 经验",
     update_audit_retention: "修改审计保留策略",
+    login: "登录成功",
+    login_failed: "登录失败",
+    logout: "退出登录",
   };
   const targetLabels = {
     project: "项目", deployment: "发布版本", registry: "镜像仓库",
@@ -9751,22 +9757,29 @@ function AuditSettings() {
         || "—";
     }
   };
+  const authDetail = (entry) => {
+    try { return JSON.parse(entry.detail || "{}"); } catch { return {}; }
+  };
   return (
     <>
       <div className="toolbar">
         <div>
-          <h2>操作记录</h2>
-          <p>查询删除、SQL、AI 和其他关键操作；保留策略在安全设置中管理</p>
+          <h2>日志审计</h2>
+          <p>查询系统操作和账号登录活动；保留策略在安全设置中管理</p>
         </div>
         <button className="ghost" onClick={load}>
           <RefreshCw />
           刷新
         </button>
       </div>
+      <div className="audit-kind-tabs" role="tablist" aria-label="日志类型">
+        <button className={kind === "operation" ? "active" : ""} onClick={() => setKind("operation")}>操作日志</button>
+        <button className={kind === "auth" ? "active" : ""} onClick={() => setKind("auth")}>登录日志</button>
+      </div>
       <div className="panel audit-controls">
         <div className="audit-search">
           <Search />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && load()} placeholder="搜索操作人、项目、动作、SQL 或结果" />
+          <input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && load()} placeholder={kind === "auth" ? "搜索用户、账号、IP 或登录结果" : "搜索操作人、项目、动作、SQL 或结果"} />
           <button className="ghost" onClick={load}>搜索</button>
         </div>
       </div>
@@ -9787,10 +9800,10 @@ function AuditSettings() {
               </colgroup>
               <thead>
                 <tr>
-                  <th>操作时间</th>
-                  <th>操作人</th>
-                  <th>操作</th>
-                  <th>对象</th>
+                  <th>{kind === "auth" ? "时间" : "操作时间"}</th>
+                  <th>{kind === "auth" ? "用户 / 账号" : "操作人"}</th>
+                  <th>{kind === "auth" ? "事件" : "操作"}</th>
+                  <th>{kind === "auth" ? "来源 IP" : "对象"}</th>
                   <th>处理结果</th>
                 </tr>
               </thead>
@@ -9799,18 +9812,17 @@ function AuditSettings() {
                   <tr key={x.id} onClick={() => setSelected(x)} className="audit-row-clickable">
                     <td className="audit-time">{time(x.created_at)}</td>
                     <td className="audit-user">
-                      <b>{operatorFor(x).name}</b>
-                      {operatorFor(x).username && <small>@{operatorFor(x).username}</small>}
+                      <b>{x.user_id ? operatorFor(x).name : (authDetail(x).username || operatorFor(x).name)}</b>
+                      {(operatorFor(x).username || (kind === "auth" && authDetail(x).username)) && <small>@{operatorFor(x).username || authDetail(x).username}</small>}
                     </td>
                     <td><span className="audit-action">{labels[x.action] || x.action}</span></td>
                     <td className="audit-target">
-                      <span title={`${targetLabels[x.target_type] || x.target_type || "系统"} · ${x.target_id || "系统"}`}>
-                        {targetLabels[x.target_type] || x.target_type || "系统"}
-                        <small>{x.target_id?.slice(0, 8) || "系统"}</small>
-                      </span>
+                      {kind === "auth" ? <span>{authDetail(x).ip || "—"}</span> : <span title={`${targetLabels[x.target_type] || x.target_type || "系统"} · ${x.target_id || "系统"}`}>
+                        {targetLabels[x.target_type] || x.target_type || "系统"}<small>{x.target_id?.slice(0, 8) || "系统"}</small>
+                      </span>}
                     </td>
                     <td>
-                      <small className="audit-detail" title={detail(x.detail)}>{detail(x.detail)}</small>
+                      <small className="audit-detail" title={kind === "auth" ? authDetail(x).result : detail(x.detail)}>{kind === "auth" ? (authDetail(x).result || "—") : detail(x.detail)}</small>
                     </td>
                   </tr>
                 ))}
@@ -9820,7 +9832,7 @@ function AuditSettings() {
         </div>
       )}
       {selected && (
-        <Modal title="操作记录详情" onClose={() => setSelected(null)} wide>
+        <Modal title={kind === "auth" ? "登录日志详情" : "操作日志详情"} onClose={() => setSelected(null)} wide>
           <div className="audit-detail-modal">
             <div><b>{labels[selected.action] || selected.action}</b><span>{time(selected.created_at)} · {operatorFor(selected).name}{operatorFor(selected).username ? ` (@${operatorFor(selected).username})` : ""}</span></div>
             <pre>{(() => { try { return JSON.stringify(JSON.parse(selected.detail), null, 2); } catch { return selected.detail || "—"; } })()}</pre>

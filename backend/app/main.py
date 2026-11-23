@@ -836,6 +836,8 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
         locked_until = user.locked_until if user.locked_until.tzinfo else user.locked_until.replace(tzinfo=timezone.utc)
         if locked_until > now:
             remaining = max(1, int((locked_until - now).total_seconds() / 60) + 1)
+            audit(db, user, "login_failed", "auth", detail=json.dumps({"username": body.username, "ip": source_ip, "result": "账号已锁定"}, ensure_ascii=False))
+            db.commit()
             raise HTTPException(status_code=423, detail=f"账号已锁定，请在 {remaining} 分钟后重试")
         user.locked_until = None
         user.failed_login_attempts = 0
@@ -851,14 +853,15 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
             else:
                 remaining = policy.login_max_attempts - user.failed_login_attempts
                 detail = f"用户名或密码错误，还可尝试 {remaining} 次"
-            db.commit()
+        audit(db, user, "login_failed", "auth", detail=json.dumps({"username": body.username, "ip": source_ip, "result": detail}, ensure_ascii=False))
+        db.commit()
         raise HTTPException(status_code=401, detail=detail)
     clear_login_failures(source_ip)
     user.failed_login_attempts = 0
     user.locked_until = None
     user.last_login_at = now
     user.last_login_ip = source_ip
-    audit(db, user, "login")
+    audit(db, user, "login", "auth", detail=json.dumps({"username": user.username, "ip": source_ip, "result": "登录成功"}, ensure_ascii=False))
     db.commit()
     return TokenOut(access_token=token_for(user, policy.session_timeout_minutes))
 
@@ -866,6 +869,14 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
 @app.get("/api/auth/me", response_model=UserOut)
 def me(user: User = Depends(current_user)):
     return user
+
+
+@app.post("/api/auth/logout")
+def logout_session(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    source_ip = _login_source_ip(request)
+    audit(db, user, "logout", "auth", detail=json.dumps({"username": user.username, "ip": source_ip, "result": "退出登录"}, ensure_ascii=False))
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/auth/change-password")
@@ -9457,11 +9468,16 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
 
 
 @app.get("/api/audit")
-def audit_logs(q: str = "", action: str = "", db: Session = Depends(get_db), _: User = Depends(require(Role.admin))):
+def audit_logs(q: str = "", action: str = "", category: str = "", db: Session = Depends(get_db), _: User = Depends(require(Role.admin))):
     items = db.scalars(select(AuditLog).order_by(desc(AuditLog.created_at)).limit(1000)).all()
     users = {user.id: (user.display_name or user.username) for user in db.scalars(select(User)).all()}
     if action:
         items = [item for item in items if item.action == action]
+    auth_actions = {"login", "login_failed", "logout"}
+    if category == "auth":
+        items = [item for item in items if item.action in auth_actions]
+    elif category == "operation":
+        items = [item for item in items if item.action not in auth_actions]
     keyword = q.strip().lower()
     if keyword:
         items = [item for item in items if keyword in " ".join((

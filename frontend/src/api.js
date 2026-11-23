@@ -1,7 +1,18 @@
 const base = '/api'
 
 export function token() { return localStorage.getItem('token') || '' }
-export function logout() { localStorage.removeItem('token'); location.reload() }
+export function logout() {
+  const current = token()
+  if (current) {
+    fetch(base + '/auth/logout', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${current}`},
+      keepalive: true,
+    }).catch(() => {})
+  }
+  localStorage.removeItem('token')
+  location.reload()
+}
 
 export async function api(path, options = {}) {
   const headers = {...(options.headers || {})}
