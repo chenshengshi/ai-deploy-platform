@@ -2564,6 +2564,23 @@ tbody tr:last-child td {
 .project-create-modal > .modal-actions {
   box-shadow: 0 -8px 24px rgba(34, 42, 69, .05);
 }
+.project-create-progress {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 26px 14px;
+  padding: 11px 13px;
+  border: 1px solid #dcd9ff;
+  border-radius: 10px;
+  background: #f5f4ff;
+  color: #554de3;
+  font-size: 12px;
+  font-weight: 600;
+}
+.project-create-progress svg {
+  width: 17px;
+  flex: 0 0 auto;
+}
 .project-create-modal .upload-zone {
   min-height: 156px;
   padding: 18px 24px;

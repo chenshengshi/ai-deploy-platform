@@ -1656,8 +1656,10 @@ function Chat() {
           deployImmediately={false}
           guidedActions
           onClose={() => setShowUpload(false)}
-          onDone={({ project: p, autoDeploy }) => {
+          onDone={({ project: p, deployment, nodeId, autoDeploy }) => {
             setShowUpload(false);
+            if (nodeId) setNode(nodeId);
+            if (deployment) setSelectedDeployment(deployment);
             api("/projects").then((items) => {
               setProjects(items);
               setProject(p.id);
@@ -1976,6 +1978,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
     [credentials, setCredentials] = useState([]),
     [nodes, setNodes] = useState([]),
     [node, setNode] = useState(""),
+    [processingStage, setProcessingStage] = useState(""),
     [showPrivate, setShowPrivate] = useState(false),
     [credential, setCredential] = useState({
       name: "",
@@ -2131,6 +2134,23 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
       setCredentialBusy(false);
     }
   };
+  const waitForAnalysis = async (projectId) => {
+    for (let attempt = 0; attempt < 900; attempt++) {
+      const current = await api(`/projects/${projectId}`),
+        analysis = current.source_analysis || {},
+        status = analysis.status || analysis.phase || "queued",
+        progress = Number(analysis.progress || 0);
+      if (status === "completed") return current;
+      if (status === "failed") throw new Error(analysis.error || analysis.message || "源码分析失败，请查看分析说明");
+      setProcessingStage(
+        status === "running" || status === "analyzing"
+          ? `AI 正在分析源码${progress ? `（${progress}%）` : ""}，完成后将自动部署…`
+          : "源码上传完成，正在等待 AI 分析…",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    throw new Error("源码分析等待超时，请稍后在项目管理中继续部署");
+  };
   const submit = async (shouldDeploy = deployImmediately) => {
     if (shouldDeploy && !node) {
       setErr("请先选择部署服务器");
@@ -2142,6 +2162,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
     }
     setBusy(true);
     setErr("");
+    setProcessingStage("正在创建项目并上传源码…");
     try {
       const name = form.name || "新项目",
         slug = form.slug || slugify(name);
@@ -2193,11 +2214,14 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
         }
       }
       if (shouldDeploy) {
+        setProcessingStage("源码上传完成，正在等待 AI 分析…");
+        readyProject = await waitForAnalysis(p.id);
+        setProcessingStage("分析完成，正在提交部署任务…");
         const deployment = await api(`/projects/${p.id}/deploy`, {
           method: "POST",
           body: JSON.stringify({ node_id: node }),
         });
-        onDone(guidedActions ? { project: readyProject, deployment, autoDeploy: true } : deployment);
+        onDone(guidedActions ? { project: readyProject, deployment, nodeId: node, autoDeploy: true } : deployment);
       } else {
         notify?.("项目已保存，后台 AI 已自动接管源码分析", "success", 6000);
         onDone(guidedActions ? { project: readyProject, autoDeploy: false } : readyProject);
@@ -2206,6 +2230,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
       setErr(e.message);
     } finally {
       setBusy(false);
+      setProcessingStage("");
     }
   };
   return (
@@ -2524,6 +2549,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
           </div>
         </details>
       </div>
+      {processingStage && <div className="project-create-progress"><LoaderCircle className="spin" /><span>{processingStage}</span></div>}
       {err && <div className="alert danger">{err}</div>}
       </div>
       <div className="modal-actions">
