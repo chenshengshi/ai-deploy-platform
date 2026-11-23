@@ -8852,6 +8852,24 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         if best_score >= 0.48 and best_score - runner_up >= 0.12:
             project_id = best_project.id
     confirmed = normalized in {"是", "是的", "确认", "确认部署", "确认停止", "确认取消", "确认回滚", "确认重启", "确认执行表结构", "确认执行高风险表结构", "确认执行数据变更", "确认执行高风险数据变更", "开始", "开始部署", "可以", "执行", "上线", "停止", "取消", "回滚", "重启"}
+    delete_intent_id = body.intent.split(":", 1)[1] if body.intent and body.intent.startswith("delete:") else None
+    wants_delete = (
+        decision.get("action") == "delete_project"
+        or delete_intent_id is not None
+        or any(phrase in normalized for phrase in ("删除项目", "删掉项目", "移除项目", "删除这个项目", "删掉这个项目"))
+    )
+    if wants_delete:
+        target = db.get(Project, delete_intent_id or project_id) if (delete_intent_id or project_id) else None
+        if not target:
+            return respond(
+                "请先选择或告诉我要删除的项目。平台不会仅凭模糊名称执行删除。",
+                action="none", project_id=project_id, node_id=node_id, intent="delete",
+            )
+        return respond(
+            f"尚未删除“{target.name}”。请点击下方“查看并确认删除”，核对容器、镜像、发布目录和数据卷后再决定。",
+            action="confirm_delete_project", project_id=target.id, node_id=node_id,
+            intent=f"delete:{target.id}",
+        )
     if direct_sql:
         target = db.get(Project, project_id) if project_id else None
         if not target:

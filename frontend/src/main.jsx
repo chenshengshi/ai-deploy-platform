@@ -1355,6 +1355,7 @@ function Chat() {
     [cleanupOpen, setCleanupOpen] = useState(false),
     [cleanupConfirm, setCleanupConfirm] = useState(""),
     [deleteTarget, setDeleteTarget] = useState(null),
+    [deleteProject, setDeleteProject] = useState(null),
     [selectedDeployment, setSelectedDeployment] = useState(null),
     [messages, setMessages] = useState([
       {
@@ -1475,6 +1476,7 @@ function Chat() {
         text: item.content,
         deployment: item.deployment_id,
         action: item.action,
+        projectId: data.session.project_id,
       })));
     } finally {
       setSessionBusy(false);
@@ -1552,7 +1554,7 @@ function Chat() {
       setIntent(r.intent || null);
       setMessages((x) => [
         ...x,
-        { who: "ai", text: r.reply, deployment: r.deployment_id, action: r.action },
+        { who: "ai", text: r.reply, deployment: r.deployment_id, action: r.action, projectId: r.project_id || project },
       ]);
       loadSessions();
     } catch (e) {
@@ -1571,6 +1573,14 @@ function Chat() {
         text: `无法打开发布记录：${error.message || "记录可能已被删除"}`,
         error: true,
       }]);
+    }
+  };
+  const openDeleteProject = async (projectId) => {
+    try {
+      const target = projects.find((item) => item.id === projectId) || await api(`/projects/${projectId}`);
+      setDeleteProject(target);
+    } catch (error) {
+      setMessages((items) => [...items, { who: "ai", text: `无法打开项目删除确认：${error.message}`, error: true }]);
     }
   };
   return (
@@ -1598,6 +1608,12 @@ function Chat() {
                         : m.action === "existing_deployment"
                           ? "查看进行中的部署任务"
                           : "查看发布记录"}
+                    </button>
+                  )}
+                  {m.action === "confirm_delete_project" && m.projectId && (
+                    <button type="button" className="chat-deployment-link danger-text" onClick={() => openDeleteProject(m.projectId)}>
+                      <Trash2 />
+                      查看并确认删除
                     </button>
                   )}
                 </div>
@@ -1731,6 +1747,25 @@ function Chat() {
                   : `项目“${p.name}”上传完成，AI 正在分析源码。分析完成后可选择服务器直接部署。`,
               },
             ]);
+          }}
+        />
+      )}
+      {deleteProject && (
+        <ProjectDeleteDialog
+          project={deleteProject}
+          onClose={() => setDeleteProject(null)}
+          onDone={() => {
+            const deletedId = deleteProject.id;
+            const deletedName = deleteProject.name;
+            setDeleteProject(null);
+            setProjects((items) => items.filter((item) => item.id !== deletedId));
+            if (project === deletedId) setProject("");
+            setIntent(null);
+            setMessages((items) => [...items, { who: "ai", text: `项目“${deletedName}”已删除并完成资源复查。` }]);
+          }}
+          onReset={() => {
+            setDeleteProject(null);
+            api("/projects").then(setProjects);
           }}
         />
       )}
