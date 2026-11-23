@@ -9672,24 +9672,32 @@ function SecuritySettings() {
 }
 function AuditSettings() {
   const [items, setItems] = useState(null);
+  const [pagination, setPagination] = useState({ total: 0, page: 1, page_size: 20, pages: 1 });
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [auditUsers, setAuditUsers] = useState([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(null);
   const [kind, setKind] = useState("operation");
-  const load = () => {
+  const load = (targetPage = page) => {
     setItems(null);
-    const params = new URLSearchParams({ category: kind });
+    const params = new URLSearchParams({ category: kind, paged: "true", page: String(targetPage), page_size: String(pageSize) });
     if (query.trim()) params.set("q", query.trim());
     Promise.all([
       api(`/audit?${params.toString()}`),
       api("/users"),
     ])
-      .then(([logs, users]) => { setAuditUsers(users); setItems(logs); })
-      .catch(() => setItems([]));
+      .then(([result, users]) => {
+        setAuditUsers(users);
+        setItems(result.items || []);
+        setPagination(result);
+        if (result.page !== targetPage) setPage(result.page);
+      })
+      .catch(() => { setItems([]); setPagination({ total: 0, page: 1, page_size: pageSize, pages: 1 }); });
   };
   useEffect(() => {
     load();
-  }, [kind]);
+  }, [kind, page, pageSize]);
   const operatorFor = (entry) => {
     if (!entry.user_id) return { name: entry.user_name || "系统任务", username: "" };
     const matched = auditUsers.find((user) => user.id === entry.user_id);
@@ -9760,6 +9768,10 @@ function AuditSettings() {
   const authDetail = (entry) => {
     try { return JSON.parse(entry.detail || "{}"); } catch { return {}; }
   };
+  const visiblePages = [...new Set([
+    1, pagination.pages,
+    pagination.page - 2, pagination.page - 1, pagination.page, pagination.page + 1, pagination.page + 2,
+  ])].filter((number) => number >= 1 && number <= pagination.pages).sort((a, b) => a - b);
   return (
     <>
       <div className="toolbar">
@@ -9767,20 +9779,20 @@ function AuditSettings() {
           <h2>日志审计</h2>
           <p>查询系统操作和账号登录活动；保留策略在安全设置中管理</p>
         </div>
-        <button className="ghost" onClick={load}>
+        <button className="ghost" onClick={() => load(page)}>
           <RefreshCw />
           刷新
         </button>
       </div>
       <div className="audit-kind-tabs" role="tablist" aria-label="日志类型">
-        <button className={kind === "operation" ? "active" : ""} onClick={() => setKind("operation")}>操作日志</button>
-        <button className={kind === "auth" ? "active" : ""} onClick={() => setKind("auth")}>登录日志</button>
+        <button className={kind === "operation" ? "active" : ""} onClick={() => { setPage(1); setKind("operation"); }}>操作日志</button>
+        <button className={kind === "auth" ? "active" : ""} onClick={() => { setPage(1); setKind("auth"); }}>登录日志</button>
       </div>
       <div className="panel audit-controls">
         <div className="audit-search">
           <Search />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && load()} placeholder={kind === "auth" ? "搜索用户、账号、IP 或登录结果" : "搜索操作人、项目、动作、SQL 或结果"} />
-          <button className="ghost" onClick={load}>搜索</button>
+          <input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { setPage(1); load(1); } }} placeholder={kind === "auth" ? "搜索用户、账号、IP 或登录结果" : "搜索操作人、项目、动作、SQL 或结果"} />
+          <button className="ghost" onClick={() => { setPage(1); load(1); }}>搜索</button>
         </div>
       </div>
       {items === null ? (
@@ -9828,6 +9840,22 @@ function AuditSettings() {
                 ))}
               </tbody>
             </table>
+          </div>
+          <div className="audit-pagination">
+            <div>共 <b>{pagination.total}</b> 条</div>
+            <div className="audit-page-buttons">
+              <button disabled={pagination.page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>上一页</button>
+              {visiblePages.map((number, index) => <React.Fragment key={number}>
+                {index > 0 && number - visiblePages[index - 1] > 1 && <span>…</span>}
+                <button className={number === pagination.page ? "active" : ""} onClick={() => setPage(number)}>{number}</button>
+              </React.Fragment>)}
+              <button disabled={pagination.page >= pagination.pages} onClick={() => setPage((value) => Math.min(pagination.pages, value + 1))}>下一页</button>
+            </div>
+            <label>每页
+              <select value={pageSize} onChange={(event) => { setPage(1); setPageSize(Number(event.target.value)); }}>
+                <option value={20}>20 条</option><option value={50}>50 条</option><option value={100}>100 条</option>
+              </select>
+            </label>
           </div>
         </div>
       )}

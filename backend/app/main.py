@@ -29,7 +29,7 @@ from cryptography.x509.oid import NameOID
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from sqlalchemy import desc, func, select, text
+from sqlalchemy import desc, func, or_, select, text
 from sqlalchemy.orm import Session
 from jose import JWTError, jwt
 
@@ -9468,12 +9468,47 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
 
 
 @app.get("/api/audit")
-def audit_logs(q: str = "", action: str = "", category: str = "", db: Session = Depends(get_db), _: User = Depends(require(Role.admin))):
+def audit_logs(
+    q: str = "", action: str = "", category: str = "", paged: bool = False,
+    page: int = 1, page_size: int = 20,
+    db: Session = Depends(get_db), _: User = Depends(require(Role.admin)),
+):
+    page = max(1, page)
+    page_size = min(100, max(20, page_size))
+    auth_actions = {"login", "login_failed", "logout"}
+    if paged:
+        query = select(AuditLog).outerjoin(User, User.id == AuditLog.user_id)
+        conditions = []
+        if action:
+            conditions.append(AuditLog.action == action)
+        if category == "auth":
+            conditions.append(AuditLog.action.in_(auth_actions))
+        elif category == "operation":
+            conditions.append(AuditLog.action.not_in(auth_actions))
+        keyword = q.strip().lower()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(or_(
+                func.lower(func.coalesce(User.display_name, "")).like(pattern),
+                func.lower(func.coalesce(User.username, "")).like(pattern),
+                func.lower(func.coalesce(AuditLog.action, "")).like(pattern),
+                func.lower(func.coalesce(AuditLog.target_type, "")).like(pattern),
+                func.lower(func.coalesce(AuditLog.target_id, "")).like(pattern),
+                func.lower(func.coalesce(AuditLog.detail, "")).like(pattern),
+            ))
+        if conditions:
+            query = query.where(*conditions)
+        total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages)
+        items = db.scalars(query.order_by(desc(AuditLog.created_at)).offset((page - 1) * page_size).limit(page_size)).all()
+        users = {user.id: (user.display_name or user.username) for user in db.scalars(select(User)).all()}
+        rows = [{"id": x.id, "user_id": x.user_id, "user_name": users.get(x.user_id, "系统任务"), "action": x.action, "target_type": x.target_type, "target_id": x.target_id, "detail": x.detail, "created_at": x.created_at} for x in items]
+        return {"items": rows, "total": total, "page": page, "page_size": page_size, "pages": pages}
     items = db.scalars(select(AuditLog).order_by(desc(AuditLog.created_at)).limit(1000)).all()
     users = {user.id: (user.display_name or user.username) for user in db.scalars(select(User)).all()}
     if action:
         items = [item for item in items if item.action == action]
-    auth_actions = {"login", "login_failed", "logout"}
     if category == "auth":
         items = [item for item in items if item.action in auth_actions]
     elif category == "operation":
