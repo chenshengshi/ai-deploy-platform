@@ -9290,13 +9290,12 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         decision["action"] = "none"
         missing = "项目和目标服务器" if not project_id and not node_id else ("项目" if not project_id else "目标服务器")
         decision["reply"] = f"我已记住当前选择，还缺少{missing}。请直接选择或告诉我名称。"
-    elif wants_deploy and project_id and node_id and not (body.intent == "confirm" and confirmed):
-        project, node = db.get(Project, project_id), db.get(Node, node_id)
-        plan = make_deployment_plan(project, node, db)
-        port_text = plan["port_mode"] if plan["host_port"] is None else f"内网实例端口 {plan['host_port']} → 容器端口 {plan['container_port'] or '执行时识别'}"
-        step_text = "\n".join(f"{index + 1}. {step['title']}：{step['detail']}" for index, step in enumerate(plan["steps"]))
-        decision.update({"action": "confirm", "reply": f"发布前分析已完成。\n目标：{plan['project']} → {plan['node']}（{plan['node_address']}）\n构建：{plan['build_mode']}\n端口：{port_text}\n\n执行步骤：\n{step_text}\n\n回复“确认部署”后开始执行。"})
-        next_intent = "confirm"
+    elif wants_deploy and project_id and node_id:
+        # Deploy is a reversible, explicitly requested action. Once both
+        # selections are known, enqueue it immediately; validation remains in
+        # the controlled deployment pipeline and reports only real blockers.
+        decision["action"] = "deploy"
+        next_intent = None
     elif body.intent == "confirm" and confirmed and project_id and node_id:
         decision["action"] = "deploy"
         next_intent = None
@@ -9329,9 +9328,7 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
             deployment_id = item.id
             audit(db, user, "ai_deploy", "deployment", item.id, body.message)
             db.commit()
-            port_text = plan["port_mode"] if plan["host_port"] is None else f"内网实例端口 {plan['host_port']} → 容器端口 {plan['container_port'] or '执行时识别'}"
-            step_text = "\n".join(f"{index + 1}. {step['title']}：{step['detail']}" for index, step in enumerate(plan["steps"]))
-            decision["reply"] = f"发布前分析已完成。\n目标：{plan['project']} → {plan['node']}（{plan['node_address']}）\n构建：{plan['build_mode']}\n端口：{port_text}\n访问地址：{plan['access_url'] or '部署完成后根据 Compose 配置生成'}\n\n执行步骤：\n{step_text}\n\n任务已进入队列，可在部署记录中查看每一步进度和日志。"
+            decision["reply"] = f"已开始部署“{plan['project']}”到“{plan['node']}”，可查看实时进度。"
     return respond(decision.get("reply", "已处理"), deployment_id=deployment_id, action=decision.get("action"), project_id=project_id, node_id=node_id, intent=next_intent)
 
 

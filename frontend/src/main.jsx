@@ -3208,7 +3208,6 @@ function ProjectDetail({
     [showGatewaySnapshot, setShowGatewaySnapshot] = useState(false),
     [showGatewaySettings, setShowGatewaySettings] = useState(false),
     [showDomainConfig, setShowDomainConfig] = useState(false),
-    [deployConfirm, setDeployConfirm] = useState(false),
     [rollbackConfirm, setRollbackConfirm] = useState(null),
     [busy, setBusy] = useState(false),
     [saving, setSaving] = useState(false),
@@ -3537,7 +3536,6 @@ function ProjectDetail({
         ...(current || []).filter((item) => item.id !== d.id),
       ]);
       onDeploymentCreated?.(d);
-      setDeployConfirm(false);
       loadDeployments();
     } catch (e) {
       setMsg(e.message);
@@ -4102,7 +4100,7 @@ function ProjectDetail({
             <button
               className="primary"
               disabled={!node || busy || !canEdit || !!activeDeployment || sourceIsBusy || sourceFailed}
-              onClick={() => setDeployConfirm(true)}
+              onClick={deploy}
             >
               {busy || sourceIsBusy ? <LoaderCircle className="spin" /> : <Play />}
               {deployButtonText}
@@ -4243,17 +4241,6 @@ function ProjectDetail({
           busy={projectLifecycleBusy === "stop"}
           onClose={() => projectLifecycleBusy !== "stop" && setProjectStopConfirm(false)}
           onConfirm={stopProject}
-        />
-      )}
-      {deployConfirm && (
-        <ConfirmDialog
-          title="确认创建部署"
-          text={`发布“${project.name}”到“${selectedNode?.name || "所选服务器"}”？`}
-          description="将先以 1 个应用实例完成构建、启动和访问验证。发布成功后，可到“运行服务”手动增加实例并开启负载均衡。"
-          confirmText="确认并开始部署"
-          busy={busy}
-          onClose={() => !busy && setDeployConfirm(false)}
-          onConfirm={deploy}
         />
       )}
       {rollbackConfirm && (
