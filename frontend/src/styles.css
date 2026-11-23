@@ -1323,6 +1323,33 @@ tbody tr:last-child td {
   width: 14px;
   height: 14px;
 }
+.chat-answer-meta {
+  margin: 0 0 8px;
+  color: #7c8799;
+  font-size: 11px;
+}
+.chat-answer-meta summary {
+  width: fit-content;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.chat-answer-meta summary::-webkit-details-marker { display: none; }
+.chat-answer-meta summary::after {
+  content: "›";
+  display: inline-block;
+  margin-left: 6px;
+  transition: transform .15s ease;
+}
+.chat-answer-meta[open] summary::after { transform: rotate(90deg); }
+.chat-answer-meta > div {
+  margin-top: 7px;
+  padding: 8px 10px;
+  border-left: 2px solid #dedbfd;
+  background: #fafaff;
+  color: #687487;
+  line-height: 1.5;
+}
 .composer {
   flex: 0 0 auto;
   padding: 12px;

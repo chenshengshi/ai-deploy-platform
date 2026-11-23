@@ -440,6 +440,8 @@ def startup():
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(64) NOT NULL DEFAULT ''"))
+        connection.execute(text("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS elapsed_ms INTEGER"))
+        connection.execute(text("COMMENT ON COLUMN chat_messages.elapsed_ms IS 'AI 回答从接收请求到生成完成的耗时，单位毫秒'"))
         connection.execute(text("COMMENT ON COLUMN users.last_login_at IS '用户最近一次成功登录时间'"))
         connection.execute(text("COMMENT ON COLUMN users.last_login_ip IS '用户最近一次成功登录来源 IP'"))
         connection.execute(text("ALTER TABLE security_config ADD COLUMN IF NOT EXISTS audit_retention_days INTEGER NOT NULL DEFAULT 180"))
@@ -8634,7 +8636,7 @@ def chat_session_messages(session_id: str, db: Session = Depends(get_db), user: 
         "session": _chat_session_dict(db, session),
         "messages": [
             {"id": item.id, "role": item.role, "content": item.content, "action": item.action,
-             "deployment_id": item.deployment_id, "created_at": item.created_at}
+             "deployment_id": item.deployment_id, "elapsed_ms": item.elapsed_ms, "created_at": item.created_at}
             for item in messages
         ],
     }
@@ -8708,6 +8710,7 @@ def purge_chat_sessions(body: dict, db: Session = Depends(get_db), user: User = 
 
 @app.post("/api/chat", response_model=ChatOut)
 def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+    chat_started = time.perf_counter()
     session = _chat_session_for_user(db, body.session_id, user) if body.session_id else None
     requested_ai = db.get(AiConfig, body.ai_config_id) if body.ai_config_id else None
     if requested_ai and not requested_ai.enabled:
@@ -8755,18 +8758,20 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         session.project_id = project_id if project_id and db.get(Project, project_id) else session.project_id
         session.node_id = node_id if node_id and db.get(Node, node_id) else session.node_id
         session.updated_at = datetime.now(timezone.utc)
+        elapsed_ms = max(0, round((time.perf_counter() - chat_started) * 1000))
         db.add(ChatMessage(
             session_id=session.id,
             role="assistant",
             content=reply,
             action=action,
             deployment_id=deployment_id,
+            elapsed_ms=elapsed_ms,
         ))
         db.commit()
         return ChatOut(
             reply=reply, deployment_id=deployment_id, action=action,
             project_id=project_id, node_id=node_id, intent=intent,
-            session_id=session.id,
+            session_id=session.id, elapsed_ms=elapsed_ms,
         )
 
     direct_sql = _extract_direct_sql(body.message)

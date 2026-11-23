@@ -219,6 +219,7 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text)
     action: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deployment_id: Mapped[str | None] = mapped_column(ForeignKey("deployments.id", ondelete="SET NULL"), nullable=True)
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     session: Mapped[ChatSession] = relationship(back_populates="messages")
 

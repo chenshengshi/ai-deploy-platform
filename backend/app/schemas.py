@@ -393,6 +393,7 @@ class ChatOut(BaseModel):
     node_id: str | None = None
     intent: str | None = None
     session_id: str | None = None
+    elapsed_ms: int | None = None
 
 
 class SqlConsoleIn(BaseModel):

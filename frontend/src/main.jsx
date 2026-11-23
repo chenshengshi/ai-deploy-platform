@@ -71,6 +71,12 @@ const sourcePhaseText = {
 
 const pendingAutoDeployKey = "yunzhou.pendingAutoDeploy";
 
+const formatElapsed = (milliseconds) => {
+  const seconds = Math.max(0, Number(milliseconds || 0) / 1000);
+  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}秒`;
+  return `${Math.floor(seconds / 60)}分${Math.round(seconds % 60)}秒`;
+};
+
 const stripTerminalAnsi = (value) => String(value ?? "")
   .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
   .replace(/\r(?!\n)/g, "");
@@ -1536,6 +1542,7 @@ function Chat() {
         deployment: item.deployment_id,
         action: item.action,
         projectId: data.session.project_id,
+        elapsedMs: item.elapsed_ms,
       })));
     } finally {
       setSessionBusy(false);
@@ -1616,7 +1623,7 @@ function Chat() {
       setIntent(r.intent || null);
       setMessages((x) => [
         ...x,
-        { who: "ai", text: r.reply, deployment: r.deployment_id, action: r.action, projectId: r.project_id || project },
+        { who: "ai", text: r.reply, deployment: r.deployment_id, action: r.action, projectId: r.project_id || project, elapsedMs: r.elapsed_ms },
       ]);
       loadSessions();
     } catch (e) {
@@ -1667,6 +1674,12 @@ function Chat() {
                   </div>
                 )}
                 <div>
+                  {m.who === "ai" && m.elapsedMs > 0 && (
+                    <details className="chat-answer-meta">
+                      <summary>用时 {formatElapsed(m.elapsedMs)}</summary>
+                      <div>已读取当前会话上下文，完成意图识别并保存本次回答{m.action && m.action !== "answer" && m.action !== "none" ? "；同时调用了受控平台操作" : ""}。</div>
+                    </details>
+                  )}
                   {m.workflowProjectId && !m.workflowDone && <div className="workflow-live"><LoaderCircle className="spin" />正在同步任务状态</div>}
                   <MemoChatMessageContent text={m.text} />
                   {m.deployment && (
