@@ -2544,6 +2544,38 @@ tbody tr:last-child td {
 .quick-deploy {
   padding: 22px 26px;
 }
+.modal.project-create-modal {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  max-height: min(90vh, 820px);
+}
+.project-create-modal .modal-head,
+.project-create-modal > .modal-actions {
+  flex: 0 0 auto;
+  background: #fff;
+  z-index: 2;
+}
+.project-create-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.project-create-modal > .modal-actions {
+  box-shadow: 0 -8px 24px rgba(34, 42, 69, .05);
+}
+.project-create-modal .upload-zone {
+  min-height: 156px;
+  padding: 18px 24px;
+}
+.project-create-modal .upload-zone-icon {
+  width: 42px;
+  height: 42px;
+  margin-bottom: 8px;
+}
+.project-create-modal .upload-zone > p {
+  margin: 5px 0 12px;
+}
 .quick-step {
   display: flex;
   align-items: center;

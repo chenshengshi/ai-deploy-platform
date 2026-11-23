@@ -2209,7 +2209,8 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
     }
   };
   return (
-    <Modal title={deployImmediately ? "上传并部署项目" : "添加项目并分析源码"} onClose={onClose} wide>
+    <Modal title={deployImmediately ? "上传并部署项目" : "添加项目并分析源码"} onClose={onClose} wide className="project-create-modal">
+      <div className="project-create-body">
       <div className="quick-deploy">
         <Field
           label="上传名称（项目名称）"
@@ -2524,6 +2525,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
         </details>
       </div>
       {err && <div className="alert danger">{err}</div>}
+      </div>
       <div className="modal-actions">
         <button className="ghost" onClick={onClose}>
           取消
