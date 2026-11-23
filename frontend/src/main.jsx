@@ -1313,7 +1313,12 @@ function ChatMessageContent({ text }) {
     if (heading) return <div className="message-section" key={`${prefix}-${index}`}><b>{heading[1]}</b>{heading[2] && <span>{heading[2]}</span>}</div>;
     const numbered = value.match(/^([0-9]+)[.)、]\s*(.*)$/);
     if (numbered) return <div className="message-list-line" key={`${prefix}-${index}`}><i>{numbered[1]}</i><span>{numbered[2]}</span></div>;
-    return <div className="message-line" key={`${prefix}-${index}`}>{line}</div>;
+    const parts = line.split(/(https?:\/\/[^\s]+)/g);
+    return <div className="message-line" key={`${prefix}-${index}`}>{parts.map((part, partIndex) =>
+      /^https?:\/\//.test(part)
+        ? <a key={partIndex} href={part} target="_blank" rel="noreferrer">{part}</a>
+        : part
+    )}</div>;
   };
   return (
     <div className="message-copy">
@@ -1403,7 +1408,18 @@ function Chat() {
               deployStep = latest.current_step || latest.stage_label || "";
             text = `项目“${current.name}”正在部署${deployProgress ? `（${deployProgress}%）` : ""}${deployStep ? ` · ${deployStep}` : ""}，可查看实时进度。`;
           } else if (latest?.status === "success") {
-            text = `项目“${current.name}”已部署成功，构建、启动、健康检查和访问验证均已完成${latest.access_url ? `：${latest.access_url}` : "。"}`;
+            const rawAccessUrl = latest.platform_access_url || latest.access_url || "";
+            let visitUrl = rawAccessUrl;
+            try {
+              const parsed = new URL(rawAccessUrl);
+              if (/^\/api\/(?:auth\/status|health|status)\/?$/i.test(parsed.pathname)) {
+                parsed.pathname = "/";
+                parsed.search = "";
+                parsed.hash = "";
+                visitUrl = parsed.toString();
+              }
+            } catch { /* The deployment can finish before its public URL is assigned. */ }
+            text = `项目“${current.name}”已部署成功。${visitUrl ? `\n访问地址：${visitUrl}` : ""}`;
             done = true;
           } else if (latest?.status === "failed") {
             text = `项目“${current.name}”部署失败，可打开发布记录查看原因。`;

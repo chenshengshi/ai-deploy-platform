@@ -9170,6 +9170,7 @@ def execute(deployment_id: str) -> None:
     runtime_bundle = None
     gateway_snapshot = None
     gateway_switched = False
+    public_access = None
     preempted_shared_containers: list[str] = []
     verification_paths: list[str] = []
     with SessionLocal() as db:
@@ -10170,6 +10171,7 @@ def execute(deployment_id: str) -> None:
                         route_groups=route_groups or None,
                         strategy=project.load_balance_strategy,
                     ) if published_port else None
+                    public_access = access
                     gateway_switched = bool(access)
                     service_names = {service.get("name") for service in topology.get("services", [])}
                     has_root_route = any(
@@ -10180,10 +10182,13 @@ def execute(deployment_id: str) -> None:
                     )
                     if access and build_file == ".yunzhou.compose.yml" and {"frontend", "backend"}.issubset(service_names):
                         access = access.rstrip("/") + "/app/"
+                        public_access = access
                     elif access and access_path != "/" and (
                         not has_root_route or len(service_targets) == 1
                     ):
                         access = access.rstrip("/") + access_path
+                        if not access_path.startswith("/api/"):
+                            public_access = access
                     if access:
                         log(dep.id, f"[检查] 平台网关映射完成：{access}\n")
                 else:
@@ -10248,9 +10253,12 @@ def execute(deployment_id: str) -> None:
                         certificate=decrypt(domain_config.certificate_encrypted) if domain_config else None,
                         private_key=decrypt(domain_config.private_key_encrypted) if domain_config else None,
                     )
+                    public_access = access
                     gateway_switched = True
                     if access_path != "/":
                         access = access.rstrip("/") + access_path
+                        if not access_path.startswith("/api/"):
+                            public_access = access
                     log(dep.id, f"[检查] 平台网关映射完成：{access}\n")
 
             log_stage(dep.id, "完成", "start")
@@ -10291,7 +10299,9 @@ def execute(deployment_id: str) -> None:
             dep.container_name = container_name
             dep.image_name = image_name if build_type == "dockerfile" else None
             dep.host_port = host_port if build_type == "dockerfile" else published_port
-            dep.access_url = access
+            # Keep health/readiness probes internal. The address presented to
+            # users must remain the application's browser entry point.
+            dep.access_url = public_access or access
             dep.finished_at = datetime.now(timezone.utc)
             for reservation in db.scalars(select(DeploymentPortReservation).where(
                 DeploymentPortReservation.deployment_id == dep.id,
