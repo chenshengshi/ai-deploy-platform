@@ -1364,7 +1364,6 @@ function Chat() {
     [deleteTarget, setDeleteTarget] = useState(null),
     [deleteProject, setDeleteProject] = useState(null),
     [selectedDeployment, setSelectedDeployment] = useState(null),
-    [workflowActionBusy, setWorkflowActionBusy] = useState(""),
     [messages, setMessages] = useState([
       {
         who: "ai",
@@ -1372,7 +1371,8 @@ function Chat() {
       },
     ]),
     [intent, setIntent] = useState(null);
-  const messagesEndRef = useRef(null), textareaRef = useRef(null), answerAbortRef = useRef(null);
+  const messagesEndRef = useRef(null), textareaRef = useRef(null), answerAbortRef = useRef(null), autoDiagnosisRef = useRef(new Set()), messagesRef = useRef(messages);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => {
     requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" }));
   }, [messages, busy, sessionId]);
@@ -1418,6 +1418,25 @@ function Chat() {
           setMessages((items) => items.map((item) => item.workflowProjectId === projectId && !item.workflowDone
             ? { ...item, text, error, workflowDone: done, deployment: latest?.id || item.deployment, action: latest ? "existing_deployment" : item.action }
             : item));
+          const stored = messagesRef.current.find((item) => item.workflowProjectId === projectId && item.workflowMessageId);
+          if (stored) {
+            const retrySuffix = stored.autoRetryCount ? `_retry_${stored.autoRetryCount}` : "",
+              workflowAction = done
+                ? (error ? `workflow_failed${retrySuffix}` : "workflow_success")
+                : `workflow_running${retrySuffix}`;
+            api("/chat/workflow", {
+              method: "POST",
+              body: JSON.stringify({
+                session_id: stored.workflowSessionId,
+                message_id: stored.workflowMessageId,
+                project_id: projectId,
+                node_id: latest?.node_id || node || undefined,
+                content: text,
+                action: workflowAction,
+                deployment_id: latest?.id || stored.deployment,
+              }),
+            }).catch(() => {});
+          }
           if (done) localStorage.removeItem(pendingAutoDeployKey);
         } catch {
           // A temporary refresh failure must not turn a running task into a false failure.
@@ -1428,6 +1447,74 @@ function Chat() {
     const timer = setInterval(refresh, 3000);
     return () => { stopped = true; clearInterval(timer); };
   }, [workflowIds.join("|")]);
+  const failedWorkflowDeployments = useMemo(() => messages
+    .filter((item) => item.workflowDone && item.error && item.deployment)
+    .map((item) => `${item.deployment}:${item.autoRetryCount || 0}`), [messages]);
+  useEffect(() => {
+    failedWorkflowDeployments.forEach((entry) => {
+      const [deploymentId, retryCountText] = entry.split(":"), retryCount = Number(retryCountText || 0);
+      if (!deploymentId || autoDiagnosisRef.current.has(deploymentId)) return;
+      autoDiagnosisRef.current.add(deploymentId);
+      const storedMessage = messagesRef.current.find((item) => item.deployment === deploymentId),
+        persist = (content, action, nextDeploymentId = deploymentId) => {
+          if (!storedMessage?.workflowMessageId || !storedMessage?.workflowProjectId) return Promise.resolve();
+          return api("/chat/workflow", {
+            method: "POST",
+            body: JSON.stringify({
+              session_id: storedMessage.workflowSessionId,
+              message_id: storedMessage.workflowMessageId,
+              project_id: storedMessage.workflowProjectId,
+              node_id: node || undefined,
+              content,
+              action,
+              deployment_id: nextDeploymentId,
+            }),
+          }).catch(() => {});
+        };
+      const diagnosingText = "部署失败，AI 正在自动分析完整日志并判断是否可以安全重新发布…";
+      setMessages((items) => items.map((item) => item.deployment === deploymentId
+        ? { ...item, text: diagnosingText, error: false, autoDiagnosing: true }
+        : item));
+      persist(diagnosingText, `workflow_diagnosing${retryCount ? `_retry_${retryCount}` : ""}`);
+      (async () => {
+        try {
+          const diagnosis = await api(`/deployments/${deploymentId}/ai-followup`),
+            summary = diagnosis.summary || "已读取失败日志，但暂未形成明确结论。";
+          if (diagnosis.retry_safe === true && retryCount < 1) {
+            const deployment = await api(`/deployments/${deploymentId}/retry`, { method: "POST" });
+            const retryText = `AI 已确认问题可以安全重试：${summary}\n平台已自动重新发布，正在等待执行。`;
+            setMessages((items) => items.map((item) => item.deployment === deploymentId
+              ? {
+                ...item,
+                text: retryText,
+                deployment: deployment.id,
+                action: "existing_deployment",
+                workflowDone: false,
+                error: false,
+                autoDiagnosing: false,
+                autoRetryCount: retryCount + 1,
+              }
+              : item));
+            persist(retryText, "workflow_running_retry_1", deployment.id);
+            return;
+          }
+          const nextStep = diagnosis.next_step || diagnosis.advice || "请根据失败原因处理后重新发布。",
+            prefix = retryCount > 0 ? "自动重新发布后仍未成功。" : "平台已完成自动诊断。",
+            resultText = `${prefix}\n结论：${summary}\n下一步：${nextStep}`;
+          setMessages((items) => items.map((item) => item.deployment === deploymentId
+            ? { ...item, text: resultText, error: true, autoDiagnosing: false }
+            : item));
+          persist(resultText, `workflow_failed${retryCount ? `_retry_${retryCount}` : ""}`);
+        } catch (error) {
+          const failureText = `部署失败，自动诊断暂未完成：${error.message}`;
+          setMessages((items) => items.map((item) => item.deployment === deploymentId
+            ? { ...item, text: failureText, error: true, autoDiagnosing: false }
+            : item));
+          persist(failureText, `workflow_failed${retryCount ? `_retry_${retryCount}` : ""}`);
+        }
+      })();
+    });
+  }, [failedWorkflowDeployments.join("|")]);
   useEffect(() => {
     if (!busy) {
       setAiElapsed(0);
@@ -1544,6 +1631,12 @@ function Chat() {
         deployment: item.deployment_id,
         action: item.action,
         projectId: data.session.project_id,
+        workflowProjectId: item.action?.startsWith("workflow_") ? data.session.project_id : undefined,
+        workflowSessionId: item.action?.startsWith("workflow_") ? id : undefined,
+        workflowMessageId: item.action?.startsWith("workflow_") ? item.id : undefined,
+        workflowDone: item.action?.startsWith("workflow_success") || item.action?.startsWith("workflow_failed"),
+        error: item.action?.startsWith("workflow_failed"),
+        autoRetryCount: Number(item.action?.match(/_retry_(\d+)/)?.[1] || 0),
         elapsedMs: item.elapsed_ms,
       })));
     } finally {
@@ -1652,46 +1745,6 @@ function Chat() {
       }]);
     }
   };
-  const analyzeFailedDeployment = async (deploymentId) => {
-    const actionKey = `diagnose:${deploymentId}`;
-    setWorkflowActionBusy(actionKey);
-    try {
-      const diagnosis = await api(`/deployments/${deploymentId}/ai-followup`),
-        plan = Array.isArray(diagnosis.fix_plan) ? diagnosis.fix_plan.filter(Boolean) : [],
-        details = [
-          `结论：${diagnosis.summary || "已读取失败日志，但暂未形成明确结论。"}`,
-          diagnosis.advice ? `处理建议：${diagnosis.advice}` : "",
-          plan.length ? `修复步骤：\n${plan.map((step, index) => `${index + 1}. ${step}`).join("\n")}` : "",
-          diagnosis.next_step ? `下一步：${diagnosis.next_step}` : "",
-        ].filter(Boolean).join("\n\n");
-      setMessages((items) => [...items, { who: "ai", text: details, action: "diagnosis" }]);
-    } catch (error) {
-      setMessages((items) => [...items, { who: "ai", text: `AI 分析失败原因时遇到问题：${error.message}`, error: true }]);
-    } finally {
-      setWorkflowActionBusy("");
-    }
-  };
-  const retryFailedDeployment = async (message) => {
-    const actionKey = `retry:${message.deployment}`;
-    setWorkflowActionBusy(actionKey);
-    try {
-      const deployment = await api(`/deployments/${message.deployment}/retry`, { method: "POST" });
-      setMessages((items) => items.map((item) => item === message
-        ? {
-          ...item,
-          text: `项目“${projects.find((candidate) => candidate.id === item.workflowProjectId)?.name || "当前项目"}”已重新发布，正在等待执行。`,
-          deployment: deployment.id,
-          action: "existing_deployment",
-          workflowDone: false,
-          error: false,
-        }
-        : item));
-    } catch (error) {
-      setMessages((items) => [...items, { who: "ai", text: `重新发布失败：${error.message}`, error: true }]);
-    } finally {
-      setWorkflowActionBusy("");
-    }
-  };
   const openDeleteProject = async (projectId) => {
     try {
       const target = projects.find((item) => item.id === projectId) || await api(`/projects/${projectId}`);
@@ -1733,18 +1786,6 @@ function Chat() {
                           ? "查看进行中的部署任务"
                           : "查看发布记录"}
                     </button>
-                  )}
-                  {m.workflowDone && m.error && m.deployment && (
-                    <div className="chat-failure-actions">
-                      <button type="button" disabled={Boolean(workflowActionBusy)} onClick={() => analyzeFailedDeployment(m.deployment)}>
-                        {workflowActionBusy === `diagnose:${m.deployment}` ? <LoaderCircle className="spin" /> : <Bot />}
-                        AI 分析原因
-                      </button>
-                      <button type="button" disabled={Boolean(workflowActionBusy)} onClick={() => retryFailedDeployment(m)}>
-                        {workflowActionBusy === `retry:${m.deployment}` ? <LoaderCircle className="spin" /> : <RefreshCw />}
-                        重新发布
-                      </button>
-                    </div>
                   )}
                   {m.action === "confirm_delete_project" && m.projectId && (
                     <button type="button" className="chat-deployment-link danger-text" onClick={() => openDeleteProject(m.projectId)}>
@@ -1868,15 +1909,38 @@ function Chat() {
           deployImmediately={false}
           guidedActions
           onClose={() => setShowUpload(false)}
-          onBackground={({ project: pendingProject, nodeId }) => {
+          onBackground={async ({ project: pendingProject, nodeId }) => {
             setShowUpload(false);
             if (pendingProject?.id) setProject(pendingProject.id);
             if (nodeId) setNode(nodeId);
+            const localKey = `workflow-${pendingProject?.id}-${Date.now()}`;
             setMessages((items) => [...items, {
               who: "ai",
               text: `项目“${pendingProject?.name || "未命名项目"}”已转到后台继续分析，完成后将自动部署。`,
               workflowProjectId: pendingProject?.id,
+              workflowLocalKey: localKey,
             }]);
+            if (!pendingProject?.id) return;
+            try {
+              const stored = await api("/chat/workflow", {
+                method: "POST",
+                body: JSON.stringify({
+                  session_id: sessionId || undefined,
+                  project_id: pendingProject.id,
+                  node_id: nodeId || undefined,
+                  ai_config_id: aiConfig || undefined,
+                  content: `项目“${pendingProject.name || "未命名项目"}”正在后台分析，完成后将自动部署。`,
+                  action: "workflow_analyzing",
+                }),
+              });
+              setSessionId(stored.session.id);
+              setMessages((items) => items.map((item) => item.workflowLocalKey === localKey
+                ? { ...item, workflowSessionId: stored.session.id, workflowMessageId: stored.message.id }
+                : item));
+              loadSessions(false);
+            } catch {
+              // The local workflow remains visible and can still be recovered from pending task state.
+            }
           }}
           onProgress={({ project: progressProject, text: progressText }) => {
             setMessages((items) => items.map((item) => item.workflowProjectId === progressProject.id

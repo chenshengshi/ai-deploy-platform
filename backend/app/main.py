@@ -8618,6 +8618,52 @@ def _chat_session_dict(db: Session, session: ChatSession) -> dict:
     }
 
 
+@app.post("/api/chat/workflow")
+def save_chat_workflow(body: dict, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+    project_id = str(body.get("project_id") or "").strip()
+    project = db.get(Project, project_id) if project_id else None
+    if not project or not _user_can_access_project(db, user, project.id):
+        raise HTTPException(404, "项目不存在或无权访问")
+    session_id = str(body.get("session_id") or "").strip()
+    session = _chat_session_for_user(db, session_id, user) if session_id else None
+    if not session:
+        session = ChatSession(
+            owner_id=user.id,
+            project_id=project.id,
+            node_id=str(body.get("node_id") or "").strip() or None,
+            ai_config_id=str(body.get("ai_config_id") or "").strip() or None,
+            title=f"部署 · {project.name}"[:160],
+        )
+        db.add(session)
+        db.flush()
+    session.project_id = project.id
+    if body.get("node_id") and db.get(Node, str(body["node_id"])):
+        session.node_id = str(body["node_id"])
+    session.archived = False
+    session.updated_at = datetime.now(timezone.utc)
+    message_id = str(body.get("message_id") or "").strip()
+    message = db.get(ChatMessage, message_id) if message_id else None
+    if message and message.session_id != session.id:
+        raise HTTPException(409, "任务消息不属于当前对话")
+    if not message:
+        message = ChatMessage(session_id=session.id, role="assistant", content="")
+        db.add(message)
+        db.flush()
+    message.content = str(body.get("content") or "正在读取任务状态")[:20_000]
+    message.action = str(body.get("action") or "workflow_running")[:64]
+    deployment_id = str(body.get("deployment_id") or "").strip()
+    message.deployment_id = deployment_id if deployment_id and db.get(Deployment, deployment_id) else message.deployment_id
+    db.commit()
+    return {
+        "session": _chat_session_dict(db, session),
+        "message": {
+            "id": message.id, "role": message.role, "content": message.content,
+            "action": message.action, "deployment_id": message.deployment_id,
+            "created_at": message.created_at,
+        },
+    }
+
+
 @app.get("/api/chat/sessions")
 def chat_sessions(project_id: str | None = None, archived: bool = False, db: Session = Depends(get_db), user: User = Depends(current_user)):
     query = select(ChatSession).where(ChatSession.archived == archived)
