@@ -1833,17 +1833,23 @@ function Chat() {
             if (nodeId) setNode(nodeId);
             setProject(p.id);
             api("/projects").then(setProjects);
-            setMessages((x) => [
-              ...x,
-              {
+            setMessages((items) => {
+              if (!autoDeploy) return [...items, {
                 who: "ai",
-                text: autoDeploy
-                  ? `项目“${p.name}”上传并分析完成，已自动开始部署。可在下方查看实时进度。`
-                  : `项目“${p.name}”上传完成，AI 正在分析源码。分析完成后可选择服务器直接部署。`,
+                text: `项目“${p.name}”上传完成，AI 正在分析源码。分析完成后可选择服务器直接部署。`,
+              }];
+              const found = items.some((item) => item.workflowProjectId === p.id);
+              const updated = items.map((item) => item.workflowProjectId === p.id
+                ? { ...item, text: `项目“${p.name}”正在部署，可查看实时进度。`, deployment: deployment?.id, action: "deploy" }
+                : item);
+              return found ? updated : [...updated, {
+                who: "ai",
+                text: `项目“${p.name}”正在部署，可查看实时进度。`,
+                workflowProjectId: p.id,
                 deployment: deployment?.id,
-                action: deployment ? "deploy" : undefined,
-              },
-            ]);
+                action: "deploy",
+              }];
+            });
           }}
         />
       )}
