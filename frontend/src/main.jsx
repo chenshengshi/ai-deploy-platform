@@ -1654,8 +1654,9 @@ function Chat() {
       {showUpload && (
         <ProjectModal
           deployImmediately={false}
+          guidedActions
           onClose={() => setShowUpload(false)}
-          onDone={(p) => {
+          onDone={({ project: p, autoDeploy }) => {
             setShowUpload(false);
             api("/projects").then((items) => {
               setProjects(items);
@@ -1665,7 +1666,9 @@ function Chat() {
               ...x,
               {
                 who: "ai",
-                text: `项目“${p.name}”上传完成，已自动选中。请选择目标服务器，然后告诉我部署要求。`,
+                text: autoDeploy
+                  ? `项目“${p.name}”上传并分析完成，已自动开始部署。可在下方查看实时进度。`
+                  : `项目“${p.name}”上传完成，AI 正在分析源码。分析完成后可选择服务器直接部署。`,
               },
             ]);
           }}
@@ -1951,7 +1954,7 @@ function Projects({ me }) {
     </>
   );
 }
-function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
+function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guidedActions = false }) {
   const [form, setForm] = useState({
       name: "",
       slug: "",
@@ -2128,8 +2131,8 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
       setCredentialBusy(false);
     }
   };
-  const submit = async () => {
-    if (deployImmediately && !node) {
+  const submit = async (shouldDeploy = deployImmediately) => {
+    if (shouldDeploy && !node) {
       setErr("请先选择部署服务器");
       return;
     }
@@ -2189,15 +2192,15 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
           );
         }
       }
-      if (deployImmediately) {
+      if (shouldDeploy) {
         const deployment = await api(`/projects/${p.id}/deploy`, {
           method: "POST",
           body: JSON.stringify({ node_id: node }),
         });
-        onDone(deployment);
+        onDone(guidedActions ? { project: readyProject, deployment, autoDeploy: true } : deployment);
       } else {
         notify?.("项目已保存，后台 AI 已自动接管源码分析", "success", 6000);
-        onDone(readyProject);
+        onDone(guidedActions ? { project: readyProject, autoDeploy: false } : readyProject);
       }
     } catch (e) {
       setErr(e.message);
@@ -2457,13 +2460,13 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
             )}
           </div>
         )}
-        {deployImmediately && (
+        {(deployImmediately || guidedActions) && (
           <>
             <div className="quick-step">
               <span>2</span>
               <div>
-                <h4>选择部署服务器</h4>
-                <p>部署完成后会自动生成访问地址</p>
+                <h4>{guidedActions ? "自动部署服务器" : "选择部署服务器"}</h4>
+                <p>{guidedActions ? "选择后可一键分析并自动部署；只分析时可以不选" : "部署完成后会自动生成访问地址"}</p>
               </div>
             </div>
             <Field label="目标服务器">
@@ -2525,18 +2528,30 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false }) {
         <button className="ghost" onClick={onClose}>
           取消
         </button>
-        <button
-          className="primary"
-          disabled={busy || (deployImmediately && !node) || !form.name.trim()}
-          onClick={submit}
-        >
-          {busy ? <LoaderCircle className="spin" /> : <Upload />}
-          {busy
-            ? "正在处理，请稍候"
-            : deployImmediately
-              ? "上传并开始部署"
-              : "创建项目并分析源码"}
-        </button>
+        {guidedActions ? (
+          <>
+            <button className="ghost" disabled={busy || !form.name.trim()} onClick={() => submit(false)}>
+              <Search />仅创建并分析
+            </button>
+            <button className="primary" disabled={busy || !node || !form.name.trim()} onClick={() => submit(true)}>
+              {busy ? <LoaderCircle className="spin" /> : <Play />}
+              {busy ? "正在处理，请稍候" : "分析完成后自动部署"}
+            </button>
+          </>
+        ) : (
+          <button
+            className="primary"
+            disabled={busy || (deployImmediately && !node) || !form.name.trim()}
+            onClick={() => submit(deployImmediately)}
+          >
+            {busy ? <LoaderCircle className="spin" /> : <Upload />}
+            {busy
+              ? "正在处理，请稍候"
+              : deployImmediately
+                ? "上传并开始部署"
+                : "创建项目并分析源码"}
+          </button>
+        )}
       </div>
     </Modal>
   );
