@@ -10326,8 +10326,10 @@ def execute(deployment_id: str) -> None:
             try:
                 from .main import scale_project
                 from .schemas import ScaleProjectIn
-                from .models import Role, User
-                operator = db.scalar(select(User).where(User.role == Role.admin))
+                from .models import User
+                # Automatic post-deploy work is still part of the original
+                # user's operation. Never attribute it to an arbitrary admin.
+                operator = db.get(User, dep.requested_by)
                 if operator:
                     result = scale_project(project.id, ScaleProjectIn(replicas=1), db, operator)
                     dep = db.get(Deployment, deployment_id)
