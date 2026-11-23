@@ -1333,6 +1333,15 @@ tbody tr:last-child td {
   top: 22px;
   padding: 10px;
 }
+.composer button.is-stop {
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px rgba(99, 91, 255, .12);
+}
+.composer button.is-stop svg {
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+}
 .composer small {
   position: absolute;
   left: 25px;

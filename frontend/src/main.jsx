@@ -9,6 +9,7 @@ import { createRoot } from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
   Activity,
+  ArrowUp,
   Bot,
   Boxes,
   CheckCircle2,
@@ -1364,7 +1365,7 @@ function Chat() {
       },
     ]),
     [intent, setIntent] = useState(null);
-  const messagesEndRef = useRef(null), textareaRef = useRef(null);
+  const messagesEndRef = useRef(null), textareaRef = useRef(null), answerAbortRef = useRef(null);
   useEffect(() => {
     requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" }));
   }, [messages, busy, sessionId]);
@@ -1411,6 +1412,7 @@ function Chat() {
       setMessages((items) => [...items, {
         who: "ai",
         text: `已恢复项目“${pending.projectName || "未命名项目"}”的自动部署，正在等待源码分析完成。`,
+        workflowProjectId: pending.projectId,
       }]);
       try {
         while (!stopped) {
@@ -1418,6 +1420,13 @@ function Chat() {
             analysis = current.source_analysis || {},
             status = analysis.status || analysis.phase || "queued";
           if (status === "failed") throw new Error(analysis.error || analysis.message || "源码分析失败");
+          const progress = Number(analysis.progress || 0),
+            progressText = status === "completed"
+              ? `项目“${pending.projectName || current.name}”分析完成，正在启动部署…`
+              : `项目“${pending.projectName || current.name}”正在后台分析${progress ? `（${progress}%）` : ""}，完成后将自动部署。`;
+          setMessages((items) => items.map((item) => item.workflowProjectId === pending.projectId
+            ? { ...item, text: progressText }
+            : item));
           if (status === "completed") {
             const deployments = await api(`/deployments?project_id=${pending.projectId}`),
               active = deployments.find((item) => item.node_id === pending.nodeId && ["queued", "running"].includes(item.status));
@@ -1529,12 +1538,15 @@ function Chat() {
   const send = async () => {
     if (!text.trim() || busy) return;
     const msg = text;
+    const controller = new AbortController();
+    answerAbortRef.current = controller;
     setText("");
     setMessages((x) => [...x, { who: "user", text: msg }]);
     setBusy(true);
     try {
       const r = await api("/chat", {
         method: "POST",
+        signal: controller.signal,
         body: JSON.stringify({
           message: msg,
           project_id: project || null,
@@ -1558,12 +1570,18 @@ function Chat() {
       ]);
       loadSessions();
     } catch (e) {
-      setMessages((x) => [...x, { who: "ai", text: e.message, error: true }]);
+      setMessages((x) => [...x, {
+        who: "ai",
+        text: e.name === "AbortError" ? "已停止本次回答。" : e.message,
+        error: e.name !== "AbortError",
+      }]);
     } finally {
+      answerAbortRef.current = null;
       setBusy(false);
       requestAnimationFrame(() => textareaRef.current?.focus());
     }
   };
+  const stopAnswer = () => answerAbortRef.current?.abort();
   const openDeployment = async (id) => {
     try {
       setSelectedDeployment(await api(`/deployments/${id}`));
@@ -1648,8 +1666,8 @@ function Chat() {
                 }
               }}
             />
-            <button className="primary" onClick={send}>
-              <Play />
+            <button className={`primary ${busy ? "is-stop" : ""}`} disabled={!busy && !text.trim()} title={busy ? "停止回答" : "发送"} onClick={busy ? stopAnswer : send}>
+              {busy ? <Square /> : <ArrowUp />}
             </button>
             <small>AI 只能调用受控发布动作，不会执行任意服务器命令</small>
           </div>
@@ -1739,7 +1757,13 @@ function Chat() {
             setMessages((items) => [...items, {
               who: "ai",
               text: `项目“${pendingProject?.name || "未命名项目"}”已转到后台继续分析，完成后将自动部署。`,
+              workflowProjectId: pendingProject?.id,
             }]);
+          }}
+          onProgress={({ project: progressProject, text: progressText }) => {
+            setMessages((items) => items.map((item) => item.workflowProjectId === progressProject.id
+              ? { ...item, text: `项目“${progressProject.name}”：${progressText}` }
+              : item));
           }}
           onDone={({ project: p, deployment, nodeId, autoDeploy }) => {
             setShowUpload(false);
@@ -2058,7 +2082,7 @@ function Projects({ me }) {
     </>
   );
 }
-function ProjectModal({ onClose, onDone, onBackground, notify, deployImmediately = false, guidedActions = false }) {
+function ProjectModal({ onClose, onDone, onBackground, onProgress, notify, deployImmediately = false, guidedActions = false }) {
   const [form, setForm] = useState({
       name: "",
       slug: "",
@@ -2247,11 +2271,11 @@ function ProjectModal({ onClose, onDone, onBackground, notify, deployImmediately
         progress = Number(analysis.progress || 0);
       if (status === "completed") return current;
       if (status === "failed") throw new Error(analysis.error || analysis.message || "源码分析失败，请查看分析说明");
-      setProcessingStage(
-        status === "running" || status === "analyzing"
-          ? `AI 正在分析源码${progress ? `（${progress}%）` : ""}，完成后将自动部署…`
-          : "源码上传完成，正在等待 AI 分析…",
-      );
+      const progressText = status === "running" || status === "analyzing"
+        ? `AI 正在分析源码${progress ? `（${progress}%）` : ""}，完成后将自动部署…`
+        : "源码上传完成，正在等待 AI 分析…";
+      setProcessingStage(progressText);
+      onProgress?.({ project: current, nodeId: node, status, progress, text: progressText });
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
     throw new Error("源码分析等待超时，请稍后在项目管理中继续部署");
