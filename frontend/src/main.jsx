@@ -1492,7 +1492,6 @@ function Chat() {
             });
             if (stopped) return;
             localStorage.removeItem(pendingAutoDeployKey);
-            setSelectedDeployment(deployment);
             setMessages((items) => [...items, {
               who: "ai",
               text: active ? "已接回原来的部署任务，可继续查看实时进度。" : "源码分析完成，已自动开始部署。",
@@ -1832,7 +1831,6 @@ function Chat() {
           onDone={({ project: p, deployment, nodeId, autoDeploy }) => {
             setShowUpload(false);
             if (nodeId) setNode(nodeId);
-            if (deployment) setSelectedDeployment(deployment);
             setProject(p.id);
             api("/projects").then(setProjects);
             setMessages((x) => [
@@ -1842,6 +1840,8 @@ function Chat() {
                 text: autoDeploy
                   ? `项目“${p.name}”上传并分析完成，已自动开始部署。可在下方查看实时进度。`
                   : `项目“${p.name}”上传完成，AI 正在分析源码。分析完成后可选择服务器直接部署。`,
+                deployment: deployment?.id,
+                action: deployment ? "deploy" : undefined,
               },
             ]);
           }}
