@@ -68,6 +68,8 @@ const sourcePhaseText = {
   ready: "源码已保存",
 };
 
+const pendingAutoDeployKey = "yunzhou.pendingAutoDeploy";
+
 const stripTerminalAnsi = (value) => String(value ?? "")
   .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
   .replace(/\r(?!\n)/g, "");
@@ -1392,6 +1394,62 @@ function Chat() {
     });
     loadSessions(false);
   }, []);
+  useEffect(() => {
+    let stopped = false;
+    const resume = async () => {
+      let pending;
+      try {
+        pending = JSON.parse(localStorage.getItem(pendingAutoDeployKey) || "null");
+      } catch {
+        localStorage.removeItem(pendingAutoDeployKey);
+        return;
+      }
+      if (!pending?.projectId || !pending?.nodeId) return;
+      setProject(pending.projectId);
+      setNode(pending.nodeId);
+      setMessages((items) => [...items, {
+        who: "ai",
+        text: `已恢复项目“${pending.projectName || "未命名项目"}”的自动部署，正在等待源码分析完成。`,
+      }]);
+      try {
+        while (!stopped) {
+          const current = await api(`/projects/${pending.projectId}`),
+            analysis = current.source_analysis || {},
+            status = analysis.status || analysis.phase || "queued";
+          if (status === "failed") throw new Error(analysis.error || analysis.message || "源码分析失败");
+          if (status === "completed") {
+            const deployments = await api(`/deployments?project_id=${pending.projectId}`),
+              active = deployments.find((item) => item.node_id === pending.nodeId && ["queued", "running"].includes(item.status));
+            const deployment = active || await api(`/projects/${pending.projectId}/deploy`, {
+              method: "POST",
+              body: JSON.stringify({ node_id: pending.nodeId }),
+            });
+            if (stopped) return;
+            localStorage.removeItem(pendingAutoDeployKey);
+            setSelectedDeployment(deployment);
+            setMessages((items) => [...items, {
+              who: "ai",
+              text: active ? "已接回原来的部署任务，可继续查看实时进度。" : "源码分析完成，已自动开始部署。",
+              deployment: deployment.id,
+              action: active ? "existing_deployment" : "deploy",
+            }]);
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+      } catch (error) {
+        if (stopped) return;
+        localStorage.removeItem(pendingAutoDeployKey);
+        setMessages((items) => [...items, {
+          who: "ai",
+          text: `自动部署未能继续：${error.message}`,
+          error: true,
+        }]);
+      }
+    };
+    resume();
+    return () => { stopped = true; };
+  }, []);
   const newConversation = () => {
     setSessionId(null);
     setMessages([{ who: "ai", text: greeting }]);
@@ -2221,6 +2279,12 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
         }
       }
       if (shouldDeploy) {
+        localStorage.setItem(pendingAutoDeployKey, JSON.stringify({
+          projectId: p.id,
+          projectName: p.name,
+          nodeId: node,
+          createdAt: new Date().toISOString(),
+        }));
         setProcessingStage("源码上传完成，正在等待 AI 分析…");
         readyProject = await waitForAnalysis(p.id);
         setProcessingStage("分析完成，正在提交部署任务…");
@@ -2228,6 +2292,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
           method: "POST",
           body: JSON.stringify({ node_id: node }),
         });
+        localStorage.removeItem(pendingAutoDeployKey);
         onDone(guidedActions ? { project: readyProject, deployment, nodeId: node, autoDeploy: true } : deployment);
       } else {
         notify?.("项目已保存，后台 AI 已自动接管源码分析", "success", 6000);
