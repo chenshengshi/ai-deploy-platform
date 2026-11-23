@@ -1371,7 +1371,7 @@ function Chat() {
       },
     ]),
     [intent, setIntent] = useState(null);
-  const messagesEndRef = useRef(null), textareaRef = useRef(null), answerAbortRef = useRef(null), autoDiagnosisRef = useRef(new Set()), messagesRef = useRef(messages);
+  const messagesEndRef = useRef(null), textareaRef = useRef(null), answerAbortRef = useRef(null), autoDiagnosisRef = useRef(new Set()), messagesRef = useRef(messages), workflowRegistrationRef = useRef(new Map());
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => {
     requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" }));
@@ -1435,7 +1435,7 @@ function Chat() {
                 action: workflowAction,
                 deployment_id: latest?.id || stored.deployment,
               }),
-            }).catch(() => {});
+            }).then(() => { if (done) loadSessions(false); }).catch(() => {});
           }
           if (done) localStorage.removeItem(pendingAutoDeployKey);
         } catch {
@@ -1469,7 +1469,7 @@ function Chat() {
               action,
               deployment_id: nextDeploymentId,
             }),
-          }).catch(() => {});
+          }).then(() => loadSessions(false)).catch(() => {});
         };
       const diagnosingText = "部署失败，AI 正在自动分析完整日志并判断是否可以安全重新发布…";
       setMessages((items) => items.map((item) => item.deployment === deploymentId
@@ -1753,6 +1753,42 @@ function Chat() {
       setMessages((items) => [...items, { who: "ai", text: `无法打开项目删除确认：${error.message}`, error: true }]);
     }
   };
+  const registerAiWorkflow = async (pendingProject, nodeId, closeModal = false) => {
+    if (closeModal) setShowUpload(false);
+    if (!pendingProject?.id) return;
+    setProject(pendingProject.id);
+    if (nodeId) setNode(nodeId);
+    if (workflowRegistrationRef.current.has(pendingProject.id)) return workflowRegistrationRef.current.get(pendingProject.id);
+    const localKey = `workflow-${pendingProject.id}-${Date.now()}`;
+    setMessages((items) => items.some((item) => item.workflowProjectId === pendingProject.id)
+      ? items
+      : [...items, {
+        who: "ai",
+        text: `项目“${pendingProject.name || "未命名项目"}”正在后台分析，完成后将自动部署。`,
+        workflowProjectId: pendingProject.id,
+        workflowLocalKey: localKey,
+      }]);
+    const registration = api("/chat/workflow", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId || undefined,
+        project_id: pendingProject.id,
+        node_id: nodeId || undefined,
+        ai_config_id: aiConfig || undefined,
+        content: `项目“${pendingProject.name || "未命名项目"}”正在后台分析，完成后将自动部署。`,
+        action: "workflow_analyzing",
+      }),
+    }).then((stored) => {
+      setSessionId(stored.session.id);
+      setMessages((items) => items.map((item) => item.workflowProjectId === pendingProject.id
+        ? { ...item, workflowSessionId: stored.session.id, workflowMessageId: stored.message.id }
+        : item));
+      loadSessions(false);
+      return stored;
+    }).catch(() => null);
+    workflowRegistrationRef.current.set(pendingProject.id, registration);
+    return registration;
+  };
   return (
     <>
       <div className="chat-layout">
@@ -1849,6 +1885,10 @@ function Chat() {
                   <b>{item.title}</b>
                   <span>{item.project_name} · {item.message_count} 条</span>
                 </button>
+                {item.latest_action?.startsWith("workflow_")
+                  && !item.latest_action.startsWith("workflow_success")
+                  && !item.latest_action.startsWith("workflow_failed")
+                  && <span className="chat-session-running" title="正在处理"><LoaderCircle className="spin" /></span>}
                 {showArchived ? (
                   <div className="chat-session-actions">
                     <button title="恢复" onClick={() => restoreSession(item.id)}><RefreshCw /></button>
@@ -1909,39 +1949,8 @@ function Chat() {
           deployImmediately={false}
           guidedActions
           onClose={() => setShowUpload(false)}
-          onBackground={async ({ project: pendingProject, nodeId }) => {
-            setShowUpload(false);
-            if (pendingProject?.id) setProject(pendingProject.id);
-            if (nodeId) setNode(nodeId);
-            const localKey = `workflow-${pendingProject?.id}-${Date.now()}`;
-            setMessages((items) => [...items, {
-              who: "ai",
-              text: `项目“${pendingProject?.name || "未命名项目"}”已转到后台继续分析，完成后将自动部署。`,
-              workflowProjectId: pendingProject?.id,
-              workflowLocalKey: localKey,
-            }]);
-            if (!pendingProject?.id) return;
-            try {
-              const stored = await api("/chat/workflow", {
-                method: "POST",
-                body: JSON.stringify({
-                  session_id: sessionId || undefined,
-                  project_id: pendingProject.id,
-                  node_id: nodeId || undefined,
-                  ai_config_id: aiConfig || undefined,
-                  content: `项目“${pendingProject.name || "未命名项目"}”正在后台分析，完成后将自动部署。`,
-                  action: "workflow_analyzing",
-                }),
-              });
-              setSessionId(stored.session.id);
-              setMessages((items) => items.map((item) => item.workflowLocalKey === localKey
-                ? { ...item, workflowSessionId: stored.session.id, workflowMessageId: stored.message.id }
-                : item));
-              loadSessions(false);
-            } catch {
-              // The local workflow remains visible and can still be recovered from pending task state.
-            }
-          }}
+          onWorkflowStart={({ project: pendingProject, nodeId }) => registerAiWorkflow(pendingProject, nodeId)}
+          onBackground={({ project: pendingProject, nodeId }) => registerAiWorkflow(pendingProject, nodeId, true)}
           onProgress={({ project: progressProject, text: progressText }) => {
             setMessages((items) => items.map((item) => item.workflowProjectId === progressProject.id
               ? { ...item, text: `项目“${progressProject.name}” ${progressText}` }
@@ -2271,7 +2280,7 @@ function Projects({ me }) {
     </>
   );
 }
-function ProjectModal({ onClose, onDone, onBackground, onProgress, notify, deployImmediately = false, guidedActions = false }) {
+function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgress, notify, deployImmediately = false, guidedActions = false }) {
   const [form, setForm] = useState({
       name: "",
       slug: "",
@@ -2544,6 +2553,7 @@ function ProjectModal({ onClose, onDone, onBackground, onProgress, notify, deplo
           nodeId: node,
           createdAt: new Date().toISOString(),
         }));
+        onWorkflowStart?.({ project: p, nodeId: node });
         setProcessingStage("源码上传完成，正在等待 AI 分析…");
         readyProject = await waitForAnalysis(p.id);
         setProcessingStage("分析完成，正在提交部署任务…");

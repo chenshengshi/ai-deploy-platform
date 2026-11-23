@@ -1486,6 +1486,15 @@ tbody tr:last-child td {
   text-align: left;
 }
 .chat-session-actions { display: flex; padding-right: 5px; }
+.chat-session-running {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  color: #665ee8;
+}
+.chat-session-running svg { width: 14px; height: 14px; }
 .chat-session-actions button,
 .chat-session-archive {
   border: 0;

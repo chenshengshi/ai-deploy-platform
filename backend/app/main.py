@@ -1430,6 +1430,23 @@ def create_project(body: ProjectCreate, tasks: BackgroundTasks, db: Session = De
     return item
 
 
+def _normalized_uploaded_source_root(path: Path) -> Path:
+    """Unwrap repeated archive/folder wrappers without guessing inside a real project."""
+    markers = {
+        "Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml",
+        "package.json", "pom.xml", "pyproject.toml", "requirements.txt", "go.mod", "Cargo.toml",
+    }
+    current = path
+    for _ in range(8):
+        if any((current / name).is_file() for name in markers):
+            break
+        children = [item for item in current.iterdir() if not item.name.startswith(".")]
+        if len(children) != 1 or not children[0].is_dir():
+            break
+        current = children[0]
+    return current
+
+
 @app.post("/api/projects/{item_id}/upload", response_model=ProjectOut)
 async def upload_source(item_id: str, tasks: BackgroundTasks, files: list[UploadFile] = File(...), append: bool = False, finalize: bool = True, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     project = db.get(Project, item_id)
@@ -1478,10 +1495,7 @@ async def upload_source(item_id: str, tasks: BackgroundTasks, files: list[Upload
             zf.extractall(extract_dir)
         archive.unlink()
         target = extract_dir
-    children = [x for x in target.iterdir() if not x.name.startswith(".")]
-    markers = [target / name for name in ("Dockerfile", "compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")]
-    if not any(x.exists() for x in markers) and len(children) == 1 and children[0].is_dir():
-        target = children[0]
+    target = _normalized_uploaded_source_root(target)
     relative_source = target.relative_to(project_root / "staging")
     current = project_root / "current"
     versions = project_root / "versions"
@@ -7045,6 +7059,17 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
             "fix_plan": ["修复平台内部变量引用", "部署平台修复", "重新发布并验证原项目"],
             "next_step": "平台修复完成后重新发布；无需修改项目源码或数据库配置。",
         }
+    elif re.search(r"COPY failed:.*(?:not found in build context|excluded by \.dockerignore)", combined_evidence, re.I | re.S):
+        result = {
+            "source": "system",
+            "summary": "平台生成的 Dockerfile 引用了构建上下文之外的源码路径；源码文件本身存在，不需要用户补文件。",
+            "advice": "平台会重新定位上传源码的真实根目录，校正 Dockerfile 的 COPY 相对路径后自动重新发布一次。",
+            "scope": "platform",
+            "confidence": "high",
+            "retry_safe": True,
+            "fix_plan": ["校正重复的上传目录包装层", "重新生成构建上下文", "重新发布并验证启动与访问"],
+            "next_step": "平台正在自动校正构建上下文并重新发布，无需手工修改源码。",
+        }
     else:
         try:
             result = deployment_followup(db, item, project, node, active["title"], evidence)
@@ -7578,6 +7603,13 @@ def retry_deployment(item_id: str, db: Session = Depends(get_db), user: User = D
     project, node = db.get(Project, previous.project_id), db.get(Node, previous.node_id)
     if not project or not node:
         raise HTTPException(404, "项目或节点不存在")
+    if project.source_type == SourceType.upload and project.source_path:
+        source_path = Path(project.source_path)
+        if source_path.is_dir():
+            normalized_source = _normalized_uploaded_source_root(source_path)
+            if normalized_source != source_path:
+                project.source_path = str(normalized_source)
+                audit(db, user, "normalize_uploaded_source_root", "project", project.id, f"{source_path} -> {normalized_source}")
     require_reachable_node(node, db)
     active = db.scalar(
         select(Deployment).where(
@@ -8608,11 +8640,13 @@ def _chat_session_for_user(db: Session, session_id: str, user: User) -> ChatSess
 def _chat_session_dict(db: Session, session: ChatSession) -> dict:
     project = db.get(Project, session.project_id) if session.project_id else None
     message_count = db.scalar(select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session.id)) or 0
+    latest_message = db.scalar(select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at.desc()).limit(1))
     return {
         "id": session.id, "title": session.title, "project_id": session.project_id,
         "project_name": project.name if project else "全局助手", "node_id": session.node_id,
         "ai_config_id": session.ai_config_id,
         "visibility": session.visibility, "archived": session.archived,
+        "latest_action": latest_message.action if latest_message else None,
         "message_count": message_count, "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -8646,6 +8680,14 @@ def save_chat_workflow(body: dict, db: Session = Depends(get_db), user: User = D
     if message and message.session_id != session.id:
         raise HTTPException(409, "任务消息不属于当前对话")
     if not message:
+        message = db.scalar(
+            select(ChatMessage).where(
+                ChatMessage.session_id == session.id,
+                ChatMessage.role == "assistant",
+                ChatMessage.action.like("workflow_%"),
+            ).order_by(ChatMessage.created_at.desc()).limit(1)
+        )
+    if not message:
         message = ChatMessage(session_id=session.id, role="assistant", content="")
         db.add(message)
         db.flush()
@@ -8653,6 +8695,14 @@ def save_chat_workflow(body: dict, db: Session = Depends(get_db), user: User = D
     message.action = str(body.get("action") or "workflow_running")[:64]
     deployment_id = str(body.get("deployment_id") or "").strip()
     message.deployment_id = deployment_id if deployment_id and db.get(Deployment, deployment_id) else message.deployment_id
+    duplicates = db.scalars(select(ChatMessage).where(
+        ChatMessage.session_id == session.id,
+        ChatMessage.role == "assistant",
+        ChatMessage.id != message.id,
+        ChatMessage.deployment_id == message.deployment_id,
+    )).all() if message.deployment_id else []
+    for duplicate in duplicates:
+        db.delete(duplicate)
     db.commit()
     return {
         "session": _chat_session_dict(db, session),
