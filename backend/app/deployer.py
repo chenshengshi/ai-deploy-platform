@@ -7665,7 +7665,7 @@ def central_build_and_distribute(
                     "COPY .yunzhou-pip-wheels /opt/yunzhou-pip-wheels\n"
                     f"RUN {venv_setup}{pip_executable} install --no-index --find-links=/opt/yunzhou-pip-wheels "
                     f"-r {requirement_path} \\\n"
-                    "    && rm -rf /opt/yunzhou-pip-wheels"
+                    "    && rm -rf /opt/yunzhou-pip-wheels\n"
                 )
                 rewritten_docker = docker_text[:block_start] + replacement + docker_text[block_end:]
                 # Do not replace an upstream ``pip wheel`` RUN instruction as
