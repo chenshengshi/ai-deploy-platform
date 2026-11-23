@@ -8143,10 +8143,11 @@ function UsersPage() {
     [viewingUser, setViewingUser] = useState(null),
     [toast, setToast] = useState(null);
   const load = () => api("/users").then(setItems);
-  const done = () => {
+  const done = (action = "updated", account = "") => {
     setShow(false);
     setEditing(null);
-    setToast({ text: "用户信息已保存", type: "success" });
+    const actionText = action === "created" ? "创建成功" : action === "deleted" ? "删除成功" : "修改成功";
+    setToast({ text: account ? `账号“${account}”${actionText}` : `用户${actionText}`, type: "success" });
     setTimeout(() => setToast(null), 3000);
     load();
   };
@@ -8331,7 +8332,7 @@ function UserModal({ user, onClose, onDone }) {
           body: JSON.stringify({ project_ids: selectedProjectIds }),
         });
       }
-      onDone();
+      onDone(editing ? "updated" : "created", savedUser.display_name || savedUser.username);
     } catch (e) {
       setErr(e.message);
     } finally {
@@ -8344,7 +8345,7 @@ function UserModal({ user, onClose, onDone }) {
     try {
       await api(`/users/${user.id}`, { method: "DELETE" });
       setDeleteConfirm(false);
-      onDone();
+      onDone("deleted", user.display_name || user.username);
     } catch (error) {
       setDeleteConfirm(false);
       setErr(error.message);
