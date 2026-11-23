@@ -8449,8 +8449,13 @@ def central_build_and_distribute(
                 if not artifact_dockerfile.is_file():
                     continue
                 artifact_text = artifact_dockerfile.read_text(encoding="utf-8", errors="ignore")
+                # AI plans have used both ``.yunzhou/artifacts/...`` and the
+                # older dotted ``.yunzhou.artifacts/...`` spelling.  Neither
+                # path belongs to the uploaded source package: both are
+                # platform-owned build outputs that must be materialized
+                # before Docker receives the build context.
                 requested = set(re.findall(
-                    r"(?im)^\s*COPY\s+(?!--from=)(?:--\S+\s+)*(\.yunzhou/artifacts/[^\s]+)",
+                    r"(?im)^\s*COPY\s+(?!--from=)(?:--\S+\s+)*(\.yunzhou(?:/artifacts|\.artifacts)/[^\s]+)",
                     artifact_text,
                 ))
                 requested = {value.rstrip("/") for value in requested}
@@ -8494,6 +8499,11 @@ def central_build_and_distribute(
                     destination = artifact_context / relative_artifact
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     artifact_kind = destination.name.lower()
+                    artifact_kind = {
+                        "backend": "backend-runtime",
+                        "python": "python-runtime",
+                        "frontend": "frontend-dist",
+                    }.get(artifact_kind, artifact_kind)
                     if artifact_kind == "backend-runtime":
                         if backend_requirements is None:
                             raise RuntimeError(f"[平台产物校验] {artifact_service_name} 缺少可识别的 Python 后端源码")
@@ -8568,9 +8578,12 @@ def central_build_and_distribute(
                     dockerignore = artifact_context / ".dockerignore"
                     ignore_text = dockerignore.read_text(encoding="utf-8", errors="ignore") if dockerignore.is_file() else ""
                     artifact_rule = relative_artifact.rstrip("/")
+                    if artifact_rule.startswith(".yunzhou.artifacts/"):
+                        artifact_parent_rules = ["!.yunzhou.artifacts/"]
+                    else:
+                        artifact_parent_rules = ["!.yunzhou/", "!.yunzhou/artifacts/"]
                     required_rules = [
-                        "!.yunzhou/",
-                        "!.yunzhou/artifacts/",
+                        *artifact_parent_rules,
                         f"!{artifact_rule}",
                         f"!{artifact_rule}/**",
                     ]

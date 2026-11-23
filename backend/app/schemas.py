@@ -59,6 +59,8 @@ class UserOut(ORM):
     active: bool
     failed_login_attempts: int = 0
     locked_until: datetime | None = None
+    last_login_at: datetime | None = None
+    last_login_ip: str = ""
     created_at: datetime
     project_count: int = 0
     project_scope: str = "owned"

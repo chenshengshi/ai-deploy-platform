@@ -438,6 +438,10 @@ def startup():
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ"))
+        connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ"))
+        connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(64) NOT NULL DEFAULT ''"))
+        connection.execute(text("COMMENT ON COLUMN users.last_login_at IS '用户最近一次成功登录时间'"))
+        connection.execute(text("COMMENT ON COLUMN users.last_login_ip IS '用户最近一次成功登录来源 IP'"))
         connection.execute(text("ALTER TABLE security_config ADD COLUMN IF NOT EXISTS audit_retention_days INTEGER NOT NULL DEFAULT 180"))
         connection.execute(text("UPDATE users SET password_changed_at=COALESCE(password_changed_at, created_at, NOW())"))
         connection.execute(text("ALTER TABLE project_domain_configs ADD COLUMN IF NOT EXISTS certificate_id VARCHAR(36)"))
@@ -850,6 +854,8 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     clear_login_failures(source_ip)
     user.failed_login_attempts = 0
     user.locked_until = None
+    user.last_login_at = now
+    user.last_login_ip = source_ip
     audit(db, user, "login")
     db.commit()
     return TokenOut(access_token=token_for(user, policy.session_timeout_minutes))
@@ -922,6 +928,8 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require(Role.adm
             "active": item.active,
             "failed_login_attempts": item.failed_login_attempts,
             "locked_until": item.locked_until,
+            "last_login_at": item.last_login_at,
+            "last_login_ip": item.last_login_ip,
             "created_at": item.created_at,
             "project_count": len(visible),
             "project_scope": "all" if item.role == Role.admin else "owned",
