@@ -9780,7 +9780,7 @@ def execute(deployment_id: str) -> None:
                                     raise RuntimeError("项目级数据服务配置校验失败：" + reconcile_out[-1200:])
                             log(dep.id, "[数据服务] 已核对项目级固定服务配置；配置有变化时仅重建容器，数据卷保持不变。\n")
                         data_health = (
-                            f"cd {shlex.quote(remote_dir)} && ok=0; stable=0; "
+                            f"cd {shlex.quote(remote_dir)} && ok=0; stable=0; fatal=0; "
                             "for i in $(seq 1 90); do bad=0; "
                             f"ids=$(docker compose -p {shlex.quote(data_project)} {data_args} ps -q); "
                             "[ -n \"$ids\" ] || bad=1; for id in $ids; do "
@@ -9797,9 +9797,11 @@ def execute(deployment_id: str) -> None:
                             # application in that gap produces an intermittent
                             # "connection refused" on every fresh project.
                             "case \"$image\" in *mysql*|*mariadb*) logs=$(docker logs $id 2>&1); "
+                            "printf '%s\\n' \"$logs\" | grep -Eq '^ERROR [0-9]+ \\(' && fatal=1; "
                             "if printf '%s\\n' \"$logs\" | grep -Eqi 'temporary server started'; then "
                             "printf '%s\\n' \"$logs\" | grep -Eqi 'init process done|ready for start up' || bad=1; fi;; esac; "
                             "done; "
+                            "[ \"$fatal\" -eq 0 ] || exit 2; "
                             # Require several consecutive healthy samples so
                             # a restart boundary cannot be mistaken for
                             # database readiness even on nonstandard images.
@@ -9808,7 +9810,7 @@ def execute(deployment_id: str) -> None:
                             "[ \"$ok\" -eq 1 ]"
                         )
                         log(dep.id, "[数据服务检查] 正在核验项目级 MySQL/Redis 的运行状态、健康检查与托管凭据。\n")
-                        health_code, health_out = ssh.run(data_health, timeout=150)
+                        health_code, health_out = ssh.run(data_health, timeout=240)
                         if health_code:
                             diagnostics_cmd = (
                                 f"cd {shlex.quote(remote_dir)} && "
@@ -9886,7 +9888,7 @@ def execute(deployment_id: str) -> None:
                                     raise RuntimeError(
                                         "PostgreSQL seccomp 兼容修复失败：" + ANSI_RE.sub("", repair_out)[-1200:]
                                     )
-                                health_code, health_out = ssh.run(data_health, timeout=150)
+                                health_code, health_out = ssh.run(data_health, timeout=240)
                                 if not health_code:
                                     log(dep.id, "[数据服务自动修复] PostgreSQL 已恢复健康。\n")
                             if health_code:
