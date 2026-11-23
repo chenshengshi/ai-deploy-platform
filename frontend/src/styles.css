@@ -2561,6 +2561,10 @@ tbody tr:last-child td {
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+.project-create-body.is-processing .quick-deploy {
+  pointer-events: none;
+  opacity: .78;
+}
 .project-create-modal > .modal-actions {
   box-shadow: 0 -8px 24px rgba(34, 42, 69, .05);
 }
@@ -2580,6 +2584,11 @@ tbody tr:last-child td {
 .project-create-progress svg {
   width: 17px;
   flex: 0 0 auto;
+}
+.project-create-retry-note {
+  margin: -5px 26px 14px;
+  color: #687487;
+  font-size: 11px;
 }
 .project-create-modal .upload-zone {
   min-height: 156px;

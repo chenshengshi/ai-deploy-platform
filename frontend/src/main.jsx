@@ -1396,6 +1396,8 @@ function Chat() {
     setSessionId(null);
     setMessages([{ who: "ai", text: greeting }]);
     setIntent(null);
+    setProject("");
+    setNode("");
     setAiConfig(defaultAiConfig);
   };
   const openSession = async (id) => {
@@ -1660,10 +1662,8 @@ function Chat() {
             setShowUpload(false);
             if (nodeId) setNode(nodeId);
             if (deployment) setSelectedDeployment(deployment);
-            api("/projects").then((items) => {
-              setProjects(items);
-              setProject(p.id);
-            });
+            setProject(p.id);
+            api("/projects").then(setProjects);
             setMessages((x) => [
               ...x,
               {
@@ -1979,6 +1979,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
     [nodes, setNodes] = useState([]),
     [node, setNode] = useState(""),
     [processingStage, setProcessingStage] = useState(""),
+    [createdProject, setCreatedProject] = useState(null),
     [showPrivate, setShowPrivate] = useState(false),
     [credential, setCredential] = useState({
       name: "",
@@ -1994,7 +1995,8 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
       ([c, n]) => {
         setCredentials(c);
         setNodes(n);
-        if (n[0]) setNode(n[0].id);
+        const preferred = n.find((item) => ["online", "healthy", "active"].includes(String(item.last_status || "").toLowerCase())) || n[0];
+        if (preferred) setNode(preferred.id);
       },
     );
   }, []);
@@ -2160,6 +2162,10 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
       setErr("请先选择源码文件或拖入项目文件夹");
       return;
     }
+    if (form.source_type === "git" && !form.git_url.trim()) {
+      setErr("请先填写 Git 仓库地址");
+      return;
+    }
     setBusy(true);
     setErr("");
     setProcessingStage("正在创建项目并上传源码…");
@@ -2192,10 +2198,11 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
           })),
         ];
       }
-      const p = await api("/projects", {
+      const p = createdProject || await api("/projects", {
         method: "POST",
         body: JSON.stringify(body),
       });
+      if (!createdProject) setCreatedProject(p);
       let readyProject = p;
       if (form.source_type === "upload") {
         const batchSize = 100,
@@ -2234,8 +2241,8 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
     }
   };
   return (
-    <Modal title={deployImmediately ? "上传并部署项目" : "添加项目并分析源码"} onClose={onClose} wide className="project-create-modal">
-      <div className="project-create-body">
+    <Modal title={deployImmediately ? "上传并部署项目" : "添加项目并分析源码"} onClose={busy ? () => {} : onClose} wide className="project-create-modal">
+      <div className={`project-create-body ${busy ? "is-processing" : ""}`}>
       <div className="quick-deploy">
         <Field
           label="上传名称（项目名称）"
@@ -2551,17 +2558,18 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
       </div>
       {processingStage && <div className="project-create-progress"><LoaderCircle className="spin" /><span>{processingStage}</span></div>}
       {err && <div className="alert danger">{err}</div>}
+      {err && createdProject && <div className="project-create-retry-note">项目已安全保留，再次点击不会重复创建项目。</div>}
       </div>
       <div className="modal-actions">
-        <button className="ghost" onClick={onClose}>
+        <button className="ghost" disabled={busy} onClick={onClose}>
           取消
         </button>
         {guidedActions ? (
           <>
-            <button className="ghost" disabled={busy || !form.name.trim()} onClick={() => submit(false)}>
+            <button className="ghost" disabled={busy || !form.name.trim() || (form.source_type === "upload" ? !files.length : !form.git_url.trim())} onClick={() => submit(false)}>
               <Search />仅创建并分析
             </button>
-            <button className="primary" disabled={busy || !node || !form.name.trim()} onClick={() => submit(true)}>
+            <button className="primary" disabled={busy || !node || !form.name.trim() || (form.source_type === "upload" ? !files.length : !form.git_url.trim())} onClick={() => submit(true)}>
               {busy ? <LoaderCircle className="spin" /> : <Play />}
               {busy ? "正在处理，请稍候" : "分析完成后自动部署"}
             </button>
@@ -2569,7 +2577,7 @@ function ProjectModal({ onClose, onDone, notify, deployImmediately = false, guid
         ) : (
           <button
             className="primary"
-            disabled={busy || (deployImmediately && !node) || !form.name.trim()}
+            disabled={busy || (deployImmediately && !node) || !form.name.trim() || (form.source_type === "upload" ? !files.length : !form.git_url.trim())}
             onClick={() => submit(deployImmediately)}
           >
             {busy ? <LoaderCircle className="spin" /> : <Upload />}
