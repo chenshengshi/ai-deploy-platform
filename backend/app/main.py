@@ -4884,20 +4884,25 @@ def deployment_view(
             log_text.rfind("[平台构建]"),
         )
         build_stage_position = log_text.rfind("[阶段开始] build")
-        later_stage_position = max(
+        start_stage_position = max(
             log_text.rfind("[阶段开始] start"),
-            log_text.rfind("[阶段开始] verify"),
+            log_text.rfind("[启动]"),
         )
+        verify_stage_position = max(
+            log_text.rfind("[阶段开始] verify"),
+            log_text.rfind("[检查]"),
+            log_text.rfind("[完成]"),
+        )
+        later_stage_position = max(start_stage_position, verify_stage_position)
         packaging_is_active = build_stage_position > later_stage_position
         # Explicit pipeline boundaries are more reliable than incidental
         # Chinese/Docker log words.  Use them first so a real build never sits
         # at 10% until the first image-packaging message appears.
         analyze_started = log_text.rfind("[阶段开始] analyze")
         prepare_started = log_text.rfind("[阶段开始] prepare")
-        verify_started = log_text.rfind("[阶段开始] verify")
-        if verify_started >= 0:
+        if verify_stage_position >= 0:
             progress, current_step = 90, "正在验证访问"
-        elif later_stage_position >= 0:
+        elif start_stage_position >= 0:
             progress, current_step = 75, "正在启动服务"
         elif build_stage_position >= 0:
             channel_started = set(re.findall(

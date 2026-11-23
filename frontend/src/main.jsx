@@ -1403,7 +1403,7 @@ function Chat() {
               deployStep = latest.current_step || latest.stage_label || "";
             text = `项目“${current.name}”正在部署${deployProgress ? `（${deployProgress}%）` : ""}${deployStep ? ` · ${deployStep}` : ""}，可查看实时进度。`;
           } else if (latest?.status === "success") {
-            text = `项目“${current.name}”已部署成功${latest.access_url ? `：${latest.access_url}` : "。"}`;
+            text = `项目“${current.name}”已部署成功，构建、启动、健康检查和访问验证均已完成${latest.access_url ? `：${latest.access_url}` : "。"}`;
             done = true;
           } else if (latest?.status === "failed") {
             text = `项目“${current.name}”部署失败，可打开发布记录查看原因。`;
@@ -1444,7 +1444,7 @@ function Chat() {
       }
     };
     refresh();
-    const timer = setInterval(refresh, 3000);
+    const timer = setInterval(refresh, 2000);
     return () => { stopped = true; clearInterval(timer); };
   }, [workflowIds.join("|")]);
   const failedWorkflowDeployments = useMemo(() => messages
