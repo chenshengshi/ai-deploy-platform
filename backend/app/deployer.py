@@ -2658,7 +2658,7 @@ def ensure_java_runtime_directories(runtime: str, context: Path) -> str:
     return runtime[:from_line.end()] + command + runtime[from_line.end():]
 
 
-def platform_spa_runtime_dockerfile(image: str, artifact: str) -> str:
+def platform_spa_runtime_dockerfile(image: str, artifact: str, public_base: str = "/") -> str:
     """Return the platform-owned static SPA runtime.
 
     Repository/AI Nginx snippets are evidence only.  Every static frontend
@@ -2666,6 +2666,13 @@ def platform_spa_runtime_dockerfile(image: str, artifact: str) -> str:
     a direct refresh such as /login never becomes an Nginx 404.
     """
     source = artifact.rstrip("/") + "/"
+    normalized_base = "/" + str(public_base or "/").strip("/")
+    base_config = ""
+    if normalized_base != "/":
+        base_config = (
+            f"      '    location = {normalized_base} {{ return 301 {normalized_base}/; }}' \\\n"
+            f"      '    location {normalized_base}/ {{ rewrite ^{re.escape(normalized_base)}/(.*)$ /$1 break; try_files $uri $uri/ /index.html; }}' \\\n"
+        )
     return (
         f"FROM {image}\n"
         "RUN rm -f /etc/nginx/conf.d/default.conf \\\n"
@@ -2678,7 +2685,8 @@ def platform_spa_runtime_dockerfile(image: str, artifact: str) -> str:
         "      '    root /usr/share/nginx/html;' \\\n"
         "      '    index index.html;' \\\n"
         "      '    charset utf-8;' \\\n"
-        "      '    location / { try_files $uri $uri/ /index.html; }' \\\n"
+        + base_config
+        + "      '    location / { try_files $uri $uri/ /index.html; }' \\\n"
         "      '}' \\\n"
         "    > /etc/nginx/conf.d/app.conf \\\n"
         " && nginx -t\n"
@@ -2779,7 +2787,9 @@ def runtime_stage_from_prebuilt_artifact(
     if from_match and artifact:
         image_match = re.search(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>nginx:[^\s]+)", from_match.group(0))
         image = image_match.group("image") if image_match else PLATFORM_NGINX_IMAGE
-        runtime = platform_spa_runtime_dockerfile(image, artifact)
+        runtime = platform_spa_runtime_dockerfile(
+            image, artifact, detect_frontend_public_base(str(context)).get("primary_path") or "/"
+        )
         return runtime, [artifact]
     # AI-generated nginx stages sometimes create the configuration with one
     # ``RUN echo`` instruction per line.  The classic builder then has to
@@ -6963,6 +6973,7 @@ def central_build_and_distribute(
                             runtime_text = platform_spa_runtime_dockerfile(
                                 nginx_images[-1] if nginx_images else PLATFORM_NGINX_IMAGE,
                                 static_dir.relative_to(context_path).as_posix(),
+                                detect_frontend_public_base(str(context_path)).get("primary_path") or "/",
                             )
                     if runtime_text:
                         runtime_path.write_text(
@@ -7442,7 +7453,8 @@ def central_build_and_distribute(
                 )
                 if nginx_images and static_artifact:
                     runtime_text = platform_spa_runtime_dockerfile(
-                        nginx_images[-1], static_artifact
+                        nginx_images[-1], static_artifact,
+                        detect_frontend_public_base(str(context)).get("primary_path") or "/",
                     )
                     copied = [static_artifact]
                 safe_service = re.sub(r"[^a-z0-9_.-]+", "-", str(service_name).lower()).strip("-.") or "app"
@@ -8264,6 +8276,7 @@ def central_build_and_distribute(
                     runtime_text = platform_spa_runtime_dockerfile(
                         nginx_images[-1] if nginx_images else PLATFORM_NGINX_IMAGE,
                         artifact_values[0],
+                        detect_frontend_public_base(str(context)).get("primary_path") or "/",
                     )
                     copied = [artifact_values[0]]
                 else:
@@ -8420,6 +8433,7 @@ def central_build_and_distribute(
                     runtime_text = platform_spa_runtime_dockerfile(
                         nginx_images[-1] if nginx_images else PLATFORM_NGINX_IMAGE,
                         artifact_values[0],
+                        detect_frontend_public_base(str(context)).get("primary_path") or "/",
                     )
                     copied = artifact_values
                 elif backend_role and backend_artifacts:
