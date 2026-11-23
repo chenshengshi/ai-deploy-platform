@@ -1398,7 +1398,9 @@ function Chat() {
             done = true;
             error = true;
           } else if (latest && ["queued", "running"].includes(latest.status)) {
-            text = `项目“${current.name}”正在部署${latest.stage_label ? ` · ${latest.stage_label}` : ""}，可查看实时进度。`;
+            const deployProgress = Number(latest.progress || 0),
+              deployStep = latest.current_step || latest.stage_label || "";
+            text = `项目“${current.name}”正在部署${deployProgress ? `（${deployProgress}%）` : ""}${deployStep ? ` · ${deployStep}` : ""}，可查看实时进度。`;
           } else if (latest?.status === "success") {
             text = `项目“${current.name}”已部署成功${latest.access_url ? `：${latest.access_url}` : "。"}`;
             done = true;
