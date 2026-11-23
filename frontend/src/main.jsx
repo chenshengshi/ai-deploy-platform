@@ -9275,17 +9275,27 @@ function SecuritySettings() {
 }
 function AuditSettings() {
   const [items, setItems] = useState(null);
+  const [auditUsers, setAuditUsers] = useState([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(null);
   const load = () => {
     setItems(null);
-    api(`/audit${query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ""}`)
-      .then(setItems)
+    Promise.all([
+      api(`/audit${query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ""}`),
+      api("/users"),
+    ])
+      .then(([logs, users]) => { setAuditUsers(users); setItems(logs); })
       .catch(() => setItems([]));
   };
   useEffect(() => {
     load();
   }, []);
+  const operatorFor = (entry) => {
+    if (!entry.user_id) return { name: entry.user_name || "系统任务", username: "" };
+    const matched = auditUsers.find((user) => user.id === entry.user_id);
+    if (matched) return { name: matched.display_name || matched.username, username: matched.username };
+    return { name: entry.user_name || "已删除用户", username: `ID ${entry.user_id.slice(0, 8)}` };
+  };
   const labels = {
     delete_deployment: "删除发布版本",
     delete_project: "删除项目",
@@ -9392,7 +9402,8 @@ function AuditSettings() {
                   <tr key={x.id} onClick={() => setSelected(x)} className="audit-row-clickable">
                     <td className="audit-time">{time(x.created_at)}</td>
                     <td className="audit-user">
-                      <b>{x.user_name}</b>
+                      <b>{operatorFor(x).name}</b>
+                      {operatorFor(x).username && <small>@{operatorFor(x).username}</small>}
                     </td>
                     <td><span className="audit-action">{labels[x.action] || x.action}</span></td>
                     <td className="audit-target">
@@ -9414,7 +9425,7 @@ function AuditSettings() {
       {selected && (
         <Modal title="操作记录详情" onClose={() => setSelected(null)} wide>
           <div className="audit-detail-modal">
-            <div><b>{labels[selected.action] || selected.action}</b><span>{time(selected.created_at)} · {selected.user_name}</span></div>
+            <div><b>{labels[selected.action] || selected.action}</b><span>{time(selected.created_at)} · {operatorFor(selected).name}{operatorFor(selected).username ? ` (@${operatorFor(selected).username})` : ""}</span></div>
             <pre>{(() => { try { return JSON.stringify(JSON.parse(selected.detail), null, 2); } catch { return selected.detail || "—"; } })()}</pre>
           </div>
         </Modal>
