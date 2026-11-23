@@ -1364,6 +1364,7 @@ function Chat() {
     [deleteTarget, setDeleteTarget] = useState(null),
     [deleteProject, setDeleteProject] = useState(null),
     [selectedDeployment, setSelectedDeployment] = useState(null),
+    [workflowActionBusy, setWorkflowActionBusy] = useState(""),
     [messages, setMessages] = useState([
       {
         who: "ai",
@@ -1651,6 +1652,46 @@ function Chat() {
       }]);
     }
   };
+  const analyzeFailedDeployment = async (deploymentId) => {
+    const actionKey = `diagnose:${deploymentId}`;
+    setWorkflowActionBusy(actionKey);
+    try {
+      const diagnosis = await api(`/deployments/${deploymentId}/ai-followup`),
+        plan = Array.isArray(diagnosis.fix_plan) ? diagnosis.fix_plan.filter(Boolean) : [],
+        details = [
+          `结论：${diagnosis.summary || "已读取失败日志，但暂未形成明确结论。"}`,
+          diagnosis.advice ? `处理建议：${diagnosis.advice}` : "",
+          plan.length ? `修复步骤：\n${plan.map((step, index) => `${index + 1}. ${step}`).join("\n")}` : "",
+          diagnosis.next_step ? `下一步：${diagnosis.next_step}` : "",
+        ].filter(Boolean).join("\n\n");
+      setMessages((items) => [...items, { who: "ai", text: details, action: "diagnosis" }]);
+    } catch (error) {
+      setMessages((items) => [...items, { who: "ai", text: `AI 分析失败原因时遇到问题：${error.message}`, error: true }]);
+    } finally {
+      setWorkflowActionBusy("");
+    }
+  };
+  const retryFailedDeployment = async (message) => {
+    const actionKey = `retry:${message.deployment}`;
+    setWorkflowActionBusy(actionKey);
+    try {
+      const deployment = await api(`/deployments/${message.deployment}/retry`, { method: "POST" });
+      setMessages((items) => items.map((item) => item === message
+        ? {
+          ...item,
+          text: `项目“${projects.find((candidate) => candidate.id === item.workflowProjectId)?.name || "当前项目"}”已重新发布，正在等待执行。`,
+          deployment: deployment.id,
+          action: "existing_deployment",
+          workflowDone: false,
+          error: false,
+        }
+        : item));
+    } catch (error) {
+      setMessages((items) => [...items, { who: "ai", text: `重新发布失败：${error.message}`, error: true }]);
+    } finally {
+      setWorkflowActionBusy("");
+    }
+  };
   const openDeleteProject = async (projectId) => {
     try {
       const target = projects.find((item) => item.id === projectId) || await api(`/projects/${projectId}`);
@@ -1692,6 +1733,18 @@ function Chat() {
                           ? "查看进行中的部署任务"
                           : "查看发布记录"}
                     </button>
+                  )}
+                  {m.workflowDone && m.error && m.deployment && (
+                    <div className="chat-failure-actions">
+                      <button type="button" disabled={Boolean(workflowActionBusy)} onClick={() => analyzeFailedDeployment(m.deployment)}>
+                        {workflowActionBusy === `diagnose:${m.deployment}` ? <LoaderCircle className="spin" /> : <Bot />}
+                        AI 分析原因
+                      </button>
+                      <button type="button" disabled={Boolean(workflowActionBusy)} onClick={() => retryFailedDeployment(m)}>
+                        {workflowActionBusy === `retry:${m.deployment}` ? <LoaderCircle className="spin" /> : <RefreshCw />}
+                        重新发布
+                      </button>
+                    </div>
                   )}
                   {m.action === "confirm_delete_project" && m.projectId && (
                     <button type="button" className="chat-deployment-link danger-text" onClick={() => openDeleteProject(m.projectId)}>

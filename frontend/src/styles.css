@@ -1292,6 +1292,32 @@ tbody tr:last-child td {
   text-decoration: underline;
   cursor: pointer;
 }
+.chat-failure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.chat-failure-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid #e5a9ad;
+  border-radius: 9px;
+  background: #fff;
+  color: #a62f37;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.chat-failure-actions button:first-child {
+  border-color: #cfcafc;
+  color: #5149dd;
+}
+.chat-failure-actions button:disabled { cursor: wait; opacity: .6; }
+.chat-failure-actions svg { width: 14px; height: 14px; }
 .message .avatar {
   width: 30px;
   height: 30px;
