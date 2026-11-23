@@ -250,6 +250,11 @@ header p {
   background: #fff;
   color: #554ddd;
 }
+.hero .primary:hover,
+.hero .primary:focus-visible {
+  background: #443bc7;
+  color: #fff;
+}
 .hero-art svg {
   width: 170px;
   height: 170px;
