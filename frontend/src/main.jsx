@@ -1825,7 +1825,7 @@ function Chat() {
           }}
           onProgress={({ project: progressProject, text: progressText }) => {
             setMessages((items) => items.map((item) => item.workflowProjectId === progressProject.id
-              ? { ...item, text: `项目“${progressProject.name}”：${progressText}` }
+              ? { ...item, text: `项目“${progressProject.name}” ${progressText}` }
               : item));
           }}
           onDone={({ project: p, deployment, nodeId, autoDeploy }) => {
