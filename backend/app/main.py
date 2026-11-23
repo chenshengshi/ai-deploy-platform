@@ -7053,9 +7053,35 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
         except Exception:
             live = None
     live_states = ",".join(sorted(f"{x.get('name')}={x.get('status')}" for x in (live or {}).get("containers", [])))
-    cache_key = f"{item.status.value}|{active['title']}|{item.access_url or '-'}|{live_states}"
+    data_service_evidence = ""
+    initial_evidence = active.get("log", "") + "\n" + (item.error or "")
+    if item.status == DeployStatus.failed and re.search(
+        r"PipeTimeout|数据服务检查|项目级数据服务|MySQL/Redis",
+        initial_evidence,
+        re.I,
+    ):
+        runtime_policy = db.get(DeploymentSettings, "default")
+        runtime_namespace = (runtime_policy.registry_namespace if runtime_policy else "yunzhou") or "yunzhou"
+        safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
+        data_project = f"{safe_namespace}-{project.slug}-data"
+        try:
+            with SSHNode(node) as ssh:
+                _, data_service_evidence = ssh.run(
+                    "ids=$(docker ps -aq --filter "
+                    + shlex.quote(f"label=com.docker.compose.project={data_project}")
+                    + "); for id in $ids; do "
+                    + "printf '\n--- %s ---\n' \"$(docker inspect -f '{{.Name}} image={{.Config.Image}} state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $id 2>/dev/null)\"; "
+                    + "docker logs --tail 160 $id 2>&1; done",
+                    timeout=45,
+                )
+        except Exception as exc:
+            data_service_evidence = f"[数据服务实时诊断采集失败] {type(exc).__name__}"
+    data_signature = hashlib.sha256(data_service_evidence.encode("utf-8", errors="ignore")).hexdigest()[:12] if data_service_evidence else "-"
+    cache_key = f"{item.status.value}|{active['title']}|{item.access_url or '-'}|{live_states}|{data_signature}"
     marker = "[AI跟进] "
     evidence = active.get("log", "") + ("\n[实时运行状态]\n" + json.dumps((live or {}).get("containers", []), ensure_ascii=False) if live is not None else "")
+    if data_service_evidence:
+        evidence += "\n[项目级数据服务实时日志]\n" + data_service_evidence[-12000:]
     combined_evidence = evidence + "\n" + (item.error or "")
     project_values = environment_values(decrypt(project.env_text_encrypted) or "") if project else {}
     external_mysql_env_error = (
@@ -7076,7 +7102,26 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
     # a language model that could guess a later stage such as "验证访问".
     # The pipeline parser above is the source of truth for the actual stage.
     platform_name_error = re.search(r"name ['\"]([^'\"]+)['\"] is not defined", combined_evidence, re.I)
-    if access_verified and item.status == DeployStatus.running:
+    mysql_init_error = re.search(
+        r"ERROR\s+(\d+)\s+\(([^)]+)\)(?:\s+at line\s+(\d+))?:\s*([^\r\n]+)",
+        combined_evidence,
+        re.I,
+    )
+    if mysql_init_error:
+        error_code, sql_state, sql_line, sql_message = mysql_init_error.groups()
+        location = f"第 {sql_line} 行" if sql_line else "初始化脚本"
+        result = {
+            "source": "system",
+            "summary": f"已定位为 MySQL 初始化 SQL 错误：init.sql {location}执行失败（ERROR {error_code} / {sql_state}），因此平台停止创建应用容器。",
+            "advice": f"修正该行 SQL 后拉取最新源码；由于当前数据卷可能只完成了部分初始化，需要确认无保留数据后重置该项目的新建数据库，再重新发布。错误内容：{sql_message[:300]}",
+            "scope": "source",
+            "confidence": "high",
+            "evidence": [mysql_init_error.group(0)[:500]],
+            "retry_safe": False,
+            "fix_plan": ["修正 init.sql 中不兼容当前 MySQL 版本的语法", "确认后重置本次未完整初始化的数据卷", "拉取最新源码并重新发布，验证数据库、应用启动和访问地址"],
+            "next_step": "源码已经修正后，先确认是否允许清空本次新建且未完整初始化的 CRM 数据卷，再重新发布。",
+        }
+    elif access_verified and item.status == DeployStatus.running:
         verified_url = re.search(r"访问验证通过：HTTP\s+2\d\d\s*[·，,]?\s*(https?://\S+)", combined_evidence, re.I)
         result = {
             "source": "system",
