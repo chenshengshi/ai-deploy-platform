@@ -1369,6 +1369,56 @@ function Chat() {
   useEffect(() => {
     requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" }));
   }, [messages, busy, sessionId]);
+  const workflowIds = useMemo(() => [...new Set(
+    messages.filter((item) => item.workflowProjectId && !item.workflowDone).map((item) => item.workflowProjectId),
+  )], [messages]);
+  useEffect(() => {
+    if (!workflowIds.length) return undefined;
+    let stopped = false;
+    const refresh = async () => {
+      for (const projectId of workflowIds) {
+        try {
+          const [current, deployments] = await Promise.all([
+              api(`/projects/${projectId}`),
+              api(`/deployments?project_id=${projectId}`),
+            ]),
+            analysis = current.source_analysis || {},
+            analysisStatus = analysis.status || analysis.phase || "queued",
+            progress = Number(analysis.progress || 0),
+            latest = deployments[0];
+          let text = `项目“${current.name}”正在等待 AI 分析…`, done = false, error = false;
+          if (analysisStatus === "failed") {
+            text = `项目“${current.name}”分析失败：${analysis.error || analysis.message || "请查看源码分析说明"}`;
+            done = true;
+            error = true;
+          } else if (latest && ["queued", "running"].includes(latest.status)) {
+            text = `项目“${current.name}”正在部署${latest.stage_label ? ` · ${latest.stage_label}` : ""}，可查看实时进度。`;
+          } else if (latest?.status === "success") {
+            text = `项目“${current.name}”已部署成功${latest.access_url ? `：${latest.access_url}` : "。"}`;
+            done = true;
+          } else if (latest?.status === "failed") {
+            text = `项目“${current.name}”部署失败，可打开发布记录查看原因。`;
+            done = true;
+            error = true;
+          } else if (analysisStatus === "completed") {
+            text = `项目“${current.name}”分析完成，正在创建部署任务…`;
+          } else {
+            text = `项目“${current.name}”正在后台分析${progress ? `（${progress}%）` : ""}，完成后将自动部署。`;
+          }
+          if (stopped) return;
+          setMessages((items) => items.map((item) => item.workflowProjectId === projectId && !item.workflowDone
+            ? { ...item, text, error, workflowDone: done, deployment: latest?.id || item.deployment, action: latest ? "existing_deployment" : item.action }
+            : item));
+          if (done) localStorage.removeItem(pendingAutoDeployKey);
+        } catch {
+          // A temporary refresh failure must not turn a running task into a false failure.
+        }
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, 3000);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [workflowIds.join("|")]);
   useEffect(() => {
     if (!busy) {
       setAiElapsed(0);
@@ -1617,6 +1667,7 @@ function Chat() {
                   </div>
                 )}
                 <div>
+                  {m.workflowProjectId && !m.workflowDone && <div className="workflow-live"><LoaderCircle className="spin" />正在同步任务状态</div>}
                   <MemoChatMessageContent text={m.text} />
                   {m.deployment && (
                     <button type="button" className="chat-deployment-link" onClick={() => openDeployment(m.deployment)}>

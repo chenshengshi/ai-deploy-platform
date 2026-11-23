@@ -1310,6 +1310,19 @@ tbody tr:last-child td {
   background: #fff0f1;
   color: #b8343b;
 }
+.workflow-live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: #665ee8;
+  font-size: 10px;
+  font-weight: 650;
+}
+.workflow-live svg {
+  width: 14px;
+  height: 14px;
+}
 .composer {
   flex: 0 0 auto;
   padding: 12px;
