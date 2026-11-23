@@ -2478,6 +2478,25 @@ tbody tr:last-child td {
 .danger-button:hover {
   background: #ffe3e5;
 }
+.user-delete-confirm { width: min(520px, calc(100vw - 32px)); }
+.user-delete-confirm .confirm-body { align-items: flex-start; padding-bottom: 18px; }
+.user-delete-confirm .confirm-body p { line-height: 1.6; }
+.user-delete-impact {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 0 24px 22px;
+  padding: 13px 15px;
+  border: 1px solid #f0dfe1;
+  border-radius: 11px;
+  background: #fffafa;
+}
+.user-delete-impact span { color: #9b6267; font-size: 11px; }
+.user-delete-impact b { color: #452f32; font-size: 12px; }
+.user-delete-impact small { grid-column: 2; color: #7c6a6d; line-height: 1.55; }
+.user-delete-confirm .modal-actions { padding-top: 13px; }
+.user-delete-confirm .danger-button { display: inline-flex; align-items: center; gap: 7px; }
+.user-delete-confirm .danger-button svg { width: 16px; height: 16px; }
 .drop-box {
   background: #fafaff;
   border-color: #8c85ff;

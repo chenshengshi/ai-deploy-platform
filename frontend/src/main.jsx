@@ -8435,9 +8435,20 @@ function UserModal({ user, onClose, onDone }) {
           {editing ? "保存修改" : "创建用户"}
         </button>
       </div>
-      {deleteConfirm && <Modal title="删除用户账号" onClose={() => setDeleteConfirm(false)}>
-        <div className="delete-warning"><Trash2 /><div><b>确定删除“{user.display_name || user.username}”吗？</b><p>账号将无法登录；其创建的 {user.project_count || 0} 个项目会移交给当前管理员，项目、部署记录和运行服务不会删除。</p></div></div>
-        <div className="modal-actions"><button className="ghost" onClick={() => setDeleteConfirm(false)}>取消</button><button className="danger" disabled={deleting} onClick={removeUser}>{deleting ? <LoaderCircle className="spin" /> : <Trash2 />}确认删除账号</button></div>
+      {deleteConfirm && <Modal title="删除用户账号" className="user-delete-confirm" onClose={() => setDeleteConfirm(false)}>
+        <div className="confirm-body">
+          <div className="confirm-icon danger"><Trash2 /></div>
+          <div>
+            <h4>确定删除“{user.display_name || user.username}”吗？</h4>
+            <p>删除后该账号将无法登录，且无法恢复。</p>
+          </div>
+        </div>
+        <div className="user-delete-impact">
+          <span>项目处理</span>
+          <b>{user.project_count || 0} 个项目将移交给当前管理员</b>
+          <small>项目、部署记录和正在运行的服务均不会删除。</small>
+        </div>
+        <div className="modal-actions"><button className="ghost" disabled={deleting} onClick={() => setDeleteConfirm(false)}>取消</button><button className="danger-button" disabled={deleting} onClick={removeUser}>{deleting ? <LoaderCircle className="spin" /> : <Trash2 />}确认删除账号</button></div>
       </Modal>}
     </Modal>
   );
