@@ -4925,8 +4925,8 @@ def deployment_view(
         # from real compiler/package completion events instead of leaving the
         # deployment card at 25% for several minutes.
         compiler_started = any(marker in log_text for marker in (
-            "[并发构建]", "[平台构建]", "[构建通道]", "[即时封装]",
-        ))
+            "[并发构建]", "[平台构建]", "[构建通道]", "[即时封装]", "[构建:web]", "[构建:api]",
+        )) or bool(re.search(r"\[构建:[^\]]+\]", log_text))
         compiler_done = {
             role for role, marker in (
                 ("api", "Maven 已使用公共缓存"),
@@ -5085,7 +5085,7 @@ def list_deployments(project_id: str | None = None, db: Session = Depends(get_db
         ).order_by(DeploymentPortReservation.created_at)).all():
             reservations.setdefault(row.deployment_id, []).append(row)
     return [deployment_view(
-        item, db, include_log=False,
+        item, db, include_log=bool(project_id and item.status in (DeployStatus.queued, DeployStatus.running)),
         port_reservations=reservations.get(item.id, []),
     ) for item in deployments]
 
