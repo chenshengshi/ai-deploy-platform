@@ -7534,6 +7534,36 @@ def central_build_and_distribute(
                     requirement_relative = "requirements/" + requirement_relative.split("/requirements/", 1)[-1]
                     requirements = context / requirement_relative
                 if not requirements.is_file():
+                    # The path passed to pip is resolved inside the image, not
+                    # necessarily from the Docker build-context root. A common
+                    # layout is ``COPY backend/requirements.txt ./`` followed
+                    # by ``pip install -r requirements.txt``. Trace COPY/ADD
+                    # instructions before the install block back to their
+                    # context source so these projects also use the shared
+                    # wheel cache.
+                    requested_name = Path(requirement_relative).name
+                    copy_candidates: list[str] = []
+                    for copy_match in re.finditer(
+                        r"(?im)^\s*(?:COPY|ADD)\s+(?:--\S+\s+)*([^\s]+)\s+([^\s]+)\s*$",
+                        docker_text[:pip_block[0]],
+                    ):
+                        source_value = copy_match.group(1).strip("'\"")
+                        target_value = copy_match.group(2).strip("'\"")
+                        if source_value.startswith(("http://", "https://")):
+                            continue
+                        target_name = Path(target_value.rstrip("/")).name
+                        if (
+                            Path(source_value).name == requested_name
+                            and (target_value in {".", "./"} or target_name == requested_name)
+                        ):
+                            copy_candidates.append(source_value.lstrip("/"))
+                    for copied_requirement in reversed(copy_candidates):
+                        copied_path = (context / copied_requirement).resolve()
+                        if copied_path.is_file() and (copied_path == context or context in copied_path.parents):
+                            requirement_relative = copied_requirement
+                            requirements = copied_path
+                            break
+                if not requirements.is_file():
                     continue
                 warmed_contexts.add(context_key)
                 requirement_payload = bytearray(requirements.read_bytes())
