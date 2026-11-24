@@ -237,7 +237,7 @@ function Login({ onDone, branding }) {
           <span><Activity /><b>持续管理</b><small>查看服务、日志和版本</small></span>
         </div>
       </div>
-      <form className="login-card" onSubmit={submit}>
+      <form className="login-card" autoComplete="on" onSubmit={submit}>
         <h2>欢迎回来</h2>
         <p className="sub">登录后管理项目与发布任务</p>
         <label>
