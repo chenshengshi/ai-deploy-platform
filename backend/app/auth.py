@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_db
-from .models import Role, User
+from .models import Role, SecurityConfig, User
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -38,9 +38,26 @@ def current_user(token: str = Depends(oauth2), db: Session = Depends(get_db)) ->
     if not user or not user.active:
         raise HTTPException(status_code=401, detail="用户不可用")
     issued_at = payload.get("iat")
+    # A token's embedded ``exp`` reflects the policy that was active when it
+    # was issued. Re-check its age against the current policy as well, so
+    # shortening the configured session timeout immediately invalidates older
+    # long-lived browser sessions instead of leaving them usable until their
+    # original expiration time.
+    try:
+        issued_at_value = datetime.fromtimestamp(int(issued_at), timezone.utc)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=401, detail="登录已失效") from exc
+    policy = db.get(SecurityConfig, "default")
+    timeout_minutes = (
+        policy.session_timeout_minutes
+        if policy and policy.session_timeout_minutes
+        else settings.token_expire_minutes
+    )
+    if datetime.now(timezone.utc) >= issued_at_value + timedelta(minutes=timeout_minutes):
+        raise HTTPException(status_code=401, detail="登录已超时，请重新登录")
     if issued_at and user.password_changed_at:
         changed_at = user.password_changed_at if user.password_changed_at.tzinfo else user.password_changed_at.replace(tzinfo=timezone.utc)
-        if datetime.fromtimestamp(int(issued_at), timezone.utc) < changed_at.replace(microsecond=0):
+        if issued_at_value < changed_at.replace(microsecond=0):
             raise HTTPException(status_code=401, detail="密码已变更，请重新登录")
     return user
 
