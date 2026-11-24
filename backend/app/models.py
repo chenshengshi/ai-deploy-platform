@@ -121,8 +121,10 @@ class Node(Base):
 
 class GitCredential(Base):
     __tablename__ = "git_credentials"
+    __table_args__ = (UniqueConstraint("owner_id", "name", name="uq_git_credentials_owner_name"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    name: Mapped[str] = mapped_column(String(100), unique=True)
+    name: Mapped[str] = mapped_column(String(100))
+    owner_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     auth_type: Mapped[str] = mapped_column(String(32), default="token")
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)

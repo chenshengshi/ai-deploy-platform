@@ -123,6 +123,8 @@ class CredentialIn(BaseModel):
 class CredentialOut(ORM):
     id: str
     name: str
+    owner_id: str | None = None
+    owner_username: str | None = None
     auth_type: str
     username: str | None
     created_at: datetime
@@ -173,6 +175,7 @@ class ProjectUpdate(BaseModel):
     image_retention_count: int | None = Field(default=None, ge=1, le=100)
     git_url: str | None = None
     git_branch: str | None = Field(default=None, max_length=100)
+    git_credential_id: str | None = None
     git_repositories: list[ProjectGitRepository] | None = None
 
 

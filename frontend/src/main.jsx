@@ -926,7 +926,7 @@ function App() {
       </div>
     );
   if (!me) return <Login onDone={load} branding={branding} />;
-  const allowed = (item) => !["nodes", "users", "settings"].includes(item[0]) || me.role === "admin";
+  const allowed = (item) => !["nodes", "users"].includes(item[0]) && (item[0] !== "settings" || ["admin", "deployer"].includes(me.role));
   return (
     <div className="app">
       <aside>
@@ -961,7 +961,7 @@ function App() {
             {page === "deployments" && <Deployments />}{" "}
             {page === "images" && <ImageRepository me={me} />}{" "}
             {page === "nodes" && <Nodes />} {page === "users" && <UsersPage />}{" "}
-            {page === "settings" && <SettingsPage />}
+            {page === "settings" && <SettingsPage me={me} />}
           </PageErrorBoundary>
         </section>
       </main>
@@ -2326,7 +2326,7 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
     [showPrivate, setShowPrivate] = useState(false),
     [credential, setCredential] = useState({
       name: "",
-      auth_type: "token",
+      auth_type: "password",
       username: "",
       secret: "",
     }),
@@ -2471,7 +2471,7 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
       setCredentials((items) => [...items, created]);
       set("git_credential_id", created.id);
       setShowPrivate(false);
-      setCredential({ name: "", auth_type: "token", username: "", secret: "" });
+      setCredential({ name: "", auth_type: "password", username: "", secret: "" });
       notify?.("私有仓库凭据已保存并自动选中");
     } catch (e) {
       setErr(e.message);
@@ -2744,7 +2744,7 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
                   onClick={() => setShowPrivate((x) => !x)}
                 >
                   <KeyRound />
-                  {showPrivate ? "收起" : "添加私有仓库凭据"}
+                  添加私有仓库凭据
                 </button>
                 <button
                   className="ghost"
@@ -2774,7 +2774,8 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
               )}
             </Field>
             {showPrivate && (
-              <div className="inline-credential">
+              <Modal title="添加 Git 凭据" onClose={() => setShowPrivate(false)}>
+              <div className="inline-credential credential-popup-form">
                 <div className="alert info">
                   {credential.auth_type === "ssh_key"
                     ? "SSH 仓库请粘贴完整私钥；保存后平台会加密存储。"
@@ -2800,8 +2801,8 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
                         })
                       }
                     >
-                      <option value="token">访问令牌 / PAT</option>
                       <option value="password">账号密码</option>
+                      <option value="token">访问令牌 / PAT</option>
                       <option value="ssh_key">SSH 私钥</option>
                     </select>
                   </Field>
@@ -2850,6 +2851,7 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
                   </button>
                 </div>
               </div>
+              </Modal>
             )}
           </div>
         )}
@@ -2956,7 +2958,7 @@ function CredentialModal({ onClose }) {
   const [items, setItems] = useState([]),
     [form, setForm] = useState({
       name: "",
-      auth_type: "token",
+      auth_type: "password",
       username: "",
       secret: "",
     }),
@@ -2972,7 +2974,7 @@ function CredentialModal({ onClose }) {
     setErr("");
     try {
       await api("/credentials", { method: "POST", body: JSON.stringify(form) });
-      setForm({ name: "", auth_type: "token", username: "", secret: "" });
+      setForm({ name: "", auth_type: "password", username: "", secret: "" });
       load();
     } catch (e) {
       setErr(e.message);
@@ -2980,8 +2982,17 @@ function CredentialModal({ onClose }) {
       setBusy(false);
     }
   };
+  const remove = async (item) => {
+    if (!window.confirm(`确定删除 Git 凭据“${item.name}”？`)) return;
+    try {
+      await api(`/credentials/${item.id}`, { method: "DELETE" });
+      load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
   return (
-    <Modal title="Git 访问凭据" onClose={onClose} wide>
+    <Modal title="Git 访问凭据" onClose={onClose}>
       <div className="form-grid">
         <Field label="凭据名称">
           <input
@@ -2995,8 +3006,8 @@ function CredentialModal({ onClose }) {
             value={form.auth_type}
             onChange={(e) => set("auth_type", e.target.value)}
           >
-            <option value="token">访问令牌</option>
             <option value="password">账号密码</option>
+            <option value="token">访问令牌 / PAT</option>
             <option value="ssh_key">SSH 私钥</option>
           </select>
         </Field>
@@ -3040,9 +3051,10 @@ function CredentialModal({ onClose }) {
                 <small>
                   {x.auth_type}
                   {x.username ? ` · ${x.username}` : ""}
+                  {x.owner_username ? ` · ${x.owner_username}` : ""}
                 </small>
               </span>
-              <ShieldCheck />
+              <button className="icon danger" title="删除凭据" onClick={() => remove(x)}><Trash2 /></button>
             </div>
           ))
         ) : (
@@ -8855,14 +8867,16 @@ function UserModal({ user, onClose, onDone }) {
   );
 }
 
-function SettingsPage() {
-  const [tab, setTab] = useState("ai"),
+function SettingsPage({ me }) {
+  const isAdmin = me.role === "admin";
+  const [tab, setTab] = useState(isAdmin ? "ai" : "credentials"),
     [toast, setToast] = useState(null);
   const notify = (text, type = "success") => {
     setToast({ text, type });
     setTimeout(() => setToast(null), 5000);
   };
   const tabs = [
+    ["credentials", "Git 凭据", KeyRound],
     ["appearance", "外观设置", Settings],
     ["ai", "AI 模型", Bot],
     ["network", "网络代理", CloudCog],
@@ -8873,7 +8887,7 @@ function SettingsPage() {
     ["security", "安全设置", ShieldCheck],
     ["audit", "日志审计", Activity],
     ["system", "系统信息", Activity],
-  ];
+  ].filter(([id]) => isAdmin || id === "credentials");
   return (
     <>
       <Toast toast={toast} />
@@ -8893,6 +8907,7 @@ function SettingsPage() {
           ))}
         </aside>
         <div className="settings-content">
+          {tab === "credentials" && <GitCredentialSettings />}
           {tab === "appearance" && <AppearanceSettings notify={notify} />}
           {tab === "ai" && <AiSettingsPanel onOpenExperience={() => setTab("experience")} />}
           {tab === "network" && <ProxySettings notify={notify} />}{" "}
@@ -8906,6 +8921,23 @@ function SettingsPage() {
           {tab === "system" && <SystemInfo />}
         </div>
       </div>
+    </>
+  );
+}
+
+function GitCredentialSettings() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <div className="toolbar">
+        <div><h2>Git 凭据</h2><p>凭据按登录用户隔离，只能用于你有权限操作的项目。</p></div>
+        <button className="primary" onClick={() => setOpen(true)}><Plus />添加或管理凭据</button>
+      </div>
+      <div className="panel backup-guide">
+        <KeyRound />
+        <div><b>账号之间完全隔离</b><p>发布人员只能查看和使用自己创建的凭据；管理员可以审计和管理全部凭据。</p></div>
+      </div>
+      {open && <CredentialModal onClose={() => setOpen(false)} />}
     </>
   );
 }

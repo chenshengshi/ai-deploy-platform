@@ -439,6 +439,16 @@ def startup():
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(64) NOT NULL DEFAULT ''"))
+        connection.execute(text("ALTER TABLE git_credentials ADD COLUMN IF NOT EXISTS owner_id VARCHAR(36)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_git_credentials_owner_id ON git_credentials (owner_id)"))
+        connection.execute(text("ALTER TABLE git_credentials DROP CONSTRAINT IF EXISTS git_credentials_name_key"))
+        connection.execute(text("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_git_credentials_owner_name') THEN
+                    ALTER TABLE git_credentials ADD CONSTRAINT uq_git_credentials_owner_name UNIQUE (owner_id, name);
+                END IF;
+            END $$
+        """))
         connection.execute(text("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS elapsed_ms INTEGER"))
         connection.execute(text("COMMENT ON COLUMN chat_messages.elapsed_ms IS 'AI 回答从接收请求到生成完成的耗时，单位毫秒'"))
         connection.execute(text("COMMENT ON COLUMN users.last_login_at IS '用户最近一次成功登录时间'"))
@@ -848,7 +858,22 @@ def delete_user(item_id: str, db: Session = Depends(get_db), user: User = Depend
         transferred += 1
     for deployment in db.scalars(select(Deployment).where(Deployment.requested_by == item.id)).all():
         deployment.requested_by = user.id
-    audit(db, user, "delete_user", "user", item.id, f"删除账号 {username}，移交 {transferred} 个项目")
+    credential_count = 0
+    for credential in db.scalars(select(GitCredential).where(GitCredential.owner_id == item.id)).all():
+        for project in db.scalars(select(Project).where(Project.git_credential_id == credential.id)).all():
+            project.git_credential_id = None
+        for project in db.scalars(select(Project).where(Project.git_repositories_json.contains(credential.id))).all():
+            try:
+                repositories = json.loads(project.git_repositories_json or "[]")
+                for repository in repositories:
+                    if repository.get("credential_id") == credential.id:
+                        repository["credential_id"] = None
+                project.git_repositories_json = json.dumps(repositories, ensure_ascii=False)
+            except (TypeError, ValueError):
+                pass
+        db.delete(credential)
+        credential_count += 1
+    audit(db, user, "delete_user", "user", item.id, f"删除账号 {username}，移交 {transferred} 个项目，删除 {credential_count} 个 Git 凭据")
     db.delete(item)
     db.commit()
     return {"ok": True, "transferred_projects": transferred}
@@ -1151,13 +1176,25 @@ def delete_node(item_id: str, db: Session = Depends(get_db), user: User = Depend
 
 
 @app.get("/api/credentials", response_model=list[CredentialOut])
-def list_credentials(db: Session = Depends(get_db), _: User = Depends(require(Role.admin, Role.deployer))):
-    return db.scalars(select(GitCredential).order_by(GitCredential.created_at)).all()
+def list_credentials(db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+    query = select(GitCredential)
+    if user.role != Role.admin:
+        query = query.where(GitCredential.owner_id == user.id)
+    items = db.scalars(query.order_by(GitCredential.created_at)).all()
+    owner_ids = {item.owner_id for item in items if item.owner_id}
+    owners = {item.id: item.username for item in db.scalars(select(User).where(User.id.in_(owner_ids))).all()} if owner_ids else {}
+    return [{
+        "id": item.id, "name": item.name, "owner_id": item.owner_id,
+        "owner_username": owners.get(item.owner_id) if item.owner_id else "历史未归属",
+        "auth_type": item.auth_type, "username": item.username, "created_at": item.created_at,
+    } for item in items]
 
 
 @app.post("/api/credentials", response_model=CredentialOut)
 def create_credential(body: CredentialIn, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
-    item = GitCredential(name=body.name, auth_type=body.auth_type, username=body.username, secret_encrypted=encrypt(body.secret))
+    if db.scalar(select(GitCredential.id).where(GitCredential.owner_id == user.id, GitCredential.name == body.name)):
+        raise HTTPException(409, "你已创建同名 Git 凭据")
+    item = GitCredential(name=body.name, owner_id=user.id, auth_type=body.auth_type, username=body.username, secret_encrypted=encrypt(body.secret))
     db.add(item)
     db.flush()
     audit(db, user, "create_credential", "credential", item.id, item.name)
@@ -1166,15 +1203,46 @@ def create_credential(body: CredentialIn, db: Session = Depends(get_db), user: U
     return item
 
 
+def _credential_for_user(db: Session, user: User, credential_id: str | None) -> GitCredential | None:
+    if not credential_id:
+        return None
+    item = db.get(GitCredential, credential_id)
+    if not item or (user.role != Role.admin and item.owner_id != user.id):
+        raise HTTPException(404, "Git 凭据不存在或不属于当前用户")
+    return item
+
+
+def _validate_project_credentials(db: Session, user: User, project: Project) -> None:
+    if project.source_type != SourceType.git:
+        return
+    _credential_for_user(db, user, project.git_credential_id)
+    for repository in project.git_repositories:
+        _credential_for_user(db, user, repository.get("credential_id"))
+
+
+@app.delete("/api/credentials/{item_id}")
+def delete_credential(item_id: str, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
+    item = _credential_for_user(db, user, item_id)
+    referenced = db.scalar(select(func.count()).select_from(Project).where(Project.git_credential_id == item.id)) or 0
+    referenced += sum(
+        1 for project in db.scalars(select(Project).where(Project.git_repositories_json.contains(item.id))).all()
+        if any(repository.get("credential_id") == item.id for repository in project.git_repositories)
+    )
+    if referenced:
+        raise HTTPException(409, f"该凭据仍被 {referenced} 个项目使用，请先更换项目凭据")
+    db.delete(item)
+    audit(db, user, "delete_credential", "credential", item.id, item.name)
+    db.commit()
+    return {"ok": True}
+
+
 @app.post("/api/credentials/test-git")
-def test_git_connection(body: GitConnectionTest, db: Session = Depends(get_db), _: User = Depends(require(Role.admin, Role.deployer))):
+def test_git_connection(body: GitConnectionTest, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     raw_url = body.git_url.strip()
     url, url_branch, source_path = git_source_location(raw_url, body.git_branch)
     if not url:
         raise HTTPException(400, "请填写 Git 仓库地址")
-    credential = db.get(GitCredential, body.credential_id) if body.credential_id else None
-    if body.credential_id and not credential:
-        raise HTTPException(404, "选择的 Git 凭据不存在")
+    credential = _credential_for_user(db, user, body.credential_id)
     env = dict(__import__("os").environ)
     key_path = None
     secret = ""
@@ -1229,6 +1297,9 @@ def list_projects(db: Session = Depends(get_db), user: User = Depends(current_us
 def create_project(body: ProjectCreate, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     if db.scalar(select(Project).where(Project.slug == body.slug)):
         raise HTTPException(409, "项目标识已存在")
+    _credential_for_user(db, user, body.git_credential_id)
+    for repository in body.git_repositories:
+        _credential_for_user(db, user, repository.credential_id)
     data = body.model_dump(exclude={"env_text", "git_repositories"})
     repositories = [row.model_dump() for row in body.git_repositories]
     item = Project(
@@ -3316,7 +3387,12 @@ def update_project(item_id: str, body: ProjectUpdate, db: Session = Depends(get_
         item.git_url = body.git_url.strip() if body.git_url else None
     if "git_branch" in fields_set and body.git_branch:
         item.git_branch = body.git_branch.strip()
+    if "git_credential_id" in fields_set:
+        _credential_for_user(db, user, body.git_credential_id)
+        item.git_credential_id = body.git_credential_id
     if "git_repositories" in fields_set and body.git_repositories is not None:
+        for repository in body.git_repositories:
+            _credential_for_user(db, user, repository.credential_id)
         item.git_repositories_json = json.dumps(
             [row.model_dump() for row in body.git_repositories], ensure_ascii=False,
         )
@@ -4175,6 +4251,7 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
     project, node = db.get(Project, item_id), db.get(Node, body.node_id)
     if not project or not node:
         raise HTTPException(404, "项目或节点不存在")
+    _validate_project_credentials(db, user, project)
     # Deploying from the project form must use exactly what is currently on
     # screen. Persist configuration in the same transaction that creates the
     # deployment so users never need to click a separate save button first.
