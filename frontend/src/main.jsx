@@ -2954,9 +2954,8 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
     </Modal>
   );
 }
-function CredentialModal({ onClose }) {
-  const [items, setItems] = useState([]),
-    [form, setForm] = useState({
+function CredentialModal({ onClose, onSaved }) {
+  const [form, setForm] = useState({
       name: "",
       auth_type: "password",
       username: "",
@@ -2964,39 +2963,31 @@ function CredentialModal({ onClose }) {
     }),
     [err, setErr] = useState(""),
     [busy, setBusy] = useState(false);
-  const load = () => api("/credentials").then(setItems);
-  useEffect(() => {
-    load();
-  }, []);
   const set = (k, v) => setForm({ ...form, [k]: v });
   const save = async () => {
     setBusy(true);
     setErr("");
     try {
-      await api("/credentials", { method: "POST", body: JSON.stringify(form) });
-      setForm({ name: "", auth_type: "password", username: "", secret: "" });
-      load();
+      const created = await api("/credentials", { method: "POST", body: JSON.stringify(form) });
+      onSaved?.(created);
+      onClose();
     } catch (e) {
       setErr(e.message);
     } finally {
       setBusy(false);
     }
   };
-  const remove = async (item) => {
-    if (!window.confirm(`确定删除 Git 凭据“${item.name}”？`)) return;
-    try {
-      await api(`/credentials/${item.id}`, { method: "DELETE" });
-      load();
-    } catch (e) {
-      setErr(e.message);
-    }
-  };
   return (
-    <Modal title="Git 访问凭据" onClose={onClose}>
+    <Modal title="添加 Git 凭据" onClose={onClose}>
+      <div className="alert info">
+        {form.auth_type === "ssh_key"
+          ? "SSH 仓库请粘贴完整私钥；保存后平台会加密存储。"
+          : "TFS / Azure DevOps 的 HTTP 仓库通常使用账号密码或访问令牌。"}
+      </div>
       <div className="form-grid">
         <Field label="凭据名称">
           <input
-            placeholder="例如：公司 GitLab"
+            placeholder="例如：公司 TFS"
             value={form.name}
             onChange={(e) => set("name", e.target.value)}
           />
@@ -3012,25 +3003,38 @@ function CredentialModal({ onClose }) {
           </select>
         </Field>
         {form.auth_type !== "ssh_key" && (
-          <Field label="用户名（可选）">
+          <Field label={form.auth_type === "password" ? "用户名" : "用户名（按仓库要求填写）"}>
             <input
+              autoComplete="username"
+              placeholder="仓库登录账号"
               value={form.username}
               onChange={(e) => set("username", e.target.value)}
             />
           </Field>
         )}
-        <Field label={form.auth_type === "ssh_key" ? "SSH 私钥" : "密码或令牌"}>
-          <textarea
-            rows="5"
-            value={form.secret}
-            onChange={(e) => set("secret", e.target.value)}
-          />
+        <Field label={form.auth_type === "ssh_key" ? "SSH 私钥" : form.auth_type === "token" ? "访问令牌 / PAT" : "密码"}>
+          {form.auth_type === "ssh_key" ? (
+            <textarea
+              rows="5"
+              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+              value={form.secret}
+              onChange={(e) => set("secret", e.target.value)}
+            />
+          ) : (
+            <input
+              type="password"
+              autoComplete="new-password"
+              placeholder={form.auth_type === "token" ? "输入 PAT 或访问令牌" : "输入仓库登录密码"}
+              value={form.secret}
+              onChange={(e) => set("secret", e.target.value)}
+            />
+          )}
         </Field>
       </div>
       {err && <div className="alert danger">{err}</div>}
       <div className="modal-actions">
         <button className="ghost" onClick={onClose}>
-          关闭
+          取消
         </button>
         <button
           className="primary"
@@ -3039,27 +3043,6 @@ function CredentialModal({ onClose }) {
         >
           {busy && <LoaderCircle className="spin" />}保存凭据
         </button>
-      </div>
-      <div className="credential-list">
-        <h4>已保存凭据</h4>
-        {items.length ? (
-          items.map((x) => (
-            <div key={x.id}>
-              <KeyRound />
-              <span>
-                <b>{x.name}</b>
-                <small>
-                  {x.auth_type}
-                  {x.username ? ` · ${x.username}` : ""}
-                  {x.owner_username ? ` · ${x.owner_username}` : ""}
-                </small>
-              </span>
-              <button className="icon danger" title="删除凭据" onClick={() => remove(x)}><Trash2 /></button>
-            </div>
-          ))
-        ) : (
-          <p>尚未保存 Git 凭据</p>
-        )}
       </div>
     </Modal>
   );
@@ -8876,10 +8859,10 @@ function SettingsPage({ me }) {
     setTimeout(() => setToast(null), 5000);
   };
   const tabs = [
-    ["credentials", "Git 凭据", KeyRound],
     ["appearance", "外观设置", Settings],
     ["ai", "AI 模型", Bot],
     ["network", "网络代理", CloudCog],
+    ["credentials", "Git 凭据", KeyRound],
     ["deployment", "发布调度", Activity],
     ["backup", "数据备份", FileArchive],
     ["certificates", "证书管理", KeyRound],
@@ -8926,18 +8909,60 @@ function SettingsPage({ me }) {
 }
 
 function GitCredentialSettings() {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(false),
+    [items, setItems] = useState([]),
+    [loading, setLoading] = useState(true),
+    [error, setError] = useState("");
+  const load = () => {
+    setLoading(true);
+    setError("");
+    api("/credentials")
+      .then(setItems)
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+  const authLabel = (type) => ({ password: "账号密码", token: "访问令牌 / PAT", ssh_key: "SSH 私钥" }[type] || type);
+  const remove = async (item) => {
+    if (!window.confirm(`确定删除 Git 凭据“${item.name}”？`)) return;
+    try {
+      await api(`/credentials/${item.id}`, { method: "DELETE" });
+      load();
+    } catch (e) {
+      setError(e.message);
+    }
+  };
   return (
     <>
       <div className="toolbar">
         <div><h2>Git 凭据</h2><p>凭据按登录用户隔离，只能用于你有权限操作的项目。</p></div>
-        <button className="primary" onClick={() => setOpen(true)}><Plus />添加或管理凭据</button>
+        <button className="primary" onClick={() => setOpen(true)}><Plus />添加凭据</button>
       </div>
       <div className="panel backup-guide">
         <KeyRound />
         <div><b>账号之间完全隔离</b><p>发布人员只能查看和使用自己创建的凭据；管理员可以审计和管理全部凭据。</p></div>
       </div>
-      {open && <CredentialModal onClose={() => setOpen(false)} />}
+      {error && <div className="alert danger">{error}</div>}
+      <div className="credential-list panel">
+        <h4>已保存凭据（{items.length}）</h4>
+        {loading ? (
+          <div className="center"><LoaderCircle className="spin" /></div>
+        ) : items.length ? (
+          items.map((item) => (
+            <div key={item.id}>
+              <KeyRound />
+              <span>
+                <b>{item.name}</b>
+                <small>{authLabel(item.auth_type)}{item.username ? ` · ${item.username}` : ""}{item.owner_username ? ` · 所属 ${item.owner_username}` : ""}</small>
+              </span>
+              <button className="icon danger" title="删除凭据" onClick={() => remove(item)}><Trash2 /></button>
+            </div>
+          ))
+        ) : (
+          <p>还没有凭据，点击右上角“添加凭据”创建。</p>
+        )}
+      </div>
+      {open && <CredentialModal onClose={() => setOpen(false)} onSaved={load} />}
     </>
   );
 }

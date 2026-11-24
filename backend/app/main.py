@@ -443,6 +443,13 @@ def startup():
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_git_credentials_owner_id ON git_credentials (owner_id)"))
         connection.execute(text("ALTER TABLE git_credentials DROP CONSTRAINT IF EXISTS git_credentials_name_key"))
         connection.execute(text("""
+            UPDATE git_credentials
+            SET owner_id = (
+                SELECT id FROM users WHERE role = 'admin' ORDER BY created_at ASC LIMIT 1
+            )
+            WHERE owner_id IS NULL
+        """))
+        connection.execute(text("""
             DO $$ BEGIN
                 IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_git_credentials_owner_name') THEN
                     ALTER TABLE git_credentials ADD CONSTRAINT uq_git_credentials_owner_name UNIQUE (owner_id, name);
