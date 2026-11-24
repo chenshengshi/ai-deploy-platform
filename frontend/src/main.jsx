@@ -926,7 +926,11 @@ function App() {
       </div>
     );
   if (!me) return <Login onDone={load} branding={branding} />;
-  const allowed = (item) => !["nodes", "users"].includes(item[0]) && (item[0] !== "settings" || ["admin", "deployer"].includes(me.role));
+  const allowed = (item) => {
+    if (["nodes", "users"].includes(item[0])) return me.role === "admin";
+    if (item[0] === "settings") return ["admin", "deployer"].includes(me.role);
+    return true;
+  };
   return (
     <div className="app">
       <aside>
