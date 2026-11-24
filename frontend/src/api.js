@@ -68,7 +68,7 @@ export async function login(username, password) {
   // Remove legacy browser-readable tokens after the server has issued the
   // HttpOnly session cookie.
   localStorage.removeItem('token')
-  localStorage.setItem('yunzhou_last_username', username)
+  localStorage.removeItem('yunzhou_last_username')
   return result
 }
 

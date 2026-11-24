@@ -198,22 +198,14 @@ function BrandLogo({ branding, large = false }) {
 }
 
 function Login({ onDone, branding }) {
-  const [form, setForm] = useState(() => ({
-    username: localStorage.getItem("yunzhou_last_username") || "",
-    password: "",
-  }));
   const [showPassword, setShowPassword] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  const updateField = (field, value) => {
-    setForm((current) => ({ ...current, [field]: value }));
-    if (err) setErr("");
-  };
   const submit = async (e) => {
     e.preventDefault();
     const submitted = new FormData(e.currentTarget);
-    const username = String(submitted.get("username") || form.username || "").trim();
-    const password = String(submitted.get("password") || form.password || "");
+    const username = String(submitted.get("username") || "").trim();
+    const password = String(submitted.get("password") || "");
     setBusy(true);
     setErr("");
     try {
@@ -237,7 +229,7 @@ function Login({ onDone, branding }) {
           <span><Activity /><b>持续管理</b><small>查看服务、日志和版本</small></span>
         </div>
       </div>
-      <form className="login-card" autoComplete="on" onSubmit={submit}>
+      <form className="login-card" method="post" action="/api/auth/login" autoComplete="on" onSubmit={submit}>
         <h2>欢迎回来</h2>
         <p className="sub">登录后管理项目与发布任务</p>
         <label>
@@ -246,12 +238,11 @@ function Login({ onDone, branding }) {
             id="login-username"
             name="username"
             type="text"
-            value={form.username}
             autoComplete="username"
             autoCapitalize="none"
             spellCheck={false}
             aria-invalid={Boolean(err)}
-            onChange={(e) => updateField("username", e.target.value)}
+            onInput={() => err && setErr("")}
           />
         </label>
         <label>
@@ -261,10 +252,9 @@ function Login({ onDone, branding }) {
               id="login-password"
               name="password"
               type={showPassword ? "text" : "password"}
-              value={form.password}
               autoComplete="current-password"
               aria-invalid={Boolean(err)}
-              onChange={(e) => updateField("password", e.target.value)}
+              onInput={() => err && setErr("")}
             />
             <button
               type="button"
