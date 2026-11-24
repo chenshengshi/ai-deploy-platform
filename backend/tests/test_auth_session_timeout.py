@@ -2,10 +2,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
+from starlette.requests import Request
 from jose import jwt
 
-from app.auth import user_from_token
+from app.auth import SESSION_COOKIE_NAME, user_from_token
 from app.config import settings
+from app.main import _request_user
 from app.models import Role, SecurityConfig, User
 
 
@@ -56,6 +58,20 @@ class CurrentSessionPolicyTests(unittest.TestCase):
         token = make_token(self.user, now - timedelta(minutes=59), now + timedelta(minutes=1))
 
         result = user_from_token(token, FakeSession(self.user, timeout_minutes=60))
+
+        self.assertIs(result, self.user)
+
+    def test_project_permission_middleware_recognizes_session_cookie(self):
+        now = datetime.now(timezone.utc)
+        token = make_token(self.user, now - timedelta(minutes=1), now + timedelta(minutes=59))
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/projects/other-project",
+            "headers": [(b"cookie", f"{SESSION_COOKIE_NAME}={token}".encode())],
+        })
+
+        result = _request_user(request, FakeSession(self.user, timeout_minutes=60))
 
         self.assertIs(result, self.user)
 

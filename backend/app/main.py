@@ -93,14 +93,15 @@ app.include_router(backup_router)
 
 def _request_user(request: Request, db: Session) -> User | None:
     authorization = request.headers.get("authorization", "")
-    if not authorization.lower().startswith("bearer "):
-        return None
+    token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization.lower().startswith("bearer ")
+        else request.cookies.get(SESSION_COOKIE_NAME)
+    )
     try:
-        payload = jwt.decode(authorization.split(" ", 1)[1].strip(), settings.app_secret, algorithms=["HS256"])
-    except JWTError:
+        return user_from_token(token, db)
+    except HTTPException:
         return None
-    user = db.get(User, payload.get("sub"))
-    return user if user and user.active else None
 
 
 def _user_can_access_project(db: Session, user: User, project_id: str) -> bool:
