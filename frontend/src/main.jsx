@@ -876,11 +876,15 @@ function App() {
   };
   useEffect(() => {
     api("/branding").then(setBranding).catch(() => {});
-    if (token()) load();
-    else setLoading(false);
+    load().catch(() => {});
     const syncBranding = (event) => setBranding(event.detail);
+    const sessionExpired = () => setMe(null);
     window.addEventListener("branding-updated", syncBranding);
-    return () => window.removeEventListener("branding-updated", syncBranding);
+    window.addEventListener("yunzhou-auth-expired", sessionExpired);
+    return () => {
+      window.removeEventListener("branding-updated", syncBranding);
+      window.removeEventListener("yunzhou-auth-expired", sessionExpired);
+    };
   }, []);
   useEffect(() => {
     const stopNumberWheel = (event) => {
@@ -4827,7 +4831,8 @@ function ProjectRuntime({ projectId, canEdit, runtime, refreshing, onRefresh, on
     if (!target || [WebSocket.OPEN, WebSocket.CONNECTING].includes(terminalSocketRef.current?.readyState)) return;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${protocol}//${window.location.host}/api/deployments/${target.deploymentId}/containers/${encodeURIComponent(target.container.name)}/terminal/ws?cwd=${encodeURIComponent(cwd || "/")}`;
-    const socket = new WebSocket(url, ["yunzhou-terminal", `bearer.${token()}`]);
+    const legacyToken = token();
+    const socket = new WebSocket(url, legacyToken ? ["yunzhou-terminal", `bearer.${legacyToken}`] : ["yunzhou-terminal"]);
     terminalSocketRef.current = socket;
     socket.onopen = () => { setTerminalConnected(true); setTerminalBusy(false); setTimeout(focusTerminalIfHovered, 0); };
     socket.onmessage = (event) => setTerminalOutput((value) => `${value}${stripTerminalAnsi(event.data)}`);

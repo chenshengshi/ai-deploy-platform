@@ -3,13 +3,12 @@ const base = '/api'
 export function token() { return localStorage.getItem('token') || '' }
 export function logout() {
   const current = token()
-  if (current) {
-    fetch(base + '/auth/logout', {
-      method: 'POST',
-      headers: {Authorization: `Bearer ${current}`},
-      keepalive: true,
-    }).catch(() => {})
-  }
+  fetch(base + '/auth/logout', {
+    method: 'POST',
+    headers: current ? {Authorization: `Bearer ${current}`} : {},
+    credentials: 'same-origin',
+    keepalive: true,
+  }).catch(() => {})
   localStorage.removeItem('token')
   location.reload()
 }
@@ -23,11 +22,12 @@ export async function api(path, options = {}) {
   let lastError
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const response = await fetch(base + path, {...options, headers})
+      const response = await fetch(base + path, {credentials: 'same-origin', ...options, headers})
       // A 401 returned by the login endpoint is an ordinary validation error.
       // Only clear the current session when an authenticated request expires.
-      if (response.status === 401 && token() && path !== '/auth/login') {
-        logout()
+      if (response.status === 401 && path !== '/auth/login') {
+        localStorage.removeItem('token')
+        window.dispatchEvent(new Event('yunzhou-auth-expired'))
         throw new Error('登录已过期，请重新登录')
       }
       if ([502,503,504].includes(response.status) && attempt + 1 < attempts) {
@@ -65,7 +65,9 @@ export async function api(path, options = {}) {
 
 export async function login(username, password) {
   const result = await api('/auth/login', {method:'POST', body:JSON.stringify({username,password})})
-  localStorage.setItem('token', result.access_token)
+  // Remove legacy browser-readable tokens after the server has issued the
+  // HttpOnly session cookie.
+  localStorage.removeItem('token')
   return result
 }
 

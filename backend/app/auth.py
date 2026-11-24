@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -11,7 +11,8 @@ from .database import get_db
 from .models import Role, SecurityConfig, User
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+SESSION_COOKIE_NAME = "yunzhou_session"
+oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 
 def hash_password(value: str) -> str:
@@ -28,7 +29,9 @@ def token_for(user: User, expire_minutes: int | None = None) -> str:
     return jwt.encode({"sub": user.id, "role": user.role.value, "iat": issued_at, "exp": exp}, settings.app_secret, algorithm="HS256")
 
 
-def current_user(token: str = Depends(oauth2), db: Session = Depends(get_db)) -> User:
+def user_from_token(token: str | None, db: Session) -> User:
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
     try:
         payload = jwt.decode(token, settings.app_secret, algorithms=["HS256"])
         user_id = payload.get("sub")
@@ -60,6 +63,17 @@ def current_user(token: str = Depends(oauth2), db: Session = Depends(get_db)) ->
         if issued_at_value < changed_at.replace(microsecond=0):
             raise HTTPException(status_code=401, detail="密码已变更，请重新登录")
     return user
+
+
+def current_user(
+    request: Request,
+    token: str | None = Depends(oauth2),
+    db: Session = Depends(get_db),
+) -> User:
+    # Bearer tokens remain accepted during the migration so an already-open
+    # page is not interrupted. New logins use an HttpOnly cookie which cannot
+    # be read by browser JavaScript.
+    return user_from_token(token or request.cookies.get(SESSION_COOKIE_NAME), db)
 
 
 def require(*roles: Role):

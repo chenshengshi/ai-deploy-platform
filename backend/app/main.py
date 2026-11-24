@@ -35,7 +35,7 @@ from jose import JWTError, jwt
 
 from .ai import analyze_delete_scope, analyze_project_deployment, deployment_followup, understand
 from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
-from .auth import current_user, hash_password, require, token_for, verify_password
+from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
 from .backup import router as backup_router, start_backup_scheduler
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
@@ -625,7 +625,7 @@ def update_branding(body: BrandingSettingsIn, db: Session = Depends(get_db), use
 
 
 @app.post("/api/auth/login", response_model=TokenOut)
-def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
+def login(body: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
     source_ip = _login_source_ip(request)
     enforce_login_source_limit(source_ip)
     user = db.scalar(select(User).where(User.username == body.username))
@@ -662,7 +662,19 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     user.last_login_ip = source_ip
     audit(db, user, "login", "auth", detail=json.dumps({"username": user.username, "ip": source_ip, "result": "登录成功"}, ensure_ascii=False))
     db.commit()
-    return TokenOut(access_token=token_for(user, policy.session_timeout_minutes))
+    access_token = token_for(user, policy.session_timeout_minutes)
+    forwarded_scheme = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    secure_cookie = forwarded_scheme == "https" or request.url.scheme == "https"
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        access_token,
+        max_age=policy.session_timeout_minutes * 60,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="strict",
+        path="/",
+    )
+    return TokenOut(access_token=access_token)
 
 
 @app.get("/api/auth/me", response_model=UserOut)
@@ -671,10 +683,11 @@ def me(user: User = Depends(current_user)):
 
 
 @app.post("/api/auth/logout")
-def logout_session(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def logout_session(request: Request, response: Response, db: Session = Depends(get_db), user: User = Depends(current_user)):
     source_ip = _login_source_ip(request)
     audit(db, user, "logout", "auth", detail=json.dumps({"username": user.username, "ip": source_ip, "result": "退出登录"}, ensure_ascii=False))
     db.commit()
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/", samesite="strict")
     return {"ok": True}
 
 
@@ -7285,15 +7298,9 @@ async def container_terminal_websocket(websocket: WebSocket, item_id: str, conta
     channel = None
     try:
         try:
-            payload = jwt.decode(token_value, settings.app_secret, algorithms=["HS256"])
-            user = db.get(User, payload.get("sub"))
-            issued_at = payload.get("iat")
-            changed_at = user.password_changed_at if user else None
-            if user and issued_at and changed_at:
-                changed_at = changed_at if changed_at.tzinfo else changed_at.replace(tzinfo=timezone.utc)
-                if datetime.fromtimestamp(int(issued_at), timezone.utc) < changed_at.replace(microsecond=0):
-                    user = None
-        except (JWTError, TypeError):
+            token_value = token_value or websocket.cookies.get(SESSION_COOKIE_NAME, "")
+            user = user_from_token(token_value, db)
+        except (HTTPException, JWTError, TypeError):
             user = None
         if not user or not user.active or user.role not in {Role.admin, Role.deployer}:
             await websocket.close(code=4401)

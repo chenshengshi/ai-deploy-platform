@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 from jose import jwt
 
-from app.auth import current_user
+from app.auth import user_from_token
 from app.config import settings
 from app.models import Role, SecurityConfig, User
 
@@ -46,7 +46,7 @@ class CurrentSessionPolicyTests(unittest.TestCase):
         token = make_token(self.user, now - timedelta(minutes=61), now + timedelta(hours=23))
 
         with self.assertRaises(HTTPException) as raised:
-            current_user(token=token, db=FakeSession(self.user, timeout_minutes=60))
+            user_from_token(token, FakeSession(self.user, timeout_minutes=60))
 
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(raised.exception.detail, "登录已超时，请重新登录")
@@ -55,7 +55,7 @@ class CurrentSessionPolicyTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         token = make_token(self.user, now - timedelta(minutes=59), now + timedelta(minutes=1))
 
-        result = current_user(token=token, db=FakeSession(self.user, timeout_minutes=60))
+        result = user_from_token(token, FakeSession(self.user, timeout_minutes=60))
 
         self.assertIs(result, self.user)
 
