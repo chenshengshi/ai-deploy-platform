@@ -27,9 +27,31 @@ from sqlalchemy import select, text
 
 from .config import decrypt, encrypt, settings
 from .ai import MANAGED_MINIO_FALLBACK, analyze_project_deployment, deployment_followup
+from .build_planning import (
+    PLATFORM_NGINX_IMAGE,
+    detect_java_log_directories,
+    ensure_java_runtime_directories,
+    normalize_inline_dockerfile,
+    optimize_maven_dependency_layer,
+    optimize_node_dependency_layer,
+    platform_spa_runtime_dockerfile,
+    runtime_stage_from_prebuilt_artifact,
+    source_declares_environment_optional,
+    strip_generated_code_fence,
+    valid_generated_dockerfile,
+)
 from .database import SessionLocal
 from .models import AiConfig, DeployStatus, Deployment, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, Project, ProjectDomainConfig, ProjectReplica, SourceType
 from .proxy import get_proxy_config, proxy_with_auth
+from .source_inspection import (
+    _select_runnable_jar,
+    detect_frontend_api_routes,
+    detect_frontend_public_base,
+    detect_java_version,
+    detect_spring_boot_version,
+    dockerfile_base_images,
+    enforce_nginx_pid_compatibility,
+)
 from .ssh import SSHNode
 
 
@@ -44,7 +66,6 @@ DOCKER_HUB_MIRROR_HOSTS = {
     "docker.nju.edu.cn", "dockerhub.icu", "docker.ckyl.me",
     "docker.awsl9527.cn", "hub-mirror.c.163.com",
 }
-PLATFORM_NGINX_IMAGE = "nginx:1.30.3-alpine"
 PLATFORM_REDIS_IMAGE = "redis:7.4-alpine"
 PLATFORM_MYSQL_IMAGE = "mysql:8.4"
 PLATFORM_POSTGRES_IMAGE = "postgres:16"
@@ -58,49 +79,10 @@ PLATFORM_IMAGE_VARIABLES = {
 }
 
 
-def _executable_jar_score(path: Path) -> tuple[int, int, int, str]:
-    """Rank runnable application JARs ahead of parent/library artifacts.
-
-    Maven reactors may emit several similarly named JARs.  Size and module
-    names are only tie breakers: the manifest is the authoritative evidence
-    that ``java -jar`` can start the selected artifact.
-    """
-    manifest = ""
-    try:
-        with zipfile.ZipFile(path) as archive:
-            manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", "ignore")
-    except (OSError, KeyError, zipfile.BadZipFile):
-        pass
-    executable = bool(re.search(r"(?im)^(?:Main-Class|Start-Class):\s*\S+", manifest))
-    spring_boot = bool(re.search(r"(?im)^Start-Class:\s*\S+", manifest))
-    return (
-        int(executable),
-        int(spring_boot),
-        path.stat().st_size if path.is_file() else 0,
-        path.as_posix(),
-    )
 
 
-def _select_runnable_jar(paths: list[Path]) -> Path | None:
-    candidates = [path for path in paths if path.is_file()]
-    return max(candidates, key=_executable_jar_score) if candidates else None
 
 
-def enforce_nginx_pid_compatibility(dockerfile_text: str) -> str:
-    """Let the Debian nginx image own its PID file; remove stale CLI overrides."""
-    from_lines = re.findall(
-        r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>\S+)",
-        dockerfile_text,
-    )
-    if not from_lines or not re.match(r"(?i)(?:[^/]+/)*nginx(?:[:@]|$)", from_lines[-1]):
-        return dockerfile_text
-
-    lines: list[str] = []
-    for line in dockerfile_text.splitlines():
-        if re.match(r"(?i)^\s*(?:CMD|ENTRYPOINT)\b", line):
-            line = re.sub(r"(?i)pid\s+[^;]+;\s*", "", line)
-        lines.append(line)
-    return "\n".join(lines).rstrip() + "\n"
 _SOURCE_CACHE_LOCKS: dict[str, threading.Lock] = {}
 _SOURCE_CACHE_LOCKS_GUARD = threading.Lock()
 _DEPLOYMENT_LOG_LOCKS: dict[str, threading.Lock] = {}
@@ -774,274 +756,18 @@ def detect_container_port(path: str, dockerfile_name: str = "Dockerfile") -> int
     return None
 
 
-def dockerfile_base_images(path: str, dockerfile_name: str) -> list[str]:
-    dockerfile = Path(path) / dockerfile_name
-    if not dockerfile.exists():
-        return []
-    images = []
-    for match in re.finditer(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]+)", dockerfile.read_text(errors="ignore")):
-        image = match.group(1).strip()
-        if image and "$" not in image and image.lower() != "scratch" and image not in images:
-            images.append(image)
-    return images
 
 
-def detect_java_version(path: str) -> int:
-    """Choose the project's declared Java level before generating a build image."""
-    root = Path(path)
-    values = []
-    for pom in list(root.rglob("pom.xml"))[:80]:
-        text = pom.read_text(errors="ignore")
-        for tag in ("java.version", "maven.compiler.source", "maven.compiler.target"):
-            values.extend(re.findall(rf"<{re.escape(tag)}>\s*([^<]+)\s*</{re.escape(tag)}>", text, re.I))
-    for value in values:
-        match = re.search(r"(?:1\.)?(8|11|17|21)", value.strip())
-        if match:
-            return int(match.group(1))
-    # JDK 17 is the broadly compatible modern default. JDK 21 is too new for
-    # many legacy Lombok/compiler combinations and should only be explicit.
-    return 17
 
 
-def detect_spring_boot_version(path: str) -> str | None:
-    """Return an explicit Spring Boot version declared by Maven source."""
-    root = Path(path)
-    texts = [pom.read_text(encoding="utf-8", errors="ignore") for pom in list(root.rglob("pom.xml"))[:80]]
-    patterns = (
-        r"<spring-boot\.version>\s*([^<\s]+)\s*</spring-boot\.version>",
-        r"<artifactId>spring-boot-starter-parent</artifactId>[\s\S]{0,240}?<version>\s*([^<\s]+)",
-        r"<artifactId>spring-boot-dependencies</artifactId>[\s\S]{0,240}?<version>\s*([^<\s]+)",
-    )
-    for pattern in patterns:
-        for text in texts:
-            match = re.search(pattern, text, re.I)
-            if match and re.match(r"^\d+(?:\.\d+){1,3}(?:[-.][A-Za-z0-9]+)*$", match.group(1)):
-                return match.group(1)
-    return None
 
 
-_FRONTEND_API_ENV_KEYS = (
-    "VUE_APP_BASE_API", "VITE_API_BASE_URL", "VITE_BASE_API",
-    "API_BASE_URL", "API_PREFIX",
-)
 
 
-def _public_path_from_value(value: str) -> str | None:
-    """Return a usable public URL prefix without guessing one.
-
-    A bare external origin (for example ``https://api.example.com``) contains
-    no path evidence and is deliberately ignored.  The caller must then use
-    another source signal such as the production dotenv file or an Nginx
-    location instead of silently inventing ``/api``.
-    """
-    raw = str(value or "").strip().strip("'\"").rstrip(";,)")
-    if not raw or any(token in raw for token in ("${", "$VITE_", "$VUE_", "{{")):
-        return None
-    if raw.startswith(("http://", "https://", "//")):
-        parsed = urlsplit("https:" + raw if raw.startswith("//") else raw)
-        raw = parsed.path or ""
-    if not raw.startswith("/") or raw == "/":
-        return None
-    raw = re.sub(r"/{2,}", "/", raw.split("?", 1)[0].split("#", 1)[0])
-    # These are page/static paths, not API gateway prefixes.
-    if raw.lower().startswith(("/assets/", "/static/", "/public/", "/src/")):
-        return None
-    return raw.rstrip("/") or None
 
 
-def detect_frontend_api_routes(path: str) -> dict:
-    """Detect the one effective frontend API prefix from source evidence.
-
-    The detector ranks runtime configuration, production dotenv files,
-    request-client ``baseURL`` values and Nginx proxy locations.  It returns a
-    single primary route rather than publishing every development/staging
-    alias found in the repository.
-    """
-    root = Path(path)
-    ignored = {".git", "node_modules", "target", "dist", "build", ".venv", "vendor"}
-    candidates: dict[str, dict] = {}
-
-    def add(value: str, score: int, source: str, strip_prefix: bool | None = None) -> None:
-        public_path = _public_path_from_value(value)
-        if not public_path:
-            return
-        # Production is stronger evidence than development/staging aliases.
-        lowered = public_path.lower()
-        adjusted = score + (8 if "prod" in lowered else 0) - (8 if any(x in lowered for x in ("stage", "dev", "test")) else 0)
-        row = candidates.setdefault(public_path, {
-            "path": public_path,
-            "score": adjusted,
-            "strip_prefix": strip_prefix,
-            "evidence": [],
-        })
-        if adjusted > int(row["score"]):
-            row["score"] = adjusted
-        if strip_prefix is not None:
-            row["strip_prefix"] = strip_prefix
-        if source not in row["evidence"]:
-            row["evidence"].append(source)
-
-    env_pattern = re.compile(
-        rf"(?m)^\s*(?:{'|'.join(map(re.escape, _FRONTEND_API_ENV_KEYS))})\s*=\s*([^\r\n#]+)"
-    )
-    production_origin_sources: list[str] = []
-    staged_relative_routes: list[tuple[str, str]] = []
-    for env_file in root.rglob(".env*"):
-        if not env_file.is_file() or any(part in ignored for part in env_file.relative_to(root).parts):
-            continue
-        relative = env_file.relative_to(root).as_posix()
-        name = env_file.name.lower()
-        score = 96 if "production" in name or name in {".env", ".env.local"} else 68
-        text_value = env_file.read_text(encoding="utf-8", errors="replace")
-        for match in env_pattern.finditer(text_value):
-            raw_value = match.group(1).strip().strip("'\"")
-            relative_path = _public_path_from_value(raw_value)
-            if "production" in name and raw_value.startswith(("http://", "https://", "//")) and not relative_path:
-                # A production frontend that points at a bare legacy API
-                # origin still needs a same-origin path when the platform
-                # takes over routing.  Keep that fact as evidence; do not
-                # silently fall back to a global /api convention.
-                production_origin_sources.append(relative)
-            if "staging" in name and relative_path:
-                staged_relative_routes.append((relative_path, relative))
-            add(raw_value, score, relative)
-
-    # Vue CLI projects commonly keep production on a legacy absolute API
-    # origin while the staging file describes the intended gateway path (for
-    # example /stage-api).  `npm run build` selects .env.production, so expose
-    # neither the staging route nor a guessed /api route.  Derive the matching
-    # production path from both pieces of source evidence instead.
-    if production_origin_sources:
-        for staged_path, staged_source in staged_relative_routes:
-            production_path = re.sub(r"(?i)(?:stage|staging)", "prod", staged_path)
-            if production_path != staged_path:
-                evidence = f"{production_origin_sources[0]} + {staged_source}（生产外部域名按同项目环境命名归一）"
-                add(production_path, 106, evidence, True)
-
-    for runtime_config in root.rglob("postUrl.js"):
-        if not runtime_config.is_file() or any(part in ignored for part in runtime_config.relative_to(root).parts):
-            continue
-        relative = runtime_config.relative_to(root).as_posix()
-        text_value = runtime_config.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(r"(?m)^\s*(?:const|let|var)\s+IP\s*=\s*['\"]([^'\"]+)['\"]", text_value):
-            add(match.group(1), 105, relative)
-
-    source_suffixes = {".js", ".jsx", ".ts", ".tsx", ".vue", ".mjs", ".cjs"}
-    for source_file in root.rglob("*"):
-        if not source_file.is_file() or source_file.suffix.lower() not in source_suffixes:
-            continue
-        if any(part in ignored for part in source_file.relative_to(root).parts) or source_file.stat().st_size > 1_000_000:
-            continue
-        relative = source_file.relative_to(root).as_posix()
-        text_value = source_file.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(r"\bbaseURL\s*:\s*['\"]([^'\"]+)['\"]", text_value):
-            add(match.group(1), 88, relative)
-
-    nginx_names = {"nginx.conf", "default.conf"}
-    for config_file in root.rglob("*"):
-        if not config_file.is_file() or (config_file.name not in nginx_names and config_file.suffix.lower() != ".conf"):
-            continue
-        if any(part in ignored for part in config_file.relative_to(root).parts) or config_file.stat().st_size > 1_000_000:
-            continue
-        relative = config_file.relative_to(root).as_posix()
-        text_value = config_file.read_text(encoding="utf-8", errors="replace")
-        # This bounded block matcher covers ordinary generated/hand-written
-        # location blocks without trying to implement a complete Nginx parser.
-        for match in re.finditer(r"location\s+(?:\^~\s+|=\s+|~\*?\s+)?(?P<path>/[^\s{]*)\s*\{(?P<body>[^{}]*)\}", text_value, re.I | re.S):
-            body = match.group("body")
-            proxy = re.search(r"proxy_pass\s+(?P<url>https?://[^;\s]+)\s*;", body, re.I)
-            if proxy:
-                # Nginx only removes the matched public prefix when the
-                # proxy_pass URI is the upstream root.  A target such as
-                # ``location /api/ { proxy_pass http://backend/api/; }`` keeps
-                # /api/ and must not be represented as strip_prefix=true.
-                # A proxy_pass without a URI also preserves the full request.
-                location_path = match.group("path")
-                upstream_path = urlsplit(proxy.group("url")).path
-                strip_prefix = bool(
-                    location_path != "/" and upstream_path == "/"
-                )
-                add(location_path, 82, relative, strip_prefix)
-
-    if not candidates:
-        return {"primary_path": None, "routes": [], "evidence": []}
-    selected = max(candidates.values(), key=lambda row: (int(row["score"]), len(row["evidence"]), -len(row["path"])))
-    public_path = str(selected["path"]).rstrip("/")
-    return {
-        "primary_path": public_path,
-        "routes": [{
-            "path": public_path + "/",
-            # Preserve an observed public prefix unless a production proxy
-            # rule explicitly proves that it is only an external alias. A
-            # guessed strip silently turns valid backend routes into frontend
-            # HTML responses and is much harder to diagnose than a 404.
-            "strip_prefix": False if selected["strip_prefix"] is None else bool(selected["strip_prefix"]),
-        }],
-        "evidence": list(selected["evidence"]),
-        "candidates": sorted(
-            ({"path": row["path"], "score": row["score"], "evidence": row["evidence"]} for row in candidates.values()),
-            key=lambda row: (-int(row["score"]), row["path"]),
-        ),
-    }
 
 
-def detect_frontend_public_base(path: str) -> dict:
-    """Detect a non-root frontend mount from production source evidence.
-
-    API prefixes and the frontend mount are different contracts.  A project
-    can request ``/app/api/v1`` while its static SPA itself must be served from
-    ``/app/``.  Only production dotenv/config evidence is accepted here; no
-    project-wide default is invented.
-    """
-    root = Path(path)
-    ignored = {".git", "node_modules", "target", "dist", "build", ".venv", "vendor"}
-    candidates: dict[str, dict] = {}
-
-    def add(value: str, score: int, source: str) -> None:
-        raw = str(value or "").strip().strip("'\"").split("?", 1)[0].split("#", 1)[0]
-        if not raw.startswith("/") or raw == "/":
-            return
-        normalized = "/" + raw.strip("/") + "/"
-        row = candidates.setdefault(normalized, {"path": normalized, "score": score, "evidence": []})
-        row["score"] = max(int(row["score"]), score)
-        if source not in row["evidence"]:
-            row["evidence"].append(source)
-
-    env_pattern = re.compile(
-        r"(?m)^\s*(?:VITE_APP_BASE|BASE_URL|PUBLIC_URL|VUE_APP_PUBLIC_PATH)\s*=\s*([^\r\n#]+)"
-    )
-    for env_file in root.rglob(".env*"):
-        if not env_file.is_file() or any(part in ignored for part in env_file.relative_to(root).parts):
-            continue
-        name = env_file.name.lower()
-        if "production" not in name and name not in {".env", ".env.local"}:
-            continue
-        relative = env_file.relative_to(root).as_posix()
-        text_value = env_file.read_text(encoding="utf-8", errors="replace")
-        for match in env_pattern.finditer(text_value):
-            add(match.group(1), 120 if "production" in name else 95, relative)
-
-    # A production Nginx static location corroborates the dotenv value.  It is
-    # deliberately not sufficient on its own because many repositories retain
-    # obsolete deployment examples beside the current application.
-    for config_file in root.rglob("*.conf"):
-        if not config_file.is_file() or any(part in ignored for part in config_file.relative_to(root).parts):
-            continue
-        relative = config_file.relative_to(root).as_posix()
-        text_value = config_file.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(r"location\s+(?:\^~\s+|=\s+)?(?P<path>/[^\s{]+)\s*\{(?P<body>[^{}]*)\}", text_value, re.I | re.S):
-            body = match.group("body")
-            if "proxy_pass" not in body and re.search(r"\b(?:root|alias|try_files)\b", body):
-                add(match.group("path"), 70, relative)
-
-    if not candidates:
-        return {"primary_path": "/", "evidence": []}
-    selected = max(candidates.values(), key=lambda row: (int(row["score"]), len(row["evidence"])))
-    # Require production environment evidence. This prevents an old Nginx
-    # sample from moving an otherwise root-hosted application unexpectedly.
-    if not any(".env" in source for source in selected["evidence"]):
-        return {"primary_path": "/", "evidence": []}
-    return {"primary_path": selected["path"], "evidence": list(selected["evidence"])}
 
 
 def optimize_staged_sources(path: str) -> list[str]:
@@ -2404,419 +2130,24 @@ volumes:
     raise RuntimeError("无法从源码安全生成平台构建文件，请重新执行 AI 源码分析")
 
 
-def source_declares_environment_optional(path: str, variable: str) -> bool:
-    """Confirm from executable source that an environment variable has a fallback or is optional."""
-    root = Path(path)
-    escaped = re.escape(variable)
-    # Example environment files are part of the project's configuration
-    # contract. A commented or empty assignment explicitly documents that the
-    # application may run without the integration; AI must not promote it to
-    # a required Compose secret.
-    example_assignment = re.compile(
-        rf"(?m)^\s*#?\s*(?:export\s+)?{escaped}\s*=\s*(?:['\"]\s*['\"])?\s*(?:#.*)?$"
-    )
-    for pattern in (".env.example", ".env.sample", ".env.template", "*.env.example", "*.env.sample"):
-        for file in root.rglob(pattern):
-            if not file.is_file() or any(part in {".git", "node_modules", "dist", "build"} for part in file.parts):
-                continue
-            try:
-                if example_assignment.search(file.read_text(encoding="utf-8", errors="ignore")):
-                    return True
-            except OSError:
-                continue
-    access_with_fallback = re.compile(
-        rf"(?:process\.env|values|env|config)\s*(?:\.\s*{escaped}\b|\[\s*['\"]{escaped}['\"]\s*\])[^\n]{{0,120}}?(?:\|\||\?\?)"
-    )
-    schema_optional = re.compile(rf"\b{escaped}\b\s*:[^\n]{{0,160}}?\.optional\s*\(")
-    for file in root.rglob("*"):
-        if (not file.is_file() or file.name.startswith(".yunzhou") or
-                file.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".java", ".go", ".rs"} or
-                any(part in {".git", "node_modules", "dist", "build", "target", "vendor"} for part in file.parts)):
-            continue
-        try:
-            if file.stat().st_size > 2_000_000:
-                continue
-            source = file.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        if access_with_fallback.search(source) or schema_optional.search(source):
-            return True
-    return False
 
 
-def strip_generated_code_fence(value: str) -> str:
-    text = str(value or "").strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1] if "\n" in text else ""
-        text = text.rsplit("```", 1)[0].strip()
-    return text
 
 
-def valid_generated_dockerfile(value: str) -> bool:
-    """Reject YAML/Compose accidentally returned in the Dockerfile field."""
-    instructions = []
-    continued = False
-    for raw_line in value.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if continued:
-            continued = line.endswith("\\")
-            continue
-        token = line.split(None, 1)[0].upper()
-        instructions.append(token)
-        continued = line.endswith("\\")
-    allowed = {
-        "ADD", "ARG", "CMD", "COPY", "ENTRYPOINT", "ENV", "EXPOSE", "FROM",
-        "HEALTHCHECK", "LABEL", "MAINTAINER", "ONBUILD", "RUN", "SHELL",
-        "STOPSIGNAL", "USER", "VOLUME", "WORKDIR",
-    }
-    return bool(instructions) and instructions[0] in {"ARG", "FROM"} and "FROM" in instructions and all(item in allowed for item in instructions)
 
 
-def normalize_inline_dockerfile(value: str) -> str:
-    """Keep quoted shell text on one Dockerfile instruction line."""
-    lines = value.splitlines()
-    normalized = []
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if line.lstrip().upper().startswith("RUN "):
-            # AI occasionally places a literal newline inside a single-quoted
-            # printf argument. Docker then treats the following quote as a new
-            # instruction. Preserve the intended newline as the two characters
-            # backslash+n and keep the RUN instruction valid.
-            while line.count("'") % 2 == 1 and index + 1 < len(lines):
-                index += 1
-                line += r"\n" + lines[index].lstrip()
-        normalized.append(line)
-        index += 1
-    result = "\n".join(normalized).rstrip() + "\n"
-    # The platform never permits BuildKit-only Dockerfile features.  Convert
-    # AI/user inline files to classic syntax before validation/build.  Cache
-    # mounts are replaced by normal RUN commands; dependency reuse is handled
-    # by the platform-wide host caches and classic image layers.
-    result = re.sub(r"(?im)^\s*#\s*syntax=docker/dockerfile[^\n]*\n?", "", result)
-    result = re.sub(
-        r"(?m)^(\s*RUN)\s+--mount=type=cache(?:,[^\s]+)*\s+",
-        r"\1 ",
-        result,
-    )
-    # Corepack does not reliably resolve a bare package-manager major release
-    # (for example `pnpm@8`) on older Node images. Pin known compatible patch
-    # releases so generated builds are reproducible and do not fail after all
-    # base layers and Maven dependencies have already been downloaded.
-    pnpm_versions = {"7": "7.33.7", "8": "8.15.9", "9": "9.15.9", "10": "10.20.0"}
-    result = re.sub(
-        r"(?i)(corepack\s+prepare\s+pnpm@)(7|8|9|10)(?=\s|--)",
-        lambda match: match.group(1) + pnpm_versions[match.group(2)],
-        result,
-    )
-    return result
 
 
-def optimize_node_dependency_layer(root: Path, dockerfile: str) -> str:
-    """Keep package installation cacheable when only application source changes.
-
-    AI plans commonly emit ``COPY frontend/ ./`` followed by one RUN containing
-    both install and build.  That invalidates the dependency layer for every
-    source edit.  For a regular (non-workspace) package directory we can safely
-    split it into manifest -> install -> source -> build layers.  Docker's
-    classic builder can then reuse the install layer without a project cache
-    directory or BuildKit cache mount.
-    """
-    copy_run = re.compile(
-        r"(?im)^(?P<indent>\s*)COPY\s+(?P<src>[^\s]+?)/?\s+\./?\s*\n"
-        r"(?P=indent)RUN\s+(?P<command>(?:[^\n]*\\\n[ \t]*)*[^\n]*)$"
-    )
-
-    def replace(match: re.Match) -> str:
-        source = match.group("src").strip().strip('"').rstrip("/")
-        command = re.sub(r"\\\n[ \t]*", " ", match.group("command")).strip()
-        if not re.search(r"\b(?:npm|pnpm|yarn)\s+(?:install|i|ci)\b", command, re.I):
-            return match.group(0)
-        build_match = re.search(r"\s*&&\s*((?:npm|pnpm|yarn)\s+(?:run\s+)?build\b.*)$", command, re.I)
-        if not build_match:
-            return match.group(0)
-        package_dir = (root / source).resolve()
-        if root not in package_dir.parents or not (package_dir / "package.json").is_file():
-            return match.group(0)
-        # Workspace installs may depend on sibling manifests; retain the AI
-        # layout in that case instead of producing an incomplete cache layer.
-        try:
-            package_data = json.loads((package_dir / "package.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            package_data = {}
-        if package_data.get("workspaces"):
-            return match.group(0)
-        manifests = ["package.json", "pnpm-lock.yaml", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock"]
-        existing = [name for name in manifests if (package_dir / name).is_file()]
-        if not existing:
-            return match.group(0)
-        install_command = command[:build_match.start()].rstrip()
-        build_command = build_match.group(1).strip()
-        indent = match.group("indent")
-        manifest_sources = " ".join(f"{source}/{name}" for name in existing)
-        return (
-            f"{indent}COPY {manifest_sources} ./\n"
-            f"{indent}RUN {install_command}\n"
-            f"{indent}COPY {source}/ ./\n"
-            f"{indent}RUN {build_command}"
-        )
-
-    return copy_run.sub(replace, dockerfile)
 
 
-def optimize_maven_dependency_layer(root: Path, dockerfile: str) -> str:
-    """Use the mainland mirror without adding a separate warm-up build."""
-    if not re.search(r"(?im)^\s*FROM\s+\S*maven[:@]", dockerfile) or not re.search(r"\bmvn\b", dockerfile):
-        return dockerfile
-    settings_name = ".yunzhou.maven-settings.xml"
-    (root / settings_name).write_text(
-        '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">'
-        '<mirrors><mirror><id>yunzhou-mirror</id><mirrorOf>*</mirrorOf>'
-        '<name>Yunzhou Maven Mirror</name><url>https://maven.aliyun.com/repository/public</url>'
-        '</mirror></mirrors></settings>',
-        encoding="utf-8",
-    )
-    stages = re.split(r"(?im)(?=^\s*FROM\s+)", dockerfile)
-    for index, stage in enumerate(stages):
-        if not re.search(r"(?im)^\s*FROM\s+\S*maven[:@]", stage) or not re.search(r"(?im)^\s*RUN\s+.*\bmvn\b", stage):
-            continue
-        if settings_name not in stage:
-            from_line = re.search(r"(?im)^\s*FROM[^\n]*\n", stage)
-            if from_line:
-                stage = stage[:from_line.end()] + f"COPY {settings_name} /tmp/yunzhou-maven-settings.xml\n" + stage[from_line.end():]
-        stage = re.sub(
-            r"(?im)^(\s*RUN\s+)mvn\b(?!\s+-s\b)",
-            r"\1mvn -s /tmp/yunzhou-maven-settings.xml",
-            stage,
-        )
-        # Analysis must never add or preserve an extra dependency warm-up.
-        # The single authoritative package command fills the mounted cache.
-        stage = re.sub(
-            r"(?im)^\s*RUN\s+[^\n]*\bdependency:go-offline\b[^\n]*\n?",
-            "",
-            stage,
-        )
-        stages[index] = stage
-    return "".join(stages)
 
 
-def detect_java_log_directories(root: Path) -> list[str]:
-    """Find absolute writable log directories declared by Java configs."""
-    directories: set[str] = set()
-    allowed_suffixes = {".xml", ".yml", ".yaml", ".properties"}
-    for path in root.rglob("*"):
-        if (
-            not path.is_file()
-            or path.suffix.lower() not in allowed_suffixes
-            or any(part in {".git", "target", "build", "node_modules"} for part in path.parts)
-        ):
-            continue
-        try:
-            if path.stat().st_size > 2_000_000:
-                continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        # Logback commonly declares paths as
-        # <property name="log.path" value="/var/log/app"/>.  Parse the
-        # name/value pair explicitly so the quote after name is not mistaken
-        # for the value delimiter.
-        for match in re.finditer(
-            r"(?i)name\s*=\s*[\"'](?:log\.path|logging\.file\.path)[\"'][^>]*?"
-            r"value\s*=\s*[\"'](/[^\"'<>]+)",
-            text,
-        ):
-            value = match.group(1).rstrip("/.,;\"")
-            if value.startswith("/") and "${" not in value:
-                directories.add(value)
-        for match in re.finditer(
-            r"(?im)^\s*(?:log\.path|logging\.file\.path)\s*[:=]\s*[\"']?(/[^\s\"'<>]+)",
-            text,
-        ):
-            value = match.group(1).rstrip("/.,;\"")
-            if value.startswith("/") and "${" not in value:
-                directories.add(value)
-        for match in re.finditer(r"(/(?:[A-Za-z0-9._-]+/)+)(?:[^/\s\"'<>]+\.log)\b", text):
-            directories.add(match.group(1).rstrip("/"))
-    return sorted(value for value in directories if value not in {"/", "/tmp"})[:12]
 
 
-def ensure_java_runtime_directories(runtime: str, context: Path) -> str:
-    if not re.search(r"(?i)(?:java\s+-jar|ENTRYPOINT\s*\[\s*[\"']java)", runtime):
-        return runtime
-    directories = detect_java_log_directories(context)
-    if not directories:
-        return runtime
-    command = "RUN mkdir -p " + " ".join(shlex.quote(value) for value in directories)
-    command += " && chmod 0777 " + " ".join(shlex.quote(value) for value in directories) + "\n"
-    from_line = re.search(r"(?im)^\s*FROM[^\n]*\n", runtime)
-    if not from_line:
-        return runtime
-    return runtime[:from_line.end()] + command + runtime[from_line.end():]
 
 
-def platform_spa_runtime_dockerfile(image: str, artifact: str, public_base: str = "/") -> str:
-    """Return the platform-owned static SPA runtime.
-
-    Repository/AI Nginx snippets are evidence only.  Every static frontend
-    gets the same route fallback, conservative caching and version hiding so
-    a direct refresh such as /login never becomes an Nginx 404.
-    """
-    source = artifact.rstrip("/") + "/"
-    normalized_base = "/" + str(public_base or "/").strip("/")
-    base_config = ""
-    if normalized_base != "/":
-        base_config = (
-            f"      '    location = {normalized_base} {{ return 301 {normalized_base}/; }}' \\\n"
-            f"      '    location {normalized_base}/ {{ rewrite ^{re.escape(normalized_base)}/(.*)$ /$1 break; try_files $uri $uri/ /index.html; }}' \\\n"
-        )
-    return (
-        f"FROM {image}\n"
-        "RUN rm -f /etc/nginx/conf.d/default.conf \\\n"
-        " && printf '%s\\n' \\\n"
-        "      'server {' \\\n"
-        "      '    listen 80 default_server;' \\\n"
-        "      '    listen [::]:80 default_server;' \\\n"
-        "      '    server_name _;' \\\n"
-        "      '    server_tokens off;' \\\n"
-        "      '    root /usr/share/nginx/html;' \\\n"
-        "      '    index index.html;' \\\n"
-        "      '    charset utf-8;' \\\n"
-        + base_config
-        + "      '    location / { try_files $uri $uri/ /index.html; }' \\\n"
-        "      '}' \\\n"
-        "    > /etc/nginx/conf.d/app.conf \\\n"
-        " && nginx -t\n"
-        f"COPY {source} /usr/share/nginx/html/\n"
-        "EXPOSE 80\n"
-        'CMD ["nginx", "-g", "daemon off;"]\n'
-    )
 
 
-def runtime_stage_from_prebuilt_artifact(
-    dockerfile_text: str, context: Path, artifact_paths: list[str], output_name: str,
-    target: str | None = None,
-) -> tuple[str, list[str]] | None:
-    """Convert a conventional multi-stage Dockerfile to a runtime-only one.
-
-    The compilation has already happened in a disposable toolchain container
-    with host-mounted dependency caches.  Only COPY --from lines whose source
-    can be mapped to a real artifact in the checkout are rewritten.  Returning
-    None leaves unusual Dockerfiles untouched instead of guessing.
-    """
-    stages = list(re.finditer(r"(?im)^\s*FROM\s+", dockerfile_text))
-    if len(stages) < 2:
-        return None
-    if target:
-        target_match = re.search(
-            rf"(?im)^\s*FROM\s+\S+\s+AS\s+{re.escape(target)}\s*$",
-            dockerfile_text,
-        )
-        if not target_match:
-            return None
-        next_stage = next((item.start() for item in stages if item.start() > target_match.start()), len(dockerfile_text))
-        runtime = dockerfile_text[target_match.start():next_stage]
-    else:
-        runtime = dockerfile_text[stages[-1].start():]
-    copied: list[str] = []
-    pattern = re.compile(
-        r"(?im)^(?P<indent>\s*)COPY\s+(?P<flags_before>(?:--\S+\s+)*)--from=\S+\s+"
-        r"(?P<flags_after>(?:--\S+\s+)*)(?P<src>\S+)\s+(?P<dest>\S+)\s*$"
-    )
-
-    def replace(match: re.Match) -> str:
-        source = match.group("src").strip('"\'').rstrip("/")
-        candidates: list[Path] = []
-        source_name = Path(source).name
-        for value in artifact_paths:
-            base = context / value
-            if base.exists() and (not source_name or base.name == source_name):
-                candidates.append(base)
-        if not candidates and source_name:
-            candidates.extend(path for path in context.rglob(source_name) if path.exists())
-        if not candidates and source.lower().endswith(".jar"):
-            # Multi-module Maven plans commonly normalize their builder output
-            # to app.jar while the host-built artifact keeps the module name.
-            # Reuse the largest compiled JAR instead of running Maven again.
-            jar_candidates = [
-                context / value for value in artifact_paths
-                if str(value).lower().endswith(".jar") and (context / value).is_file()
-            ]
-            selected = _select_runnable_jar(jar_candidates)
-            if selected and _executable_jar_score(selected)[0]:
-                candidates.append(selected)
-        if source.lower().endswith(".jar"):
-            # Never turn a multi-stage Java build into a runtime-only image
-            # using a plain reactor/library JAR.  If the host-side Maven pass
-            # has not produced a runnable artifact, preserve the original
-            # Dockerfile so its explicit Spring Boot repackage/bootJar stage
-            # can finish the job.
-            candidates = [path for path in candidates if _executable_jar_score(path)[0]]
-        if not candidates:
-            return match.group(0)
-        artifact = candidates[0]
-        relative = artifact.relative_to(context).as_posix()
-        copied.append(relative)
-        suffix = "/" if artifact.is_dir() else ""
-        direct_flags = (match.group("flags_before") or "") + (match.group("flags_after") or "")
-        return f'{match.group("indent")}COPY {direct_flags}{relative}{suffix} {match.group("dest")}'
-
-    runtime = pattern.sub(replace, runtime)
-    if not copied or "--from=" in runtime:
-        return None
-    # Static frontends are served by a platform-owned Nginx runtime.  AI plans
-    # may describe the correct topology while still emitting a subtly broken
-    # shell-generated config (for example a missing final ``}`` in server{}).
-    # Once the frontend artifact has been built successfully there is no value
-    # in carrying that generated shell fragment forward.  Replace the entire
-    # runtime stage with one small, deterministic SPA server.  API routing is
-    # owned by the platform gateway, so the frontend container never proxies
-    # backend traffic itself.
-    from_match = re.search(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?nginx:[^\s]+.*$", runtime)
-    artifact = next(
-        (
-            value for value in copied
-            if (context / value).is_dir()
-            and Path(value).name.lower() in {"dist", "build", "out", "public"}
-        ),
-        None,
-    )
-    if from_match and artifact:
-        image_match = re.search(r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>nginx:[^\s]+)", from_match.group(0))
-        image = image_match.group("image") if image_match else PLATFORM_NGINX_IMAGE
-        runtime = platform_spa_runtime_dockerfile(
-            image, artifact, detect_frontend_public_base(str(context)).get("primary_path") or "/"
-        )
-        return runtime, [artifact]
-    # AI-generated nginx stages sometimes create the configuration with one
-    # ``RUN echo`` instruction per line.  The classic builder then has to
-    # create and commit dozens of tiny layers even though the commands are a
-    # single logical operation.  Merge only consecutive generated echo
-    # instructions; arbitrary RUN commands keep their original boundaries.
-    runtime_lines = runtime.splitlines()
-    compact_lines: list[str] = []
-    echo_commands: list[str] = []
-
-    def flush_echo_commands() -> None:
-        if not echo_commands:
-            return
-        compact_lines.append("RUN " + " && \\\n    ".join(echo_commands))
-        echo_commands.clear()
-
-    for line in runtime_lines:
-        echo_match = re.match(r"^\s*RUN\s+(echo\s+.+)$", line)
-        if echo_match:
-            echo_commands.append(echo_match.group(1))
-            continue
-        flush_echo_commands()
-        compact_lines.append(line)
-    flush_echo_commands()
-    runtime = "\n".join(compact_lines)
-    runtime = ensure_java_runtime_directories(runtime, context)
-    return runtime.rstrip() + "\n", copied
 
 
 def reconcile_compose_build_targets(root: Path, compose: dict) -> list[str]:
