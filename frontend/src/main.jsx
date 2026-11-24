@@ -198,7 +198,10 @@ function BrandLogo({ branding, large = false }) {
 }
 
 function Login({ onDone, branding }) {
-  const [form, setForm] = useState({ username: "admin", password: "" });
+  const [form, setForm] = useState(() => ({
+    username: localStorage.getItem("yunzhou_last_username") || "",
+    password: "",
+  }));
   const [showPassword, setShowPassword] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
