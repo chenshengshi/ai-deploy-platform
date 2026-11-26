@@ -2986,6 +2986,7 @@ def ensure_managed_secrets(project: Project, compose_path: str, compose_file: st
         # platform-owned credential as JWT_SECRET and must never require the
         # user to invent a value during a managed-fresh deployment.
         "SIGNINGKEY", "SIGNING_KEY", "PRIVATE_KEY", "ENCRYPTION_KEY",
+        "ENC_KEY", "HASH_SALT",
     )
     # Compose permits `${JWT_SECRET:-}` and similar optional-empty defaults.
     # They are syntactically valid but almost never operationally valid for a
