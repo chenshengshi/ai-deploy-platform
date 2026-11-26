@@ -6087,9 +6087,11 @@ def central_build_and_distribute(
                 # also bloat or contaminate the Docker context.
                 for generated in ("node_modules", ".pnpm-store", "dist", "build"):
                     pattern = f"{top}/{generated}"
-                    if pattern not in lines:
-                        lines.append(pattern)
-                        added.append(pattern)
+                    # Docker ignore rules are order-sensitive.  Append even
+                    # when the repository already contains the same pattern:
+                    # the preceding ``!top/**`` would otherwise re-include it.
+                    lines.append(pattern)
+                    added.append(pattern)
             if added:
                 ignore_file.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
             return added
