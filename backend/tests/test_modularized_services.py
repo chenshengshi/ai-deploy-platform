@@ -10,7 +10,11 @@ from app.build_planning import (
     valid_generated_dockerfile,
 )
 from app.config import settings
-from app.deployer import _compose_service_mapping, _public_path_from_value as deployer_public_path_from_value
+from app.deployer import (
+    _compose_service_mapping,
+    _public_path_from_value as deployer_public_path_from_value,
+    analyze_repository_topology,
+)
 from app.main import app
 from app.source_inspection import (
     detect_frontend_api_routes,
@@ -70,6 +74,43 @@ class SourceInspectionModuleTests(unittest.TestCase):
 
 
 class BuildPlanningModuleTests(unittest.TestCase):
+    def test_multistage_fullstack_dockerfile_is_valid_single_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frontend").mkdir()
+            (root / "backend").mkdir()
+            (root / "frontend" / "package.json").write_text(
+                '{"scripts":{"build":"vite build"},"devDependencies":{"vite":"5"}}',
+                encoding="utf-8",
+            )
+            (root / "backend" / "requirements.txt").write_text("fastapi", encoding="utf-8")
+            (root / "Dockerfile").write_text(
+                "FROM node:22 AS web\nCOPY frontend/package.json ./\nRUN npm run build\n"
+                "FROM python:3.12\nCOPY backend/ ./\nCOPY --from=web /app/dist /app/frontend/dist\n"
+                'CMD ["python", "-m", "server"]\n',
+                encoding="utf-8",
+            )
+            topology = analyze_repository_topology(directory, "dockerfile", "Dockerfile")
+            self.assertEqual(topology["errors"], [])
+            self.assertIn("多阶段构建", topology["single_container_evidence"])
+
+    def test_plain_container_does_not_hide_unhandled_fullstack_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frontend").mkdir()
+            (root / "backend").mkdir()
+            (root / "frontend" / "package.json").write_text(
+                '{"scripts":{"build":"vite build"},"devDependencies":{"vite":"5"}}',
+                encoding="utf-8",
+            )
+            (root / "backend" / "requirements.txt").write_text("fastapi", encoding="utf-8")
+            (root / "Dockerfile").write_text(
+                'FROM python:3.12\nCOPY . .\nCMD ["python", "app.py"]\n',
+                encoding="utf-8",
+            )
+            topology = analyze_repository_topology(directory, "dockerfile", "Dockerfile")
+            self.assertTrue(topology["errors"])
+
     def test_compose_service_mapping_accepts_compose_document(self):
         services = {"web": {"image": "nginx"}}
         self.assertEqual(_compose_service_mapping({"services": services}), services)

@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import yaml
 from sqlalchemy import update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .config import decrypt
@@ -382,15 +383,23 @@ def analyze_project_deployment(
     # a deployment.
     learned_ids = [row.id for row in learned_rows]
     if learned_ids:
-        db.execute(
-            update(DeploymentExperience)
-            .where(DeploymentExperience.id.in_(learned_ids))
-            .values(
-                use_count=DeploymentExperience.use_count + 1,
-                last_used_at=now,
-            )
-            .execution_options(synchronize_session=False)
-        )
+        try:
+            # This counter is telemetry, not analysis state.  Concurrent
+            # analyses can briefly lock the same experience rows; contain a
+            # timeout inside a savepoint so it can never downgrade the actual
+            # source analysis to "AI unavailable".
+            with db.begin_nested():
+                db.execute(
+                    update(DeploymentExperience)
+                    .where(DeploymentExperience.id.in_(sorted(learned_ids)))
+                    .values(
+                        use_count=DeploymentExperience.use_count + 1,
+                        last_used_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+        except SQLAlchemyError:
+            pass
     learned_experience = [{
         "category": row.category,
         "stage": row.stage,

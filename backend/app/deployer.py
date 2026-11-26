@@ -3445,7 +3445,31 @@ def analyze_repository_topology(path: str, build_type: str, build_file: str) -> 
             })
     else:
         plan["services"].append({"name": "app", "build": ".", "dockerfile": build_file, "image": None, "ports": []})
-        if frontend_roots and (java_roots or python_roots):
+        dockerfile_path = (root / build_file).resolve()
+        integrated_single_runtime = False
+        if dockerfile_path.is_file() and root in dockerfile_path.parents:
+            dockerfile_text = dockerfile_path.read_text(encoding="utf-8", errors="replace")
+            stages = re.findall(r"(?im)^\s*FROM\s+\S+(?:\s+AS\s+\S+)?\s*$", dockerfile_text)
+            integrates_build_output = bool(re.search(r"(?im)^\s*COPY\s+--from=\S+\s+", dockerfile_text))
+            frontend_evidence = bool(re.search(
+                r"(?i)(?:\bfrontend/|package(?:-lock)?\.json|npm\s+(?:run\s+)?build|/dist\b)",
+                dockerfile_text,
+            ))
+            backend_evidence = bool(re.search(
+                r"(?i)(?:\bbackend/|requirements\.txt|pyproject\.toml|pom\.xml|\.jar\b)",
+                dockerfile_text,
+            ))
+            runtime_entrypoint = bool(re.search(r"(?im)^\s*(?:CMD|ENTRYPOINT)\b", dockerfile_text))
+            integrated_single_runtime = (
+                len(stages) >= 2
+                and integrates_build_output
+                and frontend_evidence
+                and backend_evidence
+                and runtime_entrypoint
+            )
+            if integrated_single_runtime:
+                plan["single_container_evidence"] = "Dockerfile 多阶段构建已将前端产物合并到最终后端运行镜像"
+        if frontend_roots and (java_roots or python_roots) and not integrated_single_runtime:
             plan["errors"].append("同时发现前端和后端源码，但当前方案只有一个普通应用容器")
     plan["persistent_mounts"] = sorted(set(plan["persistent_mounts"]))
     return plan
