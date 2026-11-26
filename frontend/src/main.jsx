@@ -177,7 +177,7 @@ function projectCardState(project, deployments, startingIds = new Set()) {
   if (stopped) return { kind: "stopped", label: "已停止", action: "重新启用", deployment: stopped };
   const latest = records[0];
   if (latest?.status === "failed") {
-    return { kind: "error", label: "有异常", action: "查看原因", deployment: latest };
+    return { kind: "error", label: "上次发布失败", action: "查看原因", deployment: latest };
   }
   if (latest?.status === "stopped") {
     return { kind: "ready", label: "部署已停止", action: "重新部署" };
