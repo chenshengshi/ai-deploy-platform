@@ -600,6 +600,9 @@ tbody tr:last-child td {
 .project-lifecycle.error { color: #d84552; }
 .project-deploying-badge { display: inline-flex; align-items: center; gap: 4px; margin-left: 3px; padding: 3px 7px; border-radius: 999px; color: #5e56dc; background: #efeeff; font-size: 10px; font-weight: 600; white-space: nowrap; }
 .project-deploying-badge svg { width: 11px; height: 11px; }
+.project-deploying-badge.error { color: #dc3f4f; background: #fff0f1; }
+.project-card-actions { display: flex; align-items: center; gap: 7px; }
+.danger-text { color: #dc3f4f !important; }
 .project-card-error { border-color: #f2d3d7; }
 .project-card-online { border-color: #d5ede4; }
 .compact { min-height: 34px; padding: 7px 13px; font-size: 12px; }

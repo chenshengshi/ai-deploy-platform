@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from jose import JWTError, jwt
 
 from .ai import analyze_delete_scope, analyze_project_deployment, deployment_followup, understand
+from .archive_utils import safe_extract_zip
 from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
 from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
 from .backup import router as backup_router, start_backup_scheduler
@@ -1388,13 +1389,10 @@ async def upload_source(item_id: str, tasks: BackgroundTasks, files: list[Upload
             members = zf.infolist()
             if len(members) > 30_000 or sum(member.file_size for member in members) > max_source_bytes:
                 raise HTTPException(413, "ZIP 解压后的源码超过 2 GB 或 30000 个文件")
-            for member in members:
-                destination = (extract_dir / member.filename).resolve()
-                if extract_dir.resolve() not in destination.parents and destination != extract_dir.resolve():
-                    raise HTTPException(400, "ZIP 包含不安全路径")
-                if (member.external_attr >> 16) & 0o170000 == 0o120000:
-                    raise HTTPException(400, "ZIP 包含不安全的符号链接")
-            zf.extractall(extract_dir)
+            try:
+                safe_extract_zip(zf, extract_dir)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         archive.unlink()
         target = extract_dir
     target = _normalized_uploaded_source_root(target)

@@ -129,9 +129,6 @@ function projectAnalysisFacts(project) {
 
 function projectCardState(project, deployments, startingIds = new Set()) {
   const source = projectSourceState(project);
-  if (["queued", "pulling", "analyzing", "preflight", "running"].includes(source.phase)) {
-    return { kind: "working", label: source.label, action: "查看进度" };
-  }
   const records = deployments
     .filter((item) => item.project_id === project.id)
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
@@ -139,10 +136,32 @@ function projectCardState(project, deployments, startingIds = new Set()) {
   if (starting) return { kind: "working", label: "启动中", action: "启动中", deployment: starting };
   const pending = records.find((item) => ["queued", "running"].includes(item.status));
   const active = records.find((item) => item.status === "success");
+  const sourceWorking = ["queued", "pulling", "analyzing", "preflight", "running"].includes(source.phase);
+  if (sourceWorking && active) return {
+    kind: "online",
+    label: "运行中",
+    secondaryLabel: "新版分析中",
+    secondaryKind: "working",
+    action: "访问",
+    deployment: active,
+  };
+  if (source.phase === "failed" && active) return {
+    kind: "online",
+    label: "运行中",
+    secondaryLabel: "新版分析失败",
+    secondaryKind: "error",
+    secondaryAction: "查看原因",
+    action: "访问",
+    deployment: active,
+  };
+  if (sourceWorking) {
+    return { kind: "working", label: source.label, action: "查看进度" };
+  }
   if (pending && active) return {
     kind: "online",
     label: "运行中",
     secondaryLabel: pending.status === "queued" ? "新版等待" : `新版 ${Number(pending.progress || 0)}%`,
+    secondaryKind: "working",
     action: "访问",
     deployment: active,
     pendingDeployment: pending,
@@ -2207,11 +2226,23 @@ function Projects({ me }) {
                 <span className={`project-lifecycle ${state.kind}`}>
                   {state.kind === "working" ? <LoaderCircle className="spin" /> : <i />}
                   {state.label}
-                  {state.secondaryLabel && <small className="project-deploying-badge"><LoaderCircle className="spin" />{state.secondaryLabel}</small>}
+                  {state.secondaryLabel && (
+                    <small className={`project-deploying-badge ${state.secondaryKind || "working"}`}>
+                      {state.secondaryKind === "error" ? <CircleAlert /> : <LoaderCircle className="spin" />}
+                      {state.secondaryLabel}
+                    </small>
+                  )}
                 </span>
-                <button className={state.kind === "online" ? "primary compact" : "ghost compact"} disabled={state.label === "启动中"} onClick={openPrimary}>
-                  {state.action}
-                </button>
+                <div className="project-card-actions">
+                  {state.secondaryAction && (
+                    <button className="ghost compact danger-text" onClick={(event) => { event.stopPropagation(); setSelected(x); }}>
+                      {state.secondaryAction}
+                    </button>
+                  )}
+                  <button className={state.kind === "online" ? "primary compact" : "ghost compact"} disabled={state.label === "启动中"} onClick={openPrimary}>
+                    {state.action}
+                  </button>
+                </div>
               </div>
             </article>
             );
