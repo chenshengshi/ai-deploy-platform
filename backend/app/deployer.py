@@ -6024,6 +6024,7 @@ def central_build_and_distribute(
             required = (
                 ".git", "**/.git", "node_modules", "**/node_modules",
                 ".pnpm-store", "**/.pnpm-store", ".agents", "**/.agents",
+                "dist", "**/dist", "build", "**/build",
             )
             lines = existing.splitlines()
             changed = False
@@ -6077,6 +6078,15 @@ def central_build_and_distribute(
             added: list[str] = []
             for top in sorted(required_roots):
                 for pattern in (f"!{top}/", f"!{top}/**"):
+                    if pattern not in lines:
+                        lines.append(pattern)
+                        added.append(pattern)
+                # A broad source-root negation must not re-include generated
+                # dependencies or previous build output.  Those directories
+                # can make atomic build scripts fail on OverlayFS (EXDEV) and
+                # also bloat or contaminate the Docker context.
+                for generated in ("node_modules", ".pnpm-store", "dist", "build"):
+                    pattern = f"{top}/{generated}"
                     if pattern not in lines:
                         lines.append(pattern)
                         added.append(pattern)
