@@ -5795,6 +5795,14 @@ def snapshot_deployment_files(deployment_id: str, work: str, build_file: str) ->
     (destination / "manifest.json").write_text(json.dumps({"build_file": build_file, "files": manifest}, ensure_ascii=False), encoding="utf-8")
 
 
+def _compose_service_mapping(document) -> dict:
+    """Return Compose services only when both document levels are mappings."""
+    if not isinstance(document, dict):
+        return {}
+    services = document.get("services")
+    return services if isinstance(services, dict) else {}
+
+
 def central_build_and_distribute(
     db, deployment: Deployment, project: Project, target: Node, work: str,
     build_type: str, build_file: str, release: str, image_name: str | None,
@@ -6149,7 +6157,11 @@ def central_build_and_distribute(
                 ) or {}
             except Exception:
                 continue
-            for eager_name, eager_service in (eager_override.get("services") or {}).items():
+            # ``build_file`` is a Dockerfile for non-Compose releases. YAML can
+            # legally parse some Dockerfiles as a scalar string, so parsing
+            # success alone does not mean this is a Compose document.
+            eager_services = _compose_service_mapping(eager_override)
+            for eager_name, eager_service in eager_services.items():
                 if not isinstance(eager_service, dict) or not isinstance(eager_service.get("build"), dict):
                     continue
                 eager_build = eager_service["build"]

@@ -10,6 +10,7 @@ from app.build_planning import (
     valid_generated_dockerfile,
 )
 from app.config import settings
+from app.deployer import _compose_service_mapping
 from app.main import app
 from app.source_inspection import (
     detect_frontend_api_routes,
@@ -66,6 +67,16 @@ class SourceInspectionModuleTests(unittest.TestCase):
 
 
 class BuildPlanningModuleTests(unittest.TestCase):
+    def test_compose_service_mapping_accepts_compose_document(self):
+        services = {"web": {"image": "nginx"}}
+        self.assertEqual(_compose_service_mapping({"services": services}), services)
+
+    def test_compose_service_mapping_ignores_dockerfile_scalar(self):
+        self.assertEqual(_compose_service_mapping("FROM node:22\nRUN npm ci"), {})
+
+    def test_compose_service_mapping_ignores_invalid_services_type(self):
+        self.assertEqual(_compose_service_mapping({"services": "web"}), {})
+
     def test_generated_dockerfile_validation_rejects_compose_yaml(self):
         self.assertTrue(valid_generated_dockerfile("FROM node:22\nRUN npm ci\n"))
         self.assertFalse(valid_generated_dockerfile("services:\n  web:\n    image: nginx\n"))
