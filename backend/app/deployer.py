@@ -45,6 +45,7 @@ from .models import AiConfig, DeployStatus, Deployment, DeploymentPortReservatio
 from .proxy import get_proxy_config, proxy_with_auth
 from .source_inspection import (
     _select_runnable_jar,
+    _public_path_from_value,
     detect_frontend_api_routes,
     detect_frontend_public_base,
     detect_java_version,

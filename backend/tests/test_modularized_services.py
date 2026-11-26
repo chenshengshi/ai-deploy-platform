@@ -10,7 +10,7 @@ from app.build_planning import (
     valid_generated_dockerfile,
 )
 from app.config import settings
-from app.deployer import _compose_service_mapping
+from app.deployer import _compose_service_mapping, _public_path_from_value as deployer_public_path_from_value
 from app.main import app
 from app.source_inspection import (
     detect_frontend_api_routes,
@@ -48,6 +48,9 @@ class BackupModuleTests(unittest.TestCase):
 
 
 class SourceInspectionModuleTests(unittest.TestCase):
+    def test_deployer_can_use_shared_public_path_normalizer(self):
+        self.assertEqual(deployer_public_path_from_value("https://example.com/prod-api/"), "/prod-api")
+
     def test_detects_declared_java_version(self):
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "pom.xml").write_text(
