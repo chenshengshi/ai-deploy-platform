@@ -40,6 +40,7 @@ from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, tok
 from .backup import router as backup_router, start_backup_scheduler
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
+from .deployment_logs import deployment_log_path, read_deployment_log
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectAccess, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
@@ -4708,16 +4709,9 @@ def deployment_view(
     # deployment transaction.  The append-only file is the authoritative,
     # ordered source for detail pages and includes every stage boundary.
     if include_log:
-        full_log_path = Path(settings.upload_root) / "deployment-logs" / f"{item.id}.log"
-        try:
-            if full_log_path.is_file():
-                full_log_text = full_log_path.read_text(encoding="utf-8", errors="replace")
-                if full_log_text:
-                    log_text = full_log_text
-        except OSError:
-            # A transient file read failure must not make deployment details
-            # unavailable; the retained database window remains usable.
-            pass
+        full_log_text = read_deployment_log(item.id)
+        if full_log_text:
+            log_text = full_log_text
     if item.status == DeployStatus.failed and item.error and item.error not in log_text:
         log_text = (log_text + "\n[失败] " + item.error).strip()
     # Rollback used to exist only as free-form log lines.  That made a release
@@ -5052,7 +5046,7 @@ def download_deployment_log(item_id: str, db: Session = Depends(get_db), _: User
         raise HTTPException(404, "部署不存在")
     project = db.get(Project, item.project_id)
     filename = f"{project.slug if project else 'deployment'}-{item.release or item.id[:8]}.log"
-    path = Path(settings.upload_root) / "deployment-logs" / f"{item.id}.log"
+    path = deployment_log_path(item.id)
     if path.is_file():
         content = compact_docker_pull_log(path.read_text(encoding="utf-8", errors="replace"))
         return Response(
@@ -7980,12 +7974,7 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
     # only a compact live window.  Once a newer release stops the old one, its
     # database window may be empty even though access verification succeeded.
     # Read the authoritative retained log before deciding rollback eligibility.
-    try:
-        retained_log = Path(settings.upload_root) / "deployment-logs" / f"{target.id}.log"
-        if retained_log.is_file():
-            verification_text += "\n" + retained_log.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
+    verification_text += "\n" + read_deployment_log(target.id)
     was_verified = any(marker in verification_text for marker in verified_markers)
     if target.status != DeployStatus.stopped or not target.release or not target.access_url or not was_verified:
         raise HTTPException(409, "只有曾经成功上线并通过访问验证的历史版本可以回滚；失败或构建中途停止的版本不能回滚")

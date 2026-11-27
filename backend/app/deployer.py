@@ -41,6 +41,7 @@ from .build_planning import (
     valid_generated_dockerfile,
 )
 from .database import SessionLocal
+from .deployment_logs import append_deployment_log
 from .deployment_build_repairs import apply_dockerfile_text_repairs
 from .deployment_architecture import (
     COMPOSE_NAMES,
@@ -392,13 +393,7 @@ def _write_deployment_log(deployment_id: str, text: str) -> None:
     """Write one ordered log fragment; callers serialize per deployment."""
     # The database keeps a compact, fast UI window. The append-only file keeps
     # every raw line for troubleshooting and download without rendering it.
-    try:
-        log_dir = Path(settings.upload_root) / "deployment-logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with (log_dir / f"{deployment_id}.log").open("a", encoding="utf-8") as handle:
-            handle.write(text)
-    except OSError:
-        pass
+    append_deployment_log(deployment_id, text)
     try:
         with SessionLocal() as db:
             # UI progress is best-effort. It must never wait behind the main

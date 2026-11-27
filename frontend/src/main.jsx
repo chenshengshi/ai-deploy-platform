@@ -8611,9 +8611,9 @@ function UsersPage() {
                 <th>角色</th>
                 <th>项目</th>
                 <th>状态</th>
+                <th>创建时间</th>
                 <th>最近登录</th>
                 <th>登录 IP</th>
-                <th>创建时间</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -8646,9 +8646,9 @@ function UsersPage() {
                       {!x.active ? "停用" : (x.locked_until && new Date(x.locked_until) > new Date()) ? "已锁定" : x.failed_login_attempts ? `失败 ${x.failed_login_attempts} 次` : "正常"}
                     </span>
                   </td>
+                  <td>{time(x.created_at)}</td>
                   <td>{time(x.last_login_at)}</td>
                   <td><code>{x.last_login_ip || "—"}</code></td>
-                  <td>{time(x.created_at)}</td>
                   <td>
                     {(x.failed_login_attempts > 0 || (x.locked_until && new Date(x.locked_until) > new Date())) && (
                       <button className="ghost user-edit" onClick={(event) => unlock(event, x)}>
