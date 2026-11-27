@@ -3871,7 +3871,7 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
             "-o -name '.env*' -o -name 'nginx.conf' -o -name 'default.conf' \\) -print | head -n 40",
             timeout=30,
         )
-    secret_words = ("password", "secret", "token", "key", "credential")
+    secret_words = ("password", "secret", "token", "key", "credential", "salt")
     # The generated Compose file is useful for diagnostics, but it may contain
     # literal credentials as either YAML values or KEY=VALUE environment items.
     # Keep the endpoint read-only and redact those values before returning it.

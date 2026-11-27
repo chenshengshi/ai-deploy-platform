@@ -169,7 +169,7 @@ nav button.active {
   min-width: 0;
 }
 header {
-  height: 82px;
+  height: 64px;
   background: #fff;
   border-bottom: 1px solid var(--line);
   display: flex;
@@ -182,12 +182,14 @@ header {
 }
 header h1 {
   font-size: 20px;
+  line-height: 1.25;
   margin: 0 0 4px;
 }
 header p {
   margin: 0;
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.25;
 }
 .user-pill {
   font-size: 12px;
@@ -1100,9 +1102,6 @@ tbody tr:last-child td {
   min-height: 500px;
   max-height: 900px;
   overflow: hidden;
-}
-.chat-page-shell > header {
-  height: 64px;
 }
 .chat-page-shell > .content {
   padding-top: 14px;
