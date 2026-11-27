@@ -41,7 +41,7 @@ from .backup import router as backup_router, start_backup_scheduler
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
-from .deployment_log_rendering import compact_docker_pull_log, compact_stage_log
+from .deployment_log_rendering import build_log_streams, compact_docker_pull_log, compact_stage_log
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .login_security import clear_login_failures, enforce_login_source_limit, login_source_ip as _login_source_ip, record_login_failure
@@ -4199,99 +4199,6 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
     db.commit()
     db.refresh(item)
     return item
-
-
-def build_log_streams(section: str) -> list[dict]:
-    """Split timestamped concurrent build output into service-specific views."""
-    channels: dict[str, dict] = {}
-    for match in re.finditer(
-        r"(?m)^\[构建通道\]\s+([^|\s]+)\|([^|]+)\|(开始|完成|失败)\|(\S+)\s*$",
-        section,
-    ):
-        key, label, state, raw_time = match.groups()
-        channel = channels.setdefault(key, {"key": key, "label": label, "lines": [], "started_at": None, "finished_at": None, "status": "running"})
-        channel["label"] = label
-        try:
-            moment = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-        except ValueError:
-            moment = None
-        if state == "开始":
-            channel["started_at"] = moment
-        else:
-            channel["finished_at"] = moment
-            channel["status"] = "success" if state == "完成" else "failed"
-    line_pattern = re.compile(r"^\[(\S+)\]\[构建:([^\]]+)\]\s?(.*)$")
-    for raw_line in section.splitlines():
-        match = line_pattern.match(raw_line.strip())
-        if not match:
-            continue
-        raw_time, key, message = match.groups()
-        channel = channels.setdefault(key, {"key": key, "label": key, "lines": [], "started_at": None, "finished_at": None, "status": "running"})
-        channel["lines"].append(raw_line)
-        if channel["started_at"] is None:
-            try:
-                channel["started_at"] = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-            except ValueError:
-                pass
-    build_terminal_match = re.search(
-        r"(?m)^\[阶段时间\]\s+build\s+(完成|失败|停止)\s+(\S+)\s*$",
-        section,
-    )
-    build_terminal_state = build_terminal_match.group(1) if build_terminal_match else None
-    result = []
-    latest_stream_end: datetime | None = None
-    for channel in channels.values():
-        started, finished = channel.pop("started_at"), channel.pop("finished_at")
-        if finished and (latest_stream_end is None or finished > latest_stream_end):
-            latest_stream_end = finished
-        effective_end = finished or datetime.now(timezone.utc)
-        duration = max(0, (effective_end - started).total_seconds()) if started else None
-        if not finished and build_terminal_state:
-            channel["status"] = {
-                "完成": "success", "失败": "failed", "停止": "stopped",
-            }[build_terminal_state]
-        channel["duration_seconds"] = round(duration, 1) if duration is not None else None
-        channel["log"] = compact_stage_log("\n".join(channel.pop("lines")))[-30_000:]
-        result.append(channel)
-    # Frontend/backend compilation can run concurrently, then the platform
-    # still needs to package the final runtime images.  Expose that wall-clock
-    # interval as its own stream; otherwise the stage total legitimately
-    # exceeds both service timers and looks like a calculation error.
-    package_markers = (
-        "[并发构建] 前端 Web 与后端 API 依赖构建已汇合，开始封装运行镜像。",
-        "[镜像封装]",
-        "镜像封装完成",
-        "[即时封装]",
-    )
-    package_positions = [section.find(marker) for marker in package_markers if section.find(marker) >= 0]
-    package_pos = min(package_positions) if package_positions else -1
-    # A real package channel is emitted by immediate packaging. Do not append
-    # a second synthetic package tab (which previously duplicated the timer).
-    has_package_channel = any(item.get("key") == "package" for item in result)
-    if package_pos >= 0 and not has_package_channel:
-        stage_end_match = re.search(
-            r"(?m)^\[阶段时间\]\s+build\s+(?:完成|失败|停止)\s+(\S+)\s*$",
-            section,
-        )
-        stage_end = None
-        if stage_end_match:
-            try:
-                stage_end = datetime.fromisoformat(stage_end_match.group(1).replace("Z", "+00:00"))
-            except ValueError:
-                pass
-        effective_end = stage_end or datetime.now(timezone.utc)
-        package_log = section[package_pos:]
-        package_log = re.sub(r"(?m)^\[阶段(?:时间|开始|完成|失败|停止)\].*$", "", package_log)
-        package_log = re.sub(r"(?m)^\[构建通道\].*$", "", package_log)
-        result.append({
-            "key": "package",
-            "label": "镜像封装",
-            "status": "success" if stage_end_match and "完成" in stage_end_match.group(0) else ("failed" if stage_end_match else "running"),
-            "duration_seconds": round(max(0, (effective_end - (latest_stream_end or effective_end)).total_seconds()), 1),
-            "log": compact_stage_log(package_log)[-30_000:],
-        })
-    order = {"web": 0, "api": 1, "package": 2, "distribute": 3}
-    return sorted(result, key=lambda item: (order.get(item["key"], 99), item["label"]))
 
 
 def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None = None, is_compose: bool = False) -> list[dict]:

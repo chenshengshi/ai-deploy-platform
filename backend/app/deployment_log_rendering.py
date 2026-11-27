@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 
 
 def compact_docker_pull_log(section: str) -> str:
@@ -73,3 +74,78 @@ def compact_stage_log(section: str) -> str:
         visible.append("[Compose 最新状态]")
         visible.extend(compose_progress.values())
     return "\n".join(visible).strip()
+
+
+def build_log_streams(section: str) -> list[dict]:
+    """Split timestamped concurrent build output into service-specific views."""
+    channels: dict[str, dict] = {}
+    for match in re.finditer(
+        r"(?m)^\[构建通道\]\s+([^|\s]+)\|([^|]+)\|(开始|完成|失败)\|(\S+)\s*$",
+        section,
+    ):
+        key, label, state, raw_time = match.groups()
+        channel = channels.setdefault(key, {"key": key, "label": label, "lines": [], "started_at": None, "finished_at": None, "status": "running"})
+        channel["label"] = label
+        try:
+            moment = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        except ValueError:
+            moment = None
+        if state == "开始":
+            channel["started_at"] = moment
+        else:
+            channel["finished_at"] = moment
+            channel["status"] = "success" if state == "完成" else "failed"
+    line_pattern = re.compile(r"^\[(\S+)\]\[构建:([^\]]+)\]\s?(.*)$")
+    for raw_line in section.splitlines():
+        match = line_pattern.match(raw_line.strip())
+        if not match:
+            continue
+        raw_time, key, _message = match.groups()
+        channel = channels.setdefault(key, {"key": key, "label": key, "lines": [], "started_at": None, "finished_at": None, "status": "running"})
+        channel["lines"].append(raw_line)
+        if channel["started_at"] is None:
+            try:
+                channel["started_at"] = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+    terminal = re.search(r"(?m)^\[阶段时间\]\s+build\s+(完成|失败|停止)\s+(\S+)\s*$", section)
+    terminal_state = terminal.group(1) if terminal else None
+    result = []
+    latest_stream_end: datetime | None = None
+    for channel in channels.values():
+        started, finished = channel.pop("started_at"), channel.pop("finished_at")
+        if finished and (latest_stream_end is None or finished > latest_stream_end):
+            latest_stream_end = finished
+        effective_end = finished or datetime.now(timezone.utc)
+        duration = max(0, (effective_end - started).total_seconds()) if started else None
+        if not finished and terminal_state:
+            channel["status"] = {"完成": "success", "失败": "failed", "停止": "stopped"}[terminal_state]
+        channel["duration_seconds"] = round(duration, 1) if duration is not None else None
+        channel["log"] = compact_stage_log("\n".join(channel.pop("lines")))[-30_000:]
+        result.append(channel)
+    package_markers = (
+        "[并发构建] 前端 Web 与后端 API 依赖构建已汇合，开始封装运行镜像。",
+        "[镜像封装]", "镜像封装完成", "[即时封装]",
+    )
+    package_positions = [section.find(marker) for marker in package_markers if section.find(marker) >= 0]
+    package_pos = min(package_positions) if package_positions else -1
+    if package_pos >= 0 and not any(item.get("key") == "package" for item in result):
+        stage_end_match = re.search(r"(?m)^\[阶段时间\]\s+build\s+(?:完成|失败|停止)\s+(\S+)\s*$", section)
+        stage_end = None
+        if stage_end_match:
+            try:
+                stage_end = datetime.fromisoformat(stage_end_match.group(1).replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        effective_end = stage_end or datetime.now(timezone.utc)
+        package_log = re.sub(r"(?m)^\[阶段(?:时间|开始|完成|失败|停止)\].*$", "", section[package_pos:])
+        package_log = re.sub(r"(?m)^\[构建通道\].*$", "", package_log)
+        result.append({
+            "key": "package",
+            "label": "镜像封装",
+            "status": "success" if stage_end_match and "完成" in stage_end_match.group(0) else ("failed" if stage_end_match else "running"),
+            "duration_seconds": round(max(0, (effective_end - (latest_stream_end or effective_end)).total_seconds()), 1),
+            "log": compact_stage_log(package_log)[-30_000:],
+        })
+    order = {"web": 0, "api": 1, "package": 2, "distribute": 3}
+    return sorted(result, key=lambda item: (order.get(item["key"], 99), item["label"]))
