@@ -54,9 +54,15 @@ from app.source_inspection import (
     detect_frontend_public_base,
     detect_java_version,
 )
+from app.project_data.integration_analysis import _source_workspace_metadata
 
 
 class DeploymentSourceContractTests(unittest.TestCase):
+    def test_source_analysis_workspace_metadata_is_available_to_worker_entrypoint(self):
+        from app import main
+
+        self.assertIs(main._source_workspace_metadata, _source_workspace_metadata)
+
     def test_launch_config_route_is_registered_once(self):
         routes = [
             (route.path, method)
