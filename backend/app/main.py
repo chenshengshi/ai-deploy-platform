@@ -46,7 +46,7 @@ from .chat.responses import format_failure_diagnosis
 from .chat.sessions import chat_session_dict, chat_session_for_user
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
-from .data.sql_safety import data_change_confirmation_token, extract_direct_sql, high_risk_matches, is_high_risk_sql, sql_kind
+from .project_data.sql_safety import data_change_confirmation_token, extract_direct_sql, high_risk_matches, is_high_risk_sql, sql_kind
 from .deployment_logs import deployment_log_path, read_deployment_log
 from .deployment_log_rendering import build_log_streams, compact_docker_pull_log, compact_stage_log
 from .deployment_lifecycle import can_switch_to_release, is_verified_release

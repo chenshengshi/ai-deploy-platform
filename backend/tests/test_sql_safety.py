@@ -1,6 +1,6 @@
 import unittest
 
-from app.data.sql_safety import extract_direct_sql, is_high_risk_sql, sql_kind
+from app.project_data.sql_safety import extract_direct_sql, is_high_risk_sql, sql_kind
 
 
 class SqlSafetyTests(unittest.TestCase):
