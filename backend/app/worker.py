@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from .config import settings
 from .database import Base, SessionLocal, engine
+from .deployment_repair_policy import MAX_AI_RETRIES, assess_failure
 from .deployer import (
     cleanup_incomplete_release_images,
     deployment_compose_project_name,
@@ -25,9 +26,6 @@ from .models import DeployStatus, Deployment, DeploymentExperience, DeploymentSe
 from .ssh import SSHNode
 
 
-# Prefer one well-supported repair over repeated speculative rebuilds. A
-# second attempt is reserved for a genuinely different follow-up failure.
-MAX_AI_RETRIES = 2
 DEFERRED_CLEANUP_MARKER = "[待清理] 已登记本次失败版本镜像"
 DEFERRED_CLEANUP_DONE_MARKER = "[后台清理完成]"
 
@@ -369,7 +367,6 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
         error = (failed.error or "").lower()
         project = db.get(Project, failed.project_id)
         repaired_managed_volume = repair_empty_managed_postgres_volume(db, failed, project)
-        ai_retry_safe = False
         ai_result = {}
         for line in reversed((failed.log_text or "").splitlines()):
             if not line.startswith("[AI跟进] "):
@@ -378,27 +375,9 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
                 ai_result = json.loads(line[len("[AI跟进] "):])
             except (TypeError, ValueError):
                 continue
-            ai_retry_safe = bool(
-                ai_result.get("retry_safe") is True
-                and ai_result.get("confidence") in {"high", "medium"}
-                and ai_result.get("scope") in {"platform", "dependency_network", "configuration", "runtime"}
-            )
             break
-        recoverable = any(token in error for token in (
-            "unhealthy", "connection refused", "timed out", "timeout", "temporarily",
-            "connection reset", "访问验证未通过", "联合检查未通过", "容器启动后状态异常",
-            "dependency failed to start", "service unavailable", "429", "500", "502", "503", "504",
-            "cannot find native binding", "optional dependencies", "@rolldown/binding-",
-            "object has no attribute 'rglob'",
-            "lockfile needs to be updated", "requires node.js >=24",
-            "target stage", "could not be found",
-            "unexpected eof", "unexpected end of file", "expecting \"}\"", "nginx -t", "nginx: [emerg]",
-            "docker daemon", "snapshotter", "creatediff",
-            "snapshot ", "does not exist: not found",
-            "find: ‘target’: no such file or directory",
-            "find: 'target': no such file or directory",
-            "find target -name '*.jar'",
-        )) or missing_maven_reactor_module(error, project) or ai_retry_safe
+        assessment = assess_failure(error, ai_result)
+        recoverable = assessment.retry_safe or missing_maven_reactor_module(error, project)
         learned_repair = bool(
             experience and experience.verified
             and (experience.successful_repairs or 0) > (experience.failed_repairs or 0)
@@ -424,22 +403,8 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
             db.commit()
             return
         if not recoverable and not learned_repair:
-            source_markers = (
-                "compilation failure", "compilation error", "cannot find symbol",
-                "syntaxerror", "syntax error", "type error", "test failed",
-            )
-            config_markers = (
-                "missing required", "environment variable", "authentication failed",
-                "access denied", "invalid password", "permission denied",
-            )
-            if any(token in error for token in source_markers):
-                conclusion = "日志包含明确的源码编译或测试失败证据"
-            elif any(token in error for token in config_markers):
-                conclusion = "日志包含明确的配置、权限或凭据错误证据"
-            else:
-                conclusion = "当前证据尚不足以确认归属，也未识别出可安全自动执行的修复方案；这不代表一定是源码问题"
             failed.log_text = ((failed.log_text or "") +
-                f"\n[AI自动修复] {conclusion}。为避免无变化地重复消耗资源，本轮停止自动重试并保留完整诊断。\n"
+                f"\n[AI自动修复] {assessment.reason}。为避免无变化地重复消耗资源，本轮停止自动重试并保留完整诊断。\n"
             )[-200_000:]
             db.commit()
             return
