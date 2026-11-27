@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .config import decrypt
+from .deployment_repair_policy import assess_failure
 from .experience import experience_confidence, infer_experience_tags, normalized_state, rank_learning_experiences, sanitize_learning_text
 from .models import AiConfig, Deployment, DeploymentExperience, DeploymentSettings, Node, Project
 from .proxy import proxy_for
@@ -718,6 +719,18 @@ def deployment_followup(db: Session, deployment: Deployment, project: Project, n
             "confidence": "high",
             "evidence": ["AUTH failed: WRONGPASS invalid username-password pair"],
             "retry_safe": True,
+        }
+    deterministic = assess_failure(deployment.error or stage_log)
+    if deterministic.scope != "unknown":
+        return {
+            "source": "system",
+            "summary": deterministic.reason,
+            "advice": deterministic.suggested_action,
+            "scope": deterministic.scope,
+            "owner": deterministic.owner,
+            "confidence": deterministic.confidence,
+            "evidence": list(deterministic.evidence),
+            "retry_safe": deterministic.retry_safe,
         }
     config = _preferred_ai_config(db)
     context = {"project": project.name, "node": node.name, "status": deployment.status.value, "stage": stage, "release": deployment.release, "access_url": deployment.access_url, "host_port": deployment.host_port, "error": deployment.error, "recent_log": stage_log[-4000:]}

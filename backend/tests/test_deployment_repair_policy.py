@@ -18,7 +18,8 @@ class DeploymentRepairPolicyTests(unittest.TestCase):
     def test_configuration_failure_is_not_guessed(self):
         result = assess_failure("authentication failed: invalid password")
         self.assertFalse(result.retry_safe)
-        self.assertEqual(result.scope, "configuration")
+        self.assertEqual(result.scope, "credentials")
+        self.assertEqual(result.owner, "user")
 
     def test_ai_can_allow_bounded_retry_only_for_safe_scope(self):
         safe = assess_failure("unclassified failure", {
@@ -37,6 +38,18 @@ class DeploymentRepairPolicyTests(unittest.TestCase):
 
     def test_retry_budget_stays_bounded(self):
         self.assertEqual(MAX_AI_RETRIES, 2)
+
+    def test_specific_source_error_beats_generic_timeout(self):
+        result = assess_failure("request timeout\nCompilation failure: cannot find symbol OrderService")
+        self.assertFalse(result.retry_safe)
+        self.assertEqual(result.scope, "source")
+        self.assertTrue(result.evidence)
+
+    def test_server_capacity_is_not_blindly_retried(self):
+        result = assess_failure("failed to register layer: no space left on device")
+        self.assertFalse(result.retry_safe)
+        self.assertEqual(result.scope, "server")
+        self.assertEqual(result.owner, "operator")
 
 
 if __name__ == "__main__":
