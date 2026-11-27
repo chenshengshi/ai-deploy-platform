@@ -21,6 +21,16 @@ from app.deployer import (
     _public_path_from_value as deployer_public_path_from_value,
     analyze_repository_topology,
     reconcile_managed_integrations,
+    delete_deployment_resources,
+    restore_release_images,
+    start_deployment,
+    stop_deployment,
+)
+from app.deployment.image_restore import restore_release_images as modular_restore_release_images
+from app.deployment.release_cleanup import delete_deployment_resources as modular_delete_deployment_resources
+from app.deployment.release_runtime import (
+    start_deployment as modular_start_deployment,
+    stop_deployment as modular_stop_deployment,
 )
 from app.deployment_architecture import (
     analyze_repository_topology as architecture_analyze_repository_topology,
@@ -38,6 +48,12 @@ from app.source_inspection import (
 
 
 class DeploymentSourceContractTests(unittest.TestCase):
+    def test_release_lifecycle_uses_modular_implementations(self):
+        self.assertIs(start_deployment, modular_start_deployment)
+        self.assertIs(stop_deployment, modular_stop_deployment)
+        self.assertIs(delete_deployment_resources, modular_delete_deployment_resources)
+        self.assertIs(restore_release_images, modular_restore_release_images)
+
     def test_frontend_base_repair_changes_only_isolated_vite_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
