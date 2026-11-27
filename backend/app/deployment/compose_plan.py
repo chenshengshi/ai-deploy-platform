@@ -25,6 +25,14 @@ from .ports import choose_node_port
 from .runtime_environment import application_environment
 
 
+def compose_service_mapping(document) -> dict:
+    """Return Compose services only when both document levels are mappings."""
+    if not isinstance(document, dict):
+        return {}
+    services = document.get("services")
+    return services if isinstance(services, dict) else {}
+
+
 def _compose_service_container_port(root: Path, service: dict) -> int | None:
     for mapping in service.get("ports") or []:
         port = _compose_port_number(mapping.get("target") if isinstance(mapping, dict) else mapping)

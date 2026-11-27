@@ -2,10 +2,13 @@
 
 import re
 import shlex
+import time
+from urllib.parse import quote
 
+import httpx
 from sqlalchemy import select
 
-from ..models import DeployStatus, Deployment, Node, Project
+from ..models import DeployStatus, Deployment, DeploymentSettings, Node, Project
 from ..ssh import SSHNode
 from .gateway import platform_gateway_node
 from .naming import deployment_compose_project_name
@@ -125,4 +128,61 @@ def cleanup_incomplete_release_images(
             raise RuntimeError(f"{node.name} 本次版本镜像清理后仍有残留：{output[-800:]}")
         reports.append(f"{node.name}：{output.strip()}")
     return "；".join(reports)
+
+
+
+def cleanup_registry_versions(db, project: Project | None, repository: str) -> list[str]:
+    policy = db.get(DeploymentSettings, "default")
+    if not policy or not policy.registry_auto_cleanup:
+        return []
+    keep = max(1, int(policy.registry_retention_count or 5))
+    base = "http://registry:5000/v2"
+    headers = {"Accept": ", ".join((
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+    ))}
+    # A successful deployment is historical evidence, not proof that its image
+    # is still active. Protecting every successful release made retention a
+    # no-op forever. The newest successful release is the restart/active
+    # candidate; older releases are governed by the configured keep count.
+    protected: set[str] = set()
+    if project is not None:
+        active_release = db.scalar(select(Deployment.release).where(
+            Deployment.project_id == project.id,
+            Deployment.status == DeployStatus.success,
+            Deployment.release.is_not(None),
+        ).order_by(Deployment.finished_at.desc(), Deployment.created_at.desc()).limit(1))
+        if active_release:
+            protected.add(active_release)
+    removed = []
+    with httpx.Client(timeout=20, trust_env=False) as client:
+        response = client.get(f"{base}/{repository}/tags/list")
+        if response.status_code != 200:
+            return []
+        tags = sorted(response.json().get("tags") or [], reverse=True)
+        retained = set(tags[:keep]) | protected
+        for tag in tags:
+            if tag in retained:
+                continue
+            manifest = client.head(f"{base}/{repository}/manifests/{tag}", headers=headers)
+            digest = manifest.headers.get("Docker-Content-Digest")
+            if digest and client.delete(f"{base}/{repository}/manifests/{digest}").status_code in {200, 202}:
+                removed.append(tag)
+    return removed
+def verify_registry_tag(repository: str, tag: str, attempts: int = 5) -> bool:
+    """Confirm that a pushed tag is visible in the platform's central registry."""
+    url = f"http://registry:5000/v2/{quote(repository, safe='/')}/tags/list"
+    with httpx.Client(timeout=20, trust_env=False) as client:
+        for attempt in range(attempts):
+            try:
+                response = client.get(url)
+                if response.status_code == 200 and tag in (response.json().get("tags") or []):
+                    return True
+            except (httpx.HTTPError, ValueError):
+                pass
+            if attempt + 1 < attempts:
+                time.sleep(1)
+    return False
 
