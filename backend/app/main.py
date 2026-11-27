@@ -7975,7 +7975,18 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
     if not target:
         raise HTTPException(404, "发布版本不存在")
     verified_markers = ("[完成] 部署成功", "[启用确认]", "[回滚完成]")
-    was_verified = any(marker in (target.log_text or "") for marker in verified_markers)
+    verification_text = target.log_text or ""
+    # Successful pipeline logs are append-only files while the database keeps
+    # only a compact live window.  Once a newer release stops the old one, its
+    # database window may be empty even though access verification succeeded.
+    # Read the authoritative retained log before deciding rollback eligibility.
+    try:
+        retained_log = Path(settings.upload_root) / "deployment-logs" / f"{target.id}.log"
+        if retained_log.is_file():
+            verification_text += "\n" + retained_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    was_verified = any(marker in verification_text for marker in verified_markers)
     if target.status != DeployStatus.stopped or not target.release or not target.access_url or not was_verified:
         raise HTTPException(409, "只有曾经成功上线并通过访问验证的历史版本可以回滚；失败或构建中途停止的版本不能回滚")
     project, node = db.get(Project, target.project_id), db.get(Node, target.node_id)
