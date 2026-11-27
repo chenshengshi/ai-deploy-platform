@@ -6091,6 +6091,19 @@ def central_build_and_distribute(
                         # No verified artifact means this service is not safe
                         # to package early; leave it to the normal build path.
                         continue
+                # A runtime Dockerfile can already exist before compilation.
+                # At that earlier point its dist/build input does not exist,
+                # so ignore-rule restoration correctly has no evidence to
+                # act on. Re-evaluate the final packaging file now that the
+                # compiler has produced and verified the artifact.
+                final_dockerfile = context_path / spec["dockerfile"]
+                restored_artifacts = ensure_generated_copy_inputs(context_path, final_dockerfile)
+                if restored_artifacts:
+                    log(
+                        deployment.id,
+                        "[构建上下文] 已按最终运行镜像恢复真实构建产物："
+                        + "、".join(restored_artifacts) + "。\n",
+                    )
                 relative_context = spec["context"].removeprefix("./")
                 dockerfile_path = f"{relative_context}/{spec['dockerfile']}"
                 package_command = (
