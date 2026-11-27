@@ -1146,7 +1146,7 @@ tbody tr:last-child td {
   margin-left: auto;
   justify-content: flex-end;
 }
-.message > div:last-child {
+.message.ai > div:last-child {
   min-width: 0;
   max-width: 100%;
   background: #f3f5f8;
@@ -1155,10 +1155,35 @@ tbody tr:last-child td {
   font-size: 13px;
   line-height: 1.55;
 }
-.message.user > div {
+.message-user-stack {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+  min-width: 0;
+}
+.message-user-bubble {
   background: #625af1;
   color: #fff;
   border-radius: 14px 4px 14px 14px;
+  padding: 11px 14px;
+  font-size: 13px;
+  line-height: 1.55;
+  min-width: 0;
+  max-width: 100%;
+}
+.message-user-time {
+  padding-right: 3px;
+  color: #8a93a5;
+  font-size: 10px;
+  line-height: 1;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity .16s ease, transform .16s ease;
+}
+.message.user:hover .message-user-time,
+.message.user:focus-within .message-user-time {
+  opacity: 1;
+  transform: translateY(0);
 }
 .message p {
   margin: 0;

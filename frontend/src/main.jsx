@@ -1009,6 +1009,24 @@ function ChatMessageContent({ text }) {
 
 const MemoChatMessageContent = React.memo(ChatMessageContent);
 
+function UserChatMessage({ message }) {
+  const timestamp = message.createdAt
+    ? new Intl.DateTimeFormat("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(new Date(message.createdAt))
+    : "";
+  return (
+    <div className="message-user-stack">
+      <div className="message-user-bubble">
+        <MemoChatMessageContent text={message.text} />
+      </div>
+      {timestamp && <time className="message-user-time" dateTime={message.createdAt}>{timestamp}</time>}
+    </div>
+  );
+}
+
 function Chat() {
   const greeting = "你好，我是自助发布助手。你可以直接问我项目状态、故障原因，或告诉我发布要求。对话会自动保存。";
   const [projects, setProjects] = useState([]),
@@ -1323,6 +1341,7 @@ function Chat() {
         error: item.action?.startsWith("workflow_failed"),
         autoRetryCount: Number(item.action?.match(/_retry_(\d+)/)?.[1] || 0),
         elapsedMs: item.elapsed_ms,
+        createdAt: item.created_at,
       })));
     } finally {
       setSessionBusy(false);
@@ -1378,7 +1397,7 @@ function Chat() {
     const controller = new AbortController();
     answerAbortRef.current = controller;
     setText("");
-    setMessages((x) => [...x, { who: "user", text: msg }]);
+    setMessages((x) => [...x, { who: "user", text: msg, createdAt: new Date().toISOString() }]);
     setBusy(true);
     try {
       const r = await api("/chat", {
@@ -1489,7 +1508,7 @@ function Chat() {
                     <Bot />
                   </div>
                 )}
-                <div>
+                {m.who === "user" ? <UserChatMessage message={m} /> : <div>
                   {m.who === "ai" && m.elapsedMs > 0 && (
                     <details className="chat-answer-meta">
                       <summary>用时 {formatElapsed(m.elapsedMs)}</summary>
@@ -1514,7 +1533,7 @@ function Chat() {
                       查看并确认删除
                     </button>
                   )}
-                </div>
+                </div>}
               </div>
             ))}
             {busy && (
