@@ -14,7 +14,9 @@ from app.build_planning import (
 )
 from app.config import encrypt, settings
 from app.deployer import (
+    _compose_service_container_port,
     _compose_service_mapping,
+    _dockerfile_exposed_port,
     _public_path_from_value as deployer_public_path_from_value,
     analyze_repository_topology,
     reconcile_managed_integrations,
@@ -35,6 +37,29 @@ from app.source_inspection import (
 
 
 class DeploymentSourceContractTests(unittest.TestCase):
+    def test_compose_port_uses_requested_multistage_target(self):
+        dockerfile = (
+            "FROM node:22 AS backend-runtime\nEXPOSE 8080\n"
+            "FROM nginx:alpine AS frontend-runtime\nEXPOSE 80\n"
+        )
+        self.assertEqual(_dockerfile_exposed_port(dockerfile, "backend-runtime"), 8080)
+        self.assertEqual(_dockerfile_exposed_port(dockerfile, "frontend-runtime"), 80)
+
+    def test_compose_port_reads_final_runtime_build_definition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".yunzhou.backend.runtime.Dockerfile").write_text(
+                "FROM eclipse-temurin:17-jre\nEXPOSE 8080\n",
+                encoding="utf-8",
+            )
+            service = {
+                "build": {
+                    "context": ".",
+                    "dockerfile": ".yunzhou.backend.runtime.Dockerfile",
+                }
+            }
+            self.assertEqual(_compose_service_container_port(root, service), 8080)
+
     def test_frontend_api_environment_keys_remain_available_to_deployer(self):
         from app import deployer
 

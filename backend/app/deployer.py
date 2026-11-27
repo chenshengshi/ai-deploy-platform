@@ -4340,17 +4340,44 @@ def _compose_service_container_port(root: Path, service: dict) -> int | None:
     if build:
         build_spec = build if isinstance(build, dict) else {"context": build}
         inline = str(build_spec.get("dockerfile_inline") or "")
-        match = re.search(r"(?im)^\s*EXPOSE\s+(\d{1,5})(?:/tcp)?\s*$", inline)
-        if match:
-            return int(match.group(1))
+        target = str(build_spec.get("target") or "").strip()
+        port = _dockerfile_exposed_port(inline, target)
+        if port:
+            return port
         context = (root / str(build_spec.get("context") or ".")).resolve()
         dockerfile = (context / str(build_spec.get("dockerfile") or "Dockerfile")).resolve()
         if dockerfile.is_file() and (dockerfile == root or root in dockerfile.parents):
             text_value = dockerfile.read_text(encoding="utf-8", errors="ignore")
-            matches = re.findall(r"(?im)^\s*EXPOSE\s+(\d{1,5})(?:/tcp)?\s*$", text_value)
-            if matches:
-                return int(matches[-1])
+            port = _dockerfile_exposed_port(text_value, target)
+            if port:
+                return port
     return None
+
+
+def _dockerfile_exposed_port(text_value: str, target: str = "") -> int | None:
+    """Return the runtime port for the requested Docker build stage.
+
+    A shared multi-stage Dockerfile may expose both an API port and nginx port.
+    Looking at the final EXPOSE in the entire file incorrectly assigns port 80
+    to backend services.  Compose's build target is authoritative when present.
+    """
+    if not text_value:
+        return None
+    selected = text_value
+    if target:
+        stages = list(re.finditer(
+            r"(?im)^\s*FROM\s+\S+(?:\s+AS\s+([a-zA-Z0-9_.-]+))?\s*$",
+            text_value,
+        ))
+        wanted = target.lower()
+        for index, stage in enumerate(stages):
+            if str(stage.group(1) or "").lower() != wanted:
+                continue
+            end = stages[index + 1].start() if index + 1 < len(stages) else len(text_value)
+            selected = text_value[stage.start():end]
+            break
+    matches = re.findall(r"(?im)^\s*EXPOSE\s+(\d{1,5})(?:/tcp)?(?:\s+.*)?$", selected)
+    return int(matches[-1]) if matches else None
 
 
 def _compose_route_groups(project: Project, service_targets: dict[str, list[tuple[str, int]]], deployment_plan: dict | None = None) -> list[dict]:
@@ -4512,6 +4539,42 @@ def prepare_compose_image_override(
             "*\n!target\n!target/ruoyi-admin.jar\n!.yunzhou.runtime.Dockerfile\n",
             encoding="utf-8",
         )
+
+    def publish_routed_port(service_name: str, port_probe: dict) -> None:
+        if service_name not in routed_services or (port_probe.get("ports") or []):
+            return
+        container_target = _compose_service_container_port(root, port_probe)
+        if not container_target:
+            raise RuntimeError(f"无法确认入口服务 {service_name} 的容器端口；请在 Compose 中声明 expose 或在镜像 Dockerfile 中声明 EXPOSE")
+        if db is None:
+            raise RuntimeError(f"入口服务 {service_name} 缺少宿主端口，平台无法在无数据库上下文时安全分配")
+        published = choose_node_port(
+            db, node, None, reserved=reserved_ports,
+            exclude_deployment_id=deployment_id,
+        )
+        reserved_ports.add(published)
+        services[service_name]["ports"] = [f"{published}:{container_target}"]
+        if not deployment_id:
+            return
+        reservation = db.scalar(select(DeploymentPortReservation).where(
+            DeploymentPortReservation.node_id == node.id,
+            DeploymentPortReservation.host_port == published,
+        ))
+        if reservation:
+            reservation.deployment_id = deployment_id
+            reservation.service_name = str(service_name)
+            reservation.status = "reserved"
+            reservation.created_at = datetime.now(timezone.utc)
+        else:
+            db.add(DeploymentPortReservation(
+                deployment_id=deployment_id,
+                node_id=node.id,
+                service_name=str(service_name),
+                host_port=published,
+                status="reserved",
+            ))
+        db.commit()
+
     for service_name, service in (document.get("services") or {}).items():
         if not isinstance(service, dict):
             continue
@@ -4547,49 +4610,8 @@ def prepare_compose_image_override(
             # can run beside the online version until gateway verification.
             "container_name": _service_container_name(project.slug, service_name, 1, release, runtime_namespace),
         }
-        # The platform gateway runs outside the Compose network. Every routed
-        # or independently scalable application therefore needs one host-side
-        # port even when the repository intentionally declares only `expose`.
-        # Keep source Compose untouched and publish it solely in our generated
-        # override so users do not have to add infrastructure details to code.
-        if service_name in routed_services and not (service.get("ports") or []):
-            container_target = _compose_service_container_port(root, service)
-            if not container_target:
-                raise RuntimeError(f"无法确认入口服务 {service_name} 的容器端口；请在 Compose 中声明 expose 或在镜像 Dockerfile 中声明 EXPOSE")
-            if db is None:
-                raise RuntimeError(f"入口服务 {service_name} 缺少宿主端口，平台无法在无数据库上下文时安全分配")
-            published = choose_node_port(
-                db, node, None, reserved=reserved_ports,
-                exclude_deployment_id=deployment_id,
-            )
-            reserved_ports.add(published)
-            services[service_name]["ports"] = [f"{published}:{container_target}"]
-            if deployment_id:
-                # Persist every Compose side-service port before the lengthy
-                # image build. Concurrent projects can then never reserve the
-                # same port while neither container is listening yet.
-                reservation = db.scalar(select(DeploymentPortReservation).where(
-                    DeploymentPortReservation.node_id == node.id,
-                    DeploymentPortReservation.host_port == published,
-                ))
-                if reservation:
-                    # The table keeps one durable slot per node/port. Released
-                    # slots are reassigned instead of inserting a second row
-                    # that violates the unique node+port constraint.
-                    reservation.deployment_id = deployment_id
-                    reservation.service_name = str(service_name)
-                    reservation.status = "reserved"
-                    reservation.created_at = datetime.now(timezone.utc)
-                else:
-                    db.add(DeploymentPortReservation(
-                        deployment_id=deployment_id,
-                        node_id=node.id,
-                        service_name=str(service_name),
-                        host_port=published,
-                        status="reserved",
-                    ))
-                db.commit()
         if not service.get("build"):
+            publish_routed_port(service_name, service)
             continue
         original_build = service.get("build")
         # Compose files generated for monorepos often point several runtime
@@ -4605,6 +4627,7 @@ def prepare_compose_image_override(
         )
         if group_key in build_groups:
             services[service_name].update({"image": build_groups[group_key], "build": None})
+            publish_routed_port(service_name, service)
             continue
         safe_service = re.sub(r"[^a-z0-9_.-]+", "-", str(service_name).lower()).strip("-.") or "app"
         image = f"yunzhou/{project.slug}-{safe_service}:{release}"
@@ -4644,6 +4667,9 @@ def prepare_compose_image_override(
                 build_override = clean_build
                 compose_changed = True
         services[service_name].update({"image": image, "build": build_override})
+        port_probe = copy.deepcopy(service)
+        port_probe["build"] = build_override
+        publish_routed_port(service_name, port_probe)
         images.append(image)
     if not services:
         return None, []
