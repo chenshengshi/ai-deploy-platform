@@ -23,6 +23,7 @@ from app.deployment_architecture import (
 from app.main import app
 from app.source_inspection import (
     _FRONTEND_API_ENV_KEYS,
+    _executable_jar_score,
     detect_frontend_api_routes,
     detect_frontend_public_base,
     detect_java_version,
@@ -34,6 +35,7 @@ class DeploymentSourceContractTests(unittest.TestCase):
         from app import deployer
 
         self.assertEqual(deployer._FRONTEND_API_ENV_KEYS, _FRONTEND_API_ENV_KEYS)
+        self.assertIs(deployer._executable_jar_score, _executable_jar_score)
 
 
 class BackupModuleTests(unittest.TestCase):

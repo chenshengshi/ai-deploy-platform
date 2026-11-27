@@ -54,6 +54,7 @@ from .models import AiConfig, DeployStatus, Deployment, DeploymentPortReservatio
 from .proxy import get_proxy_config, proxy_with_auth
 from .source_inspection import (
     _FRONTEND_API_ENV_KEYS,
+    _executable_jar_score,
     _select_runnable_jar,
     _public_path_from_value,
     detect_frontend_api_routes,
@@ -5794,7 +5795,7 @@ def central_build_and_distribute(
             lines = existing.splitlines()
             added: list[str] = []
             for top in sorted(required_roots):
-                for pattern in (f"!{top}/", f"!{top}/**"):
+                for pattern in (f"!{top}", f"!{top}/", f"!{top}/**"):
                     if pattern not in lines:
                         lines.append(pattern)
                         added.append(pattern)
@@ -5814,7 +5815,7 @@ def central_build_and_distribute(
             # dependency/output exclusions above. Multi-stage Dockerfiles
             # that merely COPY the source root still keep stale artifacts out.
             for artifact in sorted(explicit_generated_inputs):
-                for pattern in (f"!{artifact}/", f"!{artifact}/**"):
+                for pattern in (f"!{artifact}", f"!{artifact}/", f"!{artifact}/**"):
                     lines.append(pattern)
                     added.append(pattern)
             if added:
