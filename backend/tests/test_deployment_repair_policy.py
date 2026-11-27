@@ -51,6 +51,19 @@ class DeploymentRepairPolicyTests(unittest.TestCase):
         self.assertEqual(result.scope, "server")
         self.assertEqual(result.owner, "operator")
 
+    def test_inner_missing_setting_beats_outer_compose_dependency_error(self):
+        result = assess_failure(
+            "dependency failed to start: container api exited (1)\n"
+            "后端启动失败： Error: 后端数据库配置缺失：AUTH_TOKEN_SECRET"
+        )
+
+        self.assertFalse(result.retry_safe)
+        self.assertEqual(result.scope, "configuration")
+        self.assertEqual(result.owner, "project")
+        self.assertIn("AUTH_TOKEN_SECRET", result.reason)
+        self.assertIn("AUTH_TOKEN_SECRET", result.suggested_action)
+        self.assertEqual(result.matched_rule, "missing_setting")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1729,6 +1729,21 @@ tbody tr:last-child td {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
+.ai-diagnostic-evidence {
+  margin-top: 7px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  background: #fff;
+  color: #697487;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.ai-followup-compact.failed .ai-diagnostic-evidence {
+  border: 1px solid #f2d8da;
+  background: #fffdfd;
+}
+.ai-diagnostic-evidence b { color: #344054; }
 .ai-diagnostic-details { margin-top: 7px; }
 .ai-diagnostic-details > summary {
   width: max-content;

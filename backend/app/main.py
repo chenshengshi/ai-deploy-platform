@@ -6830,7 +6830,7 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
         result["next_step"] = (
             "平台正在继续分析并准备可验证的处理方案。"
             if item.status == DeployStatus.running
-            else "按修复方案处理后重新发布，并由平台完成启动和访问验证。"
+            else str(result.get("advice") or "按修复方案处理后重新发布，并由平台完成启动和访问验证。")
         )
     result, reconciled_stage = reconcile_followup_live_state(result, item, active["title"], combined_evidence)
     result.update({"cache_key": cache_key, "stage": reconciled_stage, "status": item.status.value, "generated_at": datetime.now(timezone.utc).isoformat()})

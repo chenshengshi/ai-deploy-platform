@@ -7309,12 +7309,17 @@ function DeploymentDetail({ item, onClose, onConfigureDomain, onChanged }) {
           <div className="ai-followup-main">
             <div className="ai-followup-title">
               <b>{data.status === "failed" ? "部署异常" : aiFollowup?.stage || "部署分析中"}</b>
-              <span>{data.status === "failed" ? "需要处理" : "AI 实时诊断"}</span>
+              <span>{data.status === "failed"
+                ? ({ configuration: "需要补充配置", credentials: "需要检查凭据", source: "需要修改源码", server: "需要处理服务器", platform: "平台处理中" }[aiFollowup?.scope] || "需要处理")
+                : "AI 实时诊断"}</span>
               {aiFollowup?.retryable && (
                 <em className="ai-retrying"><LoaderCircle className="spin" />正在重试</em>
               )}
             </div>
             <p>{aiFollowup?.summary || "正在读取日志并判断当前状态..."}</p>
+            {aiFollowup?.evidence?.[0] && (
+              <div className="ai-diagnostic-evidence"><b>定位依据：</b>{aiFollowup.evidence[0]}</div>
+            )}
             {(diagnosticAdvice || diagnosticFixPlan.length) && (
               <details className="ai-diagnostic-details">
                 <summary>查看修复方案</summary>

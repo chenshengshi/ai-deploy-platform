@@ -84,6 +84,26 @@ def assess_failure(error: str | None, ai_result: dict | None = None) -> FailureA
     """Classify deterministic evidence, using AI only as a bounded fallback."""
     text = str(error or "")
     lowered = text.lower()
+    # Compose often reports only ``dependency failed to start`` after the real
+    # application error. Prefer the inner, actionable missing-setting line so
+    # the UI names the exact key and the worker does not blindly retry it.
+    missing_setting = re.search(
+        r"(?im)^.*?(?:配置|环境变量)缺失\s*[：:]\s*([A-Z][A-Z0-9_]{2,})[^\r\n]*$",
+        text,
+    )
+    if missing_setting:
+        key = missing_setting.group(1)
+        evidence = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", missing_setting.group(0)).strip()
+        return FailureAssessment(
+            False,
+            "configuration",
+            f"后端容器启动失败：必填环境配置 {key} 未设置",
+            "missing_setting",
+            "project",
+            (evidence[:300],),
+            f"在项目环境配置中补充 {key} 后重新发布；平台不会猜测或自动生成业务密钥",
+            "high",
+        )
     for rule in RULES:
         matched = next((token for token in rule.tokens if token in lowered), None)
         if matched:
