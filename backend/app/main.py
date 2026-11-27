@@ -9185,7 +9185,13 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
                     "下一步：请先完成一次发布，平台才能检查页面和静态资源。",
                     action="answer", project_id=project_id, node_id=node_id, intent=None,
                 )
-            frontend_issue = diagnose_blank_frontend(measured.access_url)
+            measured_node = db.get(Node, measured.node_id)
+            diagnostic_url = (
+                f"http://{measured_node.host}:{int(measured.host_port)}"
+                if measured_node and measured.host_port
+                else measured.access_url
+            )
+            frontend_issue = diagnose_blank_frontend(diagnostic_url)
             if frontend_issue:
                 evidence = frontend_issue["evidence"][0]
                 working = evidence.get("working_path") or "未找到"
