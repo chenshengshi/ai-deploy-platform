@@ -46,6 +46,7 @@ from .chat.responses import format_failure_diagnosis
 from .chat.sessions import chat_session_dict, chat_session_for_user
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
+from .data.sql_safety import data_change_confirmation_token, extract_direct_sql, high_risk_matches, is_high_risk_sql, sql_kind
 from .deployment_logs import deployment_log_path, read_deployment_log
 from .deployment_log_rendering import build_log_streams, compact_docker_pull_log, compact_stage_log
 from .deployment_lifecycle import can_switch_to_release, is_verified_release
@@ -6203,42 +6204,6 @@ def project_data_resources(item_id: str, db: Session = Depends(get_db), _: User 
 
 
 _migration_locks: dict[str, threading.Lock] = {}
-_MIGRATION_DANGER = re.compile(
-    r"(?i)\b(drop\s+(?:table|database|schema)|truncate\s+table|delete\s+from|alter\s+table\s+.+\s+drop\s+)\b"
-)
-
-
-def _extract_direct_sql(message: str) -> str | None:
-    fenced = re.search(r"```(?:sql)?\s*([\s\S]+?)```", message, re.I)
-    if fenced:
-        return fenced.group(1).strip()
-    # ``\b`` treats Chinese characters as word characters, so text such as
-    # “帮我执行SELECT ...” has no boundary before SELECT.  Only forbid an
-    # adjacent ASCII identifier character; natural-language prefixes remain
-    # valid while words like ``reselect`` do not become SQL accidentally.
-    match = re.search(r"(?is)(?<![A-Za-z0-9_])(select|show|describe|desc|explain|with|alter|create|drop|truncate|comment|rename|insert|update|delete)\b[\s\S]*", message)
-    return match.group(0).strip() if match else None
-
-
-def _sql_kind(sql: str) -> str:
-    cleaned = re.sub(r"(?s)/\*.*?\*/|--[^\n]*", " ", sql).strip()
-    first = re.match(r"(?i)([a-z]+)", cleaned)
-    keyword = first.group(1).lower() if first else ""
-    if keyword in {"select", "show", "describe", "desc", "explain", "with"}:
-        # Read-only requests may not smuggle a second modifying statement.
-        tail = cleaned.rstrip().rstrip(";")
-        if ";" in tail or re.search(r"(?i)\b(insert|update|delete|alter|create|drop|truncate|rename)\b", tail):
-            return "unsupported"
-        return "query"
-    if keyword in {"alter", "create", "drop", "truncate", "comment", "rename"}:
-        if re.search(r"(?i)\b(insert|update|delete|grant|revoke|load\s+data|copy\s+.+\s+from)\b", cleaned):
-            return "unsupported"
-        return "schema"
-    if keyword in {"insert", "update", "delete"}:
-        return "data_change"
-    return "unsupported"
-
-
 def _external_mysql_config(project: Project) -> dict | None:
     values = _env_map(decrypt(project.env_text_encrypted) or "")
     if values.get("YUNZHOU_MYSQL_MODE", "").lower() != "external":
@@ -6282,7 +6247,7 @@ def _database_container(ssh: SSHNode, project: Project, *, required: bool = True
 
 
 def _query_project_database(project: Project, sql: str, db: Session, user: User, session_id: str | None = None) -> dict:
-    if _sql_kind(sql) != "query":
+    if sql_kind(sql) != "query":
         raise HTTPException(400, "该入口只允许 SELECT、SHOW、DESCRIBE 或 EXPLAIN 查询")
     deployment = db.scalar(select(Deployment).where(
         Deployment.project_id == project.id, Deployment.status == DeployStatus.success,
@@ -6353,12 +6318,8 @@ def _query_project_database(project: Project, sql: str, db: Session, user: User,
     }
 
 
-def _data_change_confirmation_token(project_id: str, sql: str) -> str:
-    return hashlib.sha256(f"{project_id}\n{sql}\n{settings.app_secret}".encode()).hexdigest()
-
-
 def _execute_project_data_change(project: Project, sql: str, db: Session, user: User, session_id: str | None = None) -> dict:
-    if _sql_kind(sql) != "data_change":
+    if sql_kind(sql) != "data_change":
         raise HTTPException(400, "该入口只允许单条 INSERT、UPDATE 或 DELETE 语句")
     deployment = db.scalar(select(Deployment).where(
         Deployment.project_id == project.id, Deployment.status == DeployStatus.success,
@@ -6436,7 +6397,7 @@ def project_sql_console(
     if not project:
         raise HTTPException(404, "项目不存在")
     sql = body.sql.strip()
-    kind = _sql_kind(sql)
+    kind = sql_kind(sql)
     if kind == "query":
         result = _query_project_database(project, sql, db, user)
         lines = result["lines"]
@@ -6448,7 +6409,7 @@ def project_sql_console(
         raise HTTPException(400, "SQL 控制台仅支持单条查询或 INSERT、UPDATE、DELETE；表结构请使用迁移流程")
     operation = sql.lstrip().split(None, 1)[0].upper()
     high_risk = bool(operation in {"UPDATE", "DELETE"} and not re.search(r"(?i)\bwhere\b", sql))
-    token = _data_change_confirmation_token(project.id, sql)
+    token = data_change_confirmation_token(project.id, sql, settings.app_secret)
     required_phrase = "确认执行高风险数据变更" if high_risk else "确认执行数据变更"
     if body.confirm_token != token or body.confirmation != required_phrase:
         return {"kind": "data_change", "requires_confirmation": True, "high_risk": high_risk,
@@ -6508,7 +6469,7 @@ def _project_migration_plan(project: Project, db: Session) -> dict:
                     continue
                 text_content = content.decode("utf-8", "ignore")
                 relative = remote_path.removeprefix(actual.rstrip("/") + "/")
-                danger = sorted(set(match.group(0).upper() for match in _MIGRATION_DANGER.finditer(text_content)))
+                danger = high_risk_matches(text_content)
                 files.append({
                     "path": relative,
                     "remote_path": remote_path,
@@ -6551,12 +6512,12 @@ def _execute_project_migrations(project: Project, expected: list[dict], db: Sess
             inline_sql = str(expected_item.get("sql") or "").strip()
             if inline_sql:
                 digest = hashlib.sha256(inline_sql.encode()).hexdigest()
-                if digest != expected_item.get("sha256") or _sql_kind(inline_sql) != "schema":
+                if digest != expected_item.get("sha256") or sql_kind(inline_sql) != "schema":
                     raise HTTPException(409, "直接 SQL 已变化或包含非表结构语句，请重新发起")
                 item = {
                     "path": expected_item.get("path") or "AI 直接 SQL",
                     "remote_path": None, "sha256": digest, "sql": inline_sql,
-                    "risk": expected_item.get("risk") or ("high" if _MIGRATION_DANGER.search(inline_sql) else "low"),
+                    "risk": expected_item.get("risk") or ("high" if is_high_risk_sql(inline_sql) else "low"),
                 }
             else:
                 item = current.get(str(expected_item.get("sha256") or ""))
@@ -8585,7 +8546,7 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
             session_id=session.id, elapsed_ms=elapsed_ms,
         )
 
-    direct_sql = _extract_direct_sql(body.message)
+    direct_sql = extract_direct_sql(body.message)
     try:
         decision = ({
             "action": "answer", "project_id": body.project_id or session.project_id,
@@ -8713,7 +8674,7 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         target = db.get(Project, project_id) if project_id else None
         if not target:
             return respond("请先关联要查询或修改数据库的项目，再发送 SQL。", action="none", project_id=project_id, node_id=node_id, intent=None)
-        kind = _sql_kind(direct_sql)
+        kind = sql_kind(direct_sql)
         if kind == "query":
             try:
                 result = _query_project_database(target, direct_sql, db, user, session.id)
@@ -8736,7 +8697,7 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
             )
         if kind == "schema":
             digest = hashlib.sha256(direct_sql.encode()).hexdigest()
-            risk = "high" if _MIGRATION_DANGER.search(direct_sql) else "low"
+            risk = "high" if is_high_risk_sql(direct_sql) else "low"
             expected = [{
                 "path": f"AI 直接 SQL {digest[:8]}", "sha256": digest,
                 "risk": risk, "sql": direct_sql,
