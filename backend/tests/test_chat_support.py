@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 import httpx
 
 from app.chat.diagnostics import deployment_from_message_url, diagnose_blank_frontend
-from app.chat_support import extract_external_mysql_config, format_failure_diagnosis
+from app.chat.external_services import extract_external_mysql_config
+from app.chat.responses import format_failure_diagnosis
 
 
 class ChatSupportTests(unittest.TestCase):

@@ -40,7 +40,9 @@ from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
 from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
 from .backup import router as backup_router, start_backup_scheduler
 from .chat.diagnostics import deployment_from_message_url, diagnose_blank_frontend
-from .chat_support import extract_external_mysql_config, format_failure_diagnosis, session_task_state
+from .chat.external_services import extract_external_mysql_config
+from .chat.responses import format_failure_diagnosis
+from .chat.session_state import session_task_state
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
