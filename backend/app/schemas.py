@@ -32,6 +32,14 @@ class UserCreate(BaseModel):
     password: str = Field(min_length=8)
     role: Role = Role.deployer
 
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,63}", value):
+            raise ValueError("登录账号须以字母开头，仅支持字母、数字、下划线和短横线")
+        return value
+
     @field_validator("display_name")
     @classmethod
     def validate_display_name(cls, value: str) -> str:
@@ -47,6 +55,16 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=8)
     role: Role | None = None
     active: bool | None = None
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,63}", value):
+            raise ValueError("登录账号须以字母开头，仅支持字母、数字、下划线和短横线")
+        return value
 
     @field_validator("display_name")
     @classmethod

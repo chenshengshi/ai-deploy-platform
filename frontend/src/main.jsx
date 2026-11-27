@@ -8391,6 +8391,10 @@ function UserModal({ user, onClose, onDone }) {
   });
   const submit = async () => {
     if (editing && !hasChanges) return;
+    if (!/^[A-Za-z][A-Za-z0-9_-]{2,63}$/.test(f.username.trim())) {
+      setErr("登录账号须以字母开头，仅支持字母、数字、下划线和短横线");
+      return;
+    }
     if (!/^[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF·]{2,20}$/.test(f.display_name.trim())) {
       setErr("请输入 2 至 20 个汉字的真实姓名");
       return;
@@ -8434,8 +8438,10 @@ function UserModal({ user, onClose, onDone }) {
   return (
     <Modal title={editing ? "编辑用户账号" : "添加用户"} className="user-account-modal" onClose={onClose}>
       <div className="form-grid user-account-form">
-        <Field label="登录账号">
+        <Field label="登录账号" hint="建议使用姓名全拼，仅支持字母、数字、下划线和短横线">
           <input
+            placeholder="请输入登录账号，如：zhangsan"
+            maxLength={64}
             value={f.username}
             onChange={(e) => setF({ ...f, username: e.target.value })}
           />

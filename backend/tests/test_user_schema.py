@@ -17,6 +17,11 @@ class UserSchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             UserCreate(username="zhangsan", display_name="Zhang San", password="password123")
 
+    def test_new_user_rejects_chinese_or_spaced_login_account(self):
+        for username in ("张三", "zhang san", "123zhang"):
+            with self.subTest(username=username), self.assertRaises(ValidationError):
+                UserCreate(username=username, display_name="张三", password="password123")
+
     def test_existing_user_can_be_updated_without_changing_name(self):
         update = UserUpdate(active=True)
 
