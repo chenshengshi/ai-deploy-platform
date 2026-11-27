@@ -2,7 +2,6 @@ import re
 import json
 import base64
 import copy
-from contextlib import contextmanager
 import ipaddress
 import shlex
 import shutil
@@ -45,6 +44,7 @@ from .database import SessionLocal
 from .deployment_logs import append_deployment_log, read_deployment_log
 from .deployment.verification import frontend_code_warning, has_fatal_startup_error, http_status_accepted, required_route_accepted
 from .deployment.source_paths import discover_source_root, git_source_location
+from .deployment.source_cache import source_cache_guard, source_cache_lock
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -124,8 +124,6 @@ PLATFORM_IMAGE_VARIABLES = {
 
 
 
-_SOURCE_CACHE_LOCKS: dict[str, threading.Lock] = {}
-_SOURCE_CACHE_LOCKS_GUARD = threading.Lock()
 _DEPLOYMENT_LOG_LOCKS: dict[str, threading.Lock] = {}
 _DEPLOYMENT_LOG_LOCKS_GUARD = threading.Lock()
 
@@ -217,38 +215,6 @@ def verify_registry_tag(repository: str, tag: str, attempts: int = 5) -> bool:
             if attempt + 1 < attempts:
                 time.sleep(1)
     return False
-
-
-def source_cache_lock(project_id: str) -> threading.Lock:
-    with _SOURCE_CACHE_LOCKS_GUARD:
-        return _SOURCE_CACHE_LOCKS.setdefault(project_id, threading.Lock())
-
-
-@contextmanager
-def source_cache_guard(project_id: str, workspace_root: Path):
-    """Serialize mutation of the immutable Git cache across API/worker processes."""
-    thread_lock = source_cache_lock(project_id)
-    with thread_lock:
-        lock_handle = None
-        try:
-            lock_path = workspace_root / ".source-cache.lock"
-            lock_handle = lock_path.open("a+")
-            try:
-                import fcntl
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            except ImportError:
-                # Windows development uses the in-process lock; production
-                # containers use flock because API and worker are separate.
-                pass
-            yield
-        finally:
-            if lock_handle is not None:
-                try:
-                    import fcntl
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-                except ImportError:
-                    pass
-                lock_handle.close()
 
 
 class DeploymentCancelled(RuntimeError):
