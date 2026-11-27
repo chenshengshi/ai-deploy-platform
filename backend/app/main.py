@@ -3842,16 +3842,33 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
         _, selected = ssh.run(f"cd {shlex.quote(actual_dir)} && for f in {checks}; do [ -f \"$f\" ] && printf %s \"$f\" && break; done")
         config_file = selected.strip()
         if not config_file:
-            raise HTTPException(404, "未找到编排文件或 Dockerfile")
-        code, content = ssh.run(f"cd {shlex.quote(actual_dir)} && head -c 200000 -- {shlex.quote(config_file)}")
-        if code:
-            raise HTTPException(502, "读取运行配置失败")
-        _, env_output = ssh.run(f"cd {shlex.quote(actual_dir)} && test -f .env && head -c 100000 .env || true")
+            # Central builds intentionally keep only the immutable image and
+            # the release's runtime environment.  A missing source Dockerfile
+            # is therefore normal for an image-backed release, not a reason
+            # to hide its launch configuration from the user.
+            if not item.image_name:
+                raise HTTPException(404, "未找到编排文件、Dockerfile 或平台镜像运行记录")
+            config_file = "平台镜像运行配置"
+            content = (
+                f"镜像: {item.image_name}\n"
+                f"容器: {item.container_name or '应用容器'}\n"
+                f"宿主机端口: {item.host_port or '未记录'}\n"
+                "启动方式: 平台使用已验证镜像直接启动\n"
+            )
+        else:
+            code, content = ssh.run(f"cd {shlex.quote(actual_dir)} && head -c 200000 -- {shlex.quote(config_file)}")
+            if code:
+                raise HTTPException(502, "读取运行配置失败")
+        _, env_output = ssh.run(
+            f"cd {shlex.quote(actual_dir)} && "
+            "if [ -f .env.runtime ]; then head -c 100000 .env.runtime; "
+            "elif [ -f .env ]; then head -c 100000 .env; fi"
+        )
         _, file_listing = ssh.run(
             f"find {shlex.quote(actual_dir)} -maxdepth 6 -type f -size -300k "
             "\\( -name 'Dockerfile*' -o -name '*.Dockerfile' -o -name 'compose.yml' -o -name 'compose.yaml' "
             "-o -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name '.yunzhou*.yml' "
-            "-o -name '.env' -o -name 'nginx.conf' -o -name 'default.conf' \\) -print | head -n 40",
+            "-o -name '.env*' -o -name 'nginx.conf' -o -name 'default.conf' \\) -print | head -n 40",
             timeout=30,
         )
     secret_words = ("password", "secret", "token", "key", "credential")
@@ -3878,7 +3895,7 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
         for remote_path in (line.strip() for line in file_listing.splitlines() if line.strip())
         if remote_path.startswith(actual_dir.rstrip("/") + "/")
     }
-    used_files = {config_file, ".env"}
+    used_files = {config_file, ".env", ".env.runtime"}
     if ".yunzhou.app.yml" in listed_relatives:
         used_files.add(".yunzhou.app.yml")
         used_files.update(name for name in (".yunzhou.app-images.yml", ".yunzhou.external-access.yml") if name in listed_relatives)
@@ -3898,7 +3915,7 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
                 except Exception:
                     continue
                 text_value = raw.decode("utf-8", "replace")
-                if Path(relative).name == ".env":
+                if Path(relative).name.startswith(".env"):
                     safe_lines = []
                     for line in text_value.splitlines():
                         if "=" not in line or line.lstrip().startswith("#"):
@@ -3919,7 +3936,7 @@ def deployment_launch_config(item_id: str, db: Session = Depends(get_db), _: Use
                         safe_lines.append(f"{match.group(1)}******" if match else (f"{env_match.group(1)}******" if env_match else line))
                     text_value = "\n".join(safe_lines)
                 lowered = relative.lower()
-                file_type = "environment" if Path(relative).name == ".env" else (
+                file_type = "environment" if Path(relative).name.startswith(".env") else (
                     "compose" if lowered.endswith((".yml", ".yaml")) else (
                         "nginx" if lowered.endswith(".conf") else "dockerfile"
                     )
