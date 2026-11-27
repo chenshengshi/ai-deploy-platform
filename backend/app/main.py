@@ -3890,7 +3890,7 @@ def delete_project(item_id: str, remove_data: bool = False, delete_volumes: str 
         for dep in deployments:
             node = db.get(Node, dep.node_id)
             if node and dep.status in (DeployStatus.queued, DeployStatus.running):
-                cleanup_results.append(stop_deployment(dep, item, node))
+                cleanup_results.append(stop_deployment(dep, item, node, release_ports=True))
             if dep.status in (DeployStatus.queued, DeployStatus.running, DeployStatus.success):
                 dep.status = DeployStatus.stopped
         db.flush()
@@ -7714,12 +7714,12 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
         output = start_deployment(target, project, node, db)
         access = apply_gateway(target)
         verify_access(db, target.id, access)
-        # `stop_deployment` releases port reservations in a short independent
+        # `stop_deployment` updates port reservations in a short independent
         # session. Commit the outer rollback transaction first, otherwise its
         # reservation lock can make both sessions wait on each other forever.
         db.commit()
         current_stop_started = True
-        stop_output = stop_deployment(current, project, node)
+        stop_output = stop_deployment(current, project, node, release_ports=True)
         output += f"；原线上版本已安全停止：{stop_output}"
     except Exception as exc:
         recovery_errors = []
@@ -7727,7 +7727,7 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
             # The candidate is always isolated by release. A failed switch must
             # remove it before restoring traffic, otherwise a stopped record can
             # leave healthy-looking historical containers behind.
-            stop_deployment(target, project, node)
+            stop_deployment(target, project, node, release_ports=True)
         except Exception as cleanup_exc:
             recovery_errors.append(f"候选版本清理失败：{cleanup_exc}")
         try:

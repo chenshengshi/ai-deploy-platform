@@ -544,7 +544,12 @@ def main():
             # project several times. Stop and verify the interrupted execution;
             # the user can then explicitly start a fresh deployment.
             try:
-                result = stop_deployment(dep, db.get(Project, dep.project_id), db.get(Node, dep.node_id))
+                result = stop_deployment(
+                    dep,
+                    db.get(Project, dep.project_id),
+                    db.get(Node, dep.node_id),
+                    release_ports=True,
+                )
                 dep.status = DeployStatus.stopped
                 dep.error = None
                 dep.log_text = ((dep.log_text or "") + f"\n[恢复] 执行器重启，已安全终止中断任务。{result}\n")[-200_000:]

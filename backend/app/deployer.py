@@ -48,6 +48,7 @@ from .deployment.source_paths import discover_source_root, git_source_location
 from .deployment.source_cache import source_cache_guard, source_cache_lock
 from .deployment.naming import compose_project_name, deployment_compose_project_name, service_container_name as _service_container_name
 from .deployment.workspace import WORKSPACE_BRANCH, persist_verified_changes
+from .deployment.ports import stopped_port_message, stopped_reservation_status
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -4109,11 +4110,12 @@ def _reserve_reactivation_port(db, deployment: Deployment, node: Node, service: 
 def prepare_stopped_release_ports(
     deployment: Deployment, project: Project, node: Node, actual_dir: str, db,
 ) -> str:
-    """Reallocate historical host ports before a stopped release is started.
+    """Validate and restore the ports retained by a stopped release.
 
-    Stopped releases do not own their former ports. Another project may have
-    reused them, so both ordinary reactivation and rollback must reconcile the
-    saved runtime mapping with current database reservations and real listeners.
+    A user-initiated stop keeps the release's reservations, so an ordinary
+    restart normally receives exactly the same addresses.  The reconciliation
+    below remains necessary for legacy records and for ports occupied by an
+    unmanaged process outside the platform.
     """
     if db is None:
         return ""
@@ -9144,7 +9146,7 @@ def execute(deployment_id: str) -> None:
                 try:
                     old_node = db.get(Node, old.node_id)
                     if old_node:
-                        stop_deployment(old, project, old_node)
+                        stop_deployment(old, project, old_node, release_ports=True)
                         log(dep.id, f"[版本切换] 已停止旧版本 {old.release or old.id[:8]}；固定数据卷继续保留。\n")
                 except Exception as stop_exc:
                     log(dep.id, f"[版本切换] 入口已切换，但旧版本 {old.release or old.id[:8]} 自动停止未完成：{stop_exc}\n")
@@ -9297,7 +9299,14 @@ def execute(deployment_id: str) -> None:
                 shutil.rmtree(cleanup_root, ignore_errors=True)
 
 
-def stop_deployment(deployment: Deployment, project: Project, node: Node, *, preserve_runtime: bool = False) -> str:
+def stop_deployment(
+    deployment: Deployment,
+    project: Project,
+    node: Node,
+    *,
+    preserve_runtime: bool = False,
+    release_ports: bool = False,
+) -> str:
     # A central image build may run on the platform server rather than the
     # target node. Stop that process group as part of the same user action.
     builder_stop = "平台构建节点无跟踪进程"
@@ -9394,9 +9403,14 @@ def stop_deployment(deployment: Deployment, project: Project, node: Node, *, pre
                 DeploymentPortReservation.deployment_id == deployment.id,
                 DeploymentPortReservation.status.in_(["reserved", "active"]),
             )).all():
-                reservation.status = "released"
+                # A normal user stop is a pause: keep every assigned port owned
+                # by this release so another platform project cannot claim it.
+                # Replacement versions, failed candidates and project deletion
+                # opt into release_ports=True and return the ports to the pool.
+                reservation.status = stopped_reservation_status(release_ports=release_ports)
             reservation_db.commit()
-        return f"已终止部署进程并关闭容器，复查确认无残留（构建节点 {builder_stop}；目标节点 {target_stop}）"
+        port_result = stopped_port_message(release_ports=release_ports)
+        return f"已终止部署进程并关闭容器，复查确认无残留，{port_result}（构建节点 {builder_stop}；目标节点 {target_stop}）"
 
 
 def stop_project_data_services(project: Project, node: Node, db=None) -> str:
