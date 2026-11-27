@@ -43,6 +43,7 @@ from .build_planning import (
 from .chat.diagnostics import diagnose_blank_frontend
 from .database import SessionLocal
 from .deployment_logs import append_deployment_log, read_deployment_log
+from .deployment.verification import frontend_code_warning, has_fatal_startup_error, http_status_accepted, required_route_accepted
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -4064,7 +4065,7 @@ def verify_access(db, deployment_id: str, access_url: str, required_paths: list[
             # A missing route is not a successful application verification.
             # Protected endpoints may legitimately answer 401/403; otherwise
             # require a normal success or redirect response.
-            accepted = status.isdigit() and (200 <= int(status) < 400 or int(status) in {401, 403})
+            accepted = http_status_accepted(status)
             route_failures: list[str] = []
             if code == 0 and accepted:
                 for required_path in dict.fromkeys(required_paths or []):
@@ -4080,7 +4081,7 @@ def verify_access(db, deployment_id: str, access_url: str, required_paths: list[
                         f"{route_args} -w '%{{http_code}}' {shlex.quote(probe_target)}"
                     )
                     probe_status = probe_output.strip()[-3:] if probe_output.strip() else "000"
-                    probe_ok = probe_code == 0 and probe_status.isdigit() and int(probe_status) < 500
+                    probe_ok = required_route_accepted(probe_code, probe_status)
                     if not probe_ok:
                         route_failures.append(f"{required_path}=HTTP {probe_status}")
                 if route_failures:
@@ -4090,12 +4091,7 @@ def verify_access(db, deployment_id: str, access_url: str, required_paths: list[
                 else:
                     frontend_issue = diagnose_blank_frontend(access_url)
                     if frontend_issue:
-                        evidence = frontend_issue["evidence"][0]
-                        detail = (
-                            "frontend_public_base_mismatch："
-                            f"页面引用 {evidence['reference']}，但返回 {evidence['content_type']}；"
-                            f"实际资源位于 {evidence.get('working_path') or '其他路径'}"
-                        )
+                        detail = frontend_code_warning(frontend_issue)
                         # The platform has successfully built, started and
                         # exposed the service. A wrong SPA public base is a
                         # project-code defect, so keep the release successful
@@ -4123,9 +4119,7 @@ def verify_access(db, deployment_id: str, access_url: str, required_paths: list[
                     f"{route_args} -w '%{{http_code}}' {shlex.quote(root_target)}"
                 )
                 root_status = root_output.strip()[-3:] if root_output.strip() else "000"
-                root_accepted = root_status.isdigit() and (
-                    200 <= int(root_status) < 400 or int(root_status) in {401, 403}
-                )
+                root_accepted = http_status_accepted(root_status)
                 if root_code == 0 and root_accepted:
                     log(
                         deployment_id,
@@ -4145,12 +4139,7 @@ def verify_access(db, deployment_id: str, access_url: str, required_paths: list[
             log(deployment_id, f"[检查] 第 {attempt}/{max_attempts} 次访问尚未就绪：{last_output[-300:]}\n")
             if attempt in (2, 4, 6):
                 diagnostic_text = collect_diagnostics()
-                fatal_markers = (
-                    "application run failed", "could not resolve placeholder",
-                    "failed to start web server", "exception encountered during context initialization",
-                    "exec format error",
-                )
-                if diagnostic_text and any(marker in diagnostic_text.lower() for marker in fatal_markers):
+                if has_fatal_startup_error(diagnostic_text):
                     log(deployment_id, "[访问诊断] 已发现确定性启动错误，停止无意义的重复 HTTP 检查。\n")
                     ai_checkpoint(deployment_id, "访问失败诊断", diagnostic_text[-5000:])
                     raise RuntimeError(
