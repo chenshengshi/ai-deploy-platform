@@ -1221,6 +1221,12 @@ function Chat() {
     });
     loadSessions(false);
   }, []);
+  const hasActiveSessionTask = sessions.some((item) => item.has_active_task);
+  useEffect(() => {
+    if (showArchived || !hasActiveSessionTask) return undefined;
+    const timer = setInterval(() => loadSessions(false).catch(() => {}), 3000);
+    return () => clearInterval(timer);
+  }, [showArchived, hasActiveSessionTask]);
   useEffect(() => {
     let stopped = false;
     const resume = async () => {
@@ -1564,10 +1570,8 @@ function Chat() {
                   <b>{item.title}</b>
                   <span>{item.project_name} · {item.message_count} 条</span>
                 </button>
-                {item.latest_action?.startsWith("workflow_")
-                  && !item.latest_action.startsWith("workflow_success")
-                  && !item.latest_action.startsWith("workflow_failed")
-                  && <span className="chat-session-running" title="正在处理"><LoaderCircle className="spin" /></span>}
+                {item.has_active_task
+                  && <span className="chat-session-running" title={item.active_task_label || "正在处理"}><LoaderCircle className="spin" /></span>}
                 {showArchived ? (
                   <div className="chat-session-actions">
                     <button title="恢复" onClick={() => restoreSession(item.id)}><RefreshCw /></button>

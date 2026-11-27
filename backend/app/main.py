@@ -39,6 +39,7 @@ from .archive_utils import safe_extract_zip
 from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
 from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
 from .backup import router as backup_router, start_backup_scheduler
+from .chat_support import format_failure_diagnosis, session_task_state
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
@@ -8373,12 +8374,15 @@ def _chat_session_dict(db: Session, session: ChatSession) -> dict:
     project = db.get(Project, session.project_id) if session.project_id else None
     message_count = db.scalar(select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session.id)) or 0
     latest_message = db.scalar(select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at.desc()).limit(1))
+    has_active_task, active_task_label = session_task_state(db, session, latest_message.action if latest_message else None)
     return {
         "id": session.id, "title": session.title, "project_id": session.project_id,
         "project_name": project.name if project else "全局助手", "node_id": session.node_id,
         "ai_config_id": session.ai_config_id,
         "visibility": session.visibility, "archived": session.archived,
         "latest_action": latest_message.action if latest_message else None,
+        "has_active_task": has_active_task,
+        "active_task_label": active_task_label,
         "message_count": message_count, "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -9068,12 +9072,24 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
                     node_id=(online or active or latest).node_id, intent=None,
                 )
             failed_node = db.get(Node, failed.node_id)
-            failure_text = (failed.error or "平台没有记录明确错误，请打开该发布记录查看完整日志。").strip().splitlines()[0][:500]
+            try:
+                diagnosis = deployment_followup(
+                    db, failed, target_project, failed_node,
+                    "失败诊断", (failed.log_text or "")[-16_000:],
+                )
+            except Exception:
+                diagnosis = {
+                    "summary": (failed.error or "平台没有记录明确错误").strip().splitlines()[0][:500],
+                    "scope": "unknown", "evidence": [],
+                    "advice": "请查看完整发布日志后处理。",
+                }
             return respond(
-                f"结论：“{target_project.name}”最近一次发布失败。\n"
-                f"失败原因：{failure_text}\n"
-                f"服务器：{failed_node.name if failed_node else '服务器记录已移除'}；版本：{failed.release or '构建前失败'}。\n"
-                "下一步：可以打开该发布记录的 AI 诊断，平台会根据完整日志给出修复方案。",
+                format_failure_diagnosis(
+                    target_project.name,
+                    failed_node.name if failed_node else "服务器记录已移除",
+                    failed.release,
+                    diagnosis,
+                ),
                 deployment_id=failed.id, action="answer", project_id=project_id,
                 node_id=failed.node_id, intent=None,
             )
