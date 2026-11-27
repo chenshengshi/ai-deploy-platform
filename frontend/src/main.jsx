@@ -4262,6 +4262,7 @@ function ProjectDetail({
                   </b>
                   <small>
                     {d.node_name} · {time(d.created_at)} · {deploymentDuration(d)}
+                    {d.requested_by_display_name && ` · 发布人 ${d.requested_by_display_name}`}
                   </small>
                   {d.rollback_transition?.kind === "rollback_target" && (
                     <small className="release-transition rollback-target">

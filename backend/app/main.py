@@ -4429,6 +4429,7 @@ def deployment_view(
 ) -> dict:
     data = DeploymentOut.model_validate(item).model_dump()
     project, node = db.get(Project, item.project_id), db.get(Node, item.node_id)
+    requester = db.get(User, item.requested_by)
     database_log_text = item.log_text or ""
     log_text = database_log_text
     # The database value is deliberately a compact live window and can lose a
@@ -4677,6 +4678,8 @@ def deployment_view(
         "project_domain": project.domain if project else None,
         "node_name": node.name if node else "未知节点",
         "node_address": node.host if node else "",
+        "requested_by_username": requester.username if requester else None,
+        "requested_by_display_name": (requester.display_name or requester.username) if requester else None,
         "progress": progress,
         "current_step": current_step,
         "pipeline_steps": pipeline_steps(log_text, DeployStatus.success if "[完成]" in log_text else item.status, stage, bool(plan and plan["build_mode"] == "Docker Compose")) if include_log else [],

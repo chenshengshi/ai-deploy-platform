@@ -229,6 +229,8 @@ class DeploymentOut(ORM):
     project_id: str
     node_id: str
     requested_by: str
+    requested_by_username: str | None = None
+    requested_by_display_name: str | None = None
     status: DeployStatus
     trigger: str
     release: str | None
