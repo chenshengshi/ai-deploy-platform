@@ -6706,12 +6706,15 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
         except Exception as exc:
             data_service_evidence = f"[数据服务实时诊断采集失败] {type(exc).__name__}"
     data_signature = hashlib.sha256(data_service_evidence.encode("utf-8", errors="ignore")).hexdigest()[:12] if data_service_evidence else "-"
-    cache_key = f"{item.status.value}|{active['title']}|{item.access_url or '-'}|{live_states}|{data_signature}"
     marker = "[AI跟进] "
     evidence = active.get("log", "") + ("\n[实时运行状态]\n" + json.dumps((live or {}).get("containers", []), ensure_ascii=False) if live is not None else "")
     if data_service_evidence:
         evidence += "\n[项目级数据服务实时日志]\n" + data_service_evidence[-12000:]
     combined_evidence = evidence + "\n" + (item.error or "")
+    evidence_signature = hashlib.sha256(combined_evidence.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    # Include both evidence and the diagnosis policy version. A previously
+    # cached generic AI answer must not hide a newer deterministic diagnosis.
+    cache_key = f"diagnosis-v2|{item.status.value}|{active['title']}|{item.access_url or '-'}|{live_states}|{data_signature}|{evidence_signature}"
     project_values = environment_values(decrypt(project.env_text_encrypted) or "") if project else {}
     external_mysql_env_error = (
         project_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() == "external"

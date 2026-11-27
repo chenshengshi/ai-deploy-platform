@@ -720,7 +720,11 @@ def deployment_followup(db: Session, deployment: Deployment, project: Project, n
             "evidence": ["AUTH failed: WRONGPASS invalid username-password pair"],
             "retry_safe": True,
         }
-    deterministic = assess_failure(deployment.error or stage_log)
+    # The deployment summary often contains only an outer Compose failure
+    # (for example ``dependency failed to start``). Always include the stage
+    # log so the deterministic classifier can prefer the inner application
+    # error and name the exact missing setting or source failure.
+    deterministic = assess_failure("\n".join(part for part in (deployment.error, stage_log) if part))
     if deterministic.scope != "unknown":
         return {
             "source": "system",
