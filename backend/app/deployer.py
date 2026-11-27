@@ -5763,6 +5763,7 @@ def central_build_and_distribute(
             docker_text = dockerfile.read_text(encoding="utf-8", errors="ignore")
             collapsed = re.sub(r"\\\s*\r?\n\s*", " ", docker_text)
             required_roots: set[str] = set()
+            explicit_generated_inputs: set[str] = set()
             for match in re.finditer(r"(?im)^\s*(?:COPY|ADD)\s+(.+)$", collapsed):
                 instruction = match.group(1).strip()
                 try:
@@ -5783,6 +5784,9 @@ def central_build_and_distribute(
                     top = normalized.replace("\\", "/").split("/", 1)[0]
                     if top and (context / top).exists():
                         required_roots.add(top)
+                        normalized_path = normalized.replace("\\", "/").rstrip("/")
+                        if any(part in {"dist", "build", "out"} for part in normalized_path.split("/")):
+                            explicit_generated_inputs.add(normalized_path)
             if not required_roots:
                 return []
             ignore_file = context / ".dockerignore"
@@ -5803,6 +5807,14 @@ def central_build_and_distribute(
                     # Docker ignore rules are order-sensitive.  Append even
                     # when the repository already contains the same pattern:
                     # the preceding ``!top/**`` would otherwise re-include it.
+                    lines.append(pattern)
+                    added.append(pattern)
+            # Runtime-only Dockerfiles explicitly COPY a completed dist/build
+            # directory. Re-include that exact artifact after the broad
+            # dependency/output exclusions above. Multi-stage Dockerfiles
+            # that merely COPY the source root still keep stale artifacts out.
+            for artifact in sorted(explicit_generated_inputs):
+                for pattern in (f"!{artifact}/", f"!{artifact}/**"):
                     lines.append(pattern)
                     added.append(pattern)
             if added:
