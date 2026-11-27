@@ -41,6 +41,7 @@ from .build_planning import (
     valid_generated_dockerfile,
 )
 from .database import SessionLocal
+from .deployment_build_repairs import apply_dockerfile_text_repairs
 from .deployment_architecture import (
     COMPOSE_NAMES,
     analyze_repository_topology,
@@ -760,48 +761,6 @@ def optimize_staged_sources(path: str) -> list[str]:
     return changed
 
 
-_OPTIONAL_STAGE_COPY_DIRECTORIES = {"public"}
-
-
-def remove_verified_missing_optional_stage_copy(dockerfile_text: str, previous_error: str) -> str:
-    """Remove an optional stage copy only after Docker proves it is absent.
-
-    Generated Node runtime stages often copy ``/app/public`` even though that
-    directory is optional and many API-only repositories never create it.  We
-    deliberately do not generalize this to build outputs such as ``dist`` or
-    ``build``: a missing primary artifact must still fail loudly.
-    """
-    missing_match = re.search(
-        r"COPY failed:\s*stat\s+/?(?P<path>[^:\r\n]+):\s*file does not exist",
-        previous_error or "",
-        re.I,
-    )
-    if not missing_match:
-        return dockerfile_text
-    missing_source = missing_match.group("path").strip().strip("'\"").replace("\\", "/").lstrip("/").rstrip("/")
-    if Path(missing_source).name.lower() not in _OPTIONAL_STAGE_COPY_DIRECTORIES:
-        return dockerfile_text
-
-    copy_pattern = re.compile(
-        r"(?im)^(?P<line>\s*COPY\s+(?=[^\r\n]*--from=)[^\r\n]+)(?:\r?\n|$)"
-    )
-
-    def remove_if_exact_source(match: re.Match) -> str:
-        line = match.group("line")
-        # Generated Dockerfiles use shell-form COPY.  Refuse JSON-form or an
-        # ambiguous multi-source instruction instead of guessing.
-        if "[" in line or "]" in line:
-            return match.group(0)
-        tokens = re.findall(r"(?:[^\s\"']+|\"[^\"]*\"|'[^']*')+", line.strip())
-        operands = [token.strip("'\"") for token in tokens[1:] if not token.startswith("--")]
-        if len(operands) != 2:
-            return match.group(0)
-        source = operands[0].replace("\\", "/").lstrip("/").rstrip("/")
-        return "" if source == missing_source else match.group(0)
-
-    return copy_pattern.sub(remove_if_exact_source, dockerfile_text)
-
-
 def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: str = "managed_fresh") -> list[str]:
     """Apply bounded, reversible fixes to the isolated release copy only.
 
@@ -882,69 +841,14 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
         if not dockerfile.is_file() or ".git" in dockerfile.parts:
             continue
         original = dockerfile.read_text(encoding="utf-8", errors="replace")
-        # The legacy 3.10 kernels still present on some target nodes reject
-        # the pid-file write used by the moving nginx:alpine tag. Pin the
-        # platform-tested release instead of allowing a future base-image
-        # update to break an unchanged application at runtime.
-        original_pinned = re.sub(
-            r"(?im)^(\s*FROM\s+)nginx:alpine(\s*(?:AS\s+\S+)?\s*)$",
-            rf"\1{PLATFORM_NGINX_IMAGE}\2",
+        current, text_repairs = apply_dockerfile_text_repairs(
             original,
+            previous_error,
+            nginx_image=PLATFORM_NGINX_IMAGE,
         )
-        if original_pinned != original:
-            dockerfile.write_text(original_pinned, encoding="utf-8")
-            original = original_pinned
+        if text_repairs:
+            dockerfile.write_text(current, encoding="utf-8")
             changed.append(dockerfile.relative_to(root).as_posix())
-        repaired = re.sub(
-            r"(?m)^(\s*RUN)\s+--mount=type=cache(?:,[^\s]+)*\s+",
-            r"\1 ",
-            original,
-        )
-        if repaired != original:
-            dockerfile.write_text(repaired, encoding="utf-8")
-            changed.append(dockerfile.relative_to(root).as_posix())
-        # Do not let a generated runtime stage assume an optional directory
-        # exists.  This repair is evidence-driven: Docker must name the exact
-        # missing source path, and only the matching COPY --from instruction
-        # is removed.  Required artifacts remain strict build failures.
-        current = dockerfile.read_text(encoding="utf-8", errors="replace")
-        optional_copy_repaired = remove_verified_missing_optional_stage_copy(current, previous_error)
-        if optional_copy_repaired != current:
-            dockerfile.write_text(optional_copy_repaired, encoding="utf-8")
-            current = optional_copy_repaired
-            relative = dockerfile.relative_to(root).as_posix()
-            if relative not in changed:
-                changed.append(relative)
-        # A multi-module Maven build writes the executable JAR below a module
-        # directory (for example ruoyi-admin/target), not necessarily the
-        # reactor root's target/.  Repair only after Docker proves that the
-        # generated root-target lookup is wrong.  The release copy is isolated
-        # from the user's repository, and the largest non-source JAR is the
-        # same deterministic executable-artifact rule used by the platform's
-        # Maven pre-builder.
-        missing_root_maven_target = (
-            "find:" in error
-            and "target" in error
-            and "no such file or directory" in error
-            and ("find target" in error or "find: ‘target’" in error or "find: 'target'" in error)
-        )
-        if missing_root_maven_target:
-            current = dockerfile.read_text(encoding="utf-8", errors="replace")
-            root_target_find = re.compile(
-                r"find\s+(?:\./)?target\s+-name\s+(['\"])\*\.jar\1"
-                r"(?:\s+!\s+-name\s+(['\"])original-\*\2)?\s+-type\s+f\s*\|\s*head\s+-n\s*1"
-            )
-            repaired_maven = root_target_find.sub(
-                "find . -path '*/target/*.jar' ! -name 'original-*' "
-                "! -name '*-sources.jar' ! -name '*-javadoc.jar' -type f "
-                "-printf '%s %p\\n' | sort -nr | head -n1 | cut -d' ' -f2-",
-                current,
-            )
-            if repaired_maven != current:
-                dockerfile.write_text(repaired_maven, encoding="utf-8")
-                relative = dockerfile.relative_to(root).as_posix()
-                if relative not in changed:
-                    changed.append(relative)
         # Debian 11 security indices can temporarily reference superseded
         # openssl/ca-certificates packages that have already disappeared from
         # every mirror.  For Node Bullseye images, prefer the same official
