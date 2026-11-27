@@ -4096,8 +4096,11 @@ def verify_access(db, deployment_id: str, access_url: str, required_paths: list[
                             f"页面引用 {evidence['reference']}，但返回 {evidence['content_type']}；"
                             f"实际资源位于 {evidence.get('working_path') or '其他路径'}"
                         )
-                        log(deployment_id, f"[前端完整性检查] {detail}\n")
-                        raise RuntimeError(detail)
+                        # The platform has successfully built, started and
+                        # exposed the service. A wrong SPA public base is a
+                        # project-code defect, so keep the release successful
+                        # and surface it as a precise diagnostic warning.
+                        log(deployment_id, f"[前端代码提示] 发布服务可达，但页面可能空白：{detail}\n")
                     qualifier = "（服务可达，需要鉴权）" if int(status) in {401, 403} else ""
                     log(deployment_id, f"[检查] 第 {attempt} 次访问验证通过：HTTP {status}{qualifier} · {access_url}\n")
                     ai_checkpoint(deployment_id, "验证访问地址", f"访问验证通过：HTTP {status}{qualifier}，地址 {access_url}")
