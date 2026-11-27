@@ -63,6 +63,7 @@ from .deployment_build_handlers import detect_build as _detect_build, detect_con
 from .deployment_build_profiles import compatible_node_image, detect_build_profiles
 from .deployment_build_generators import generate_profile_build, generate_static_build
 from .deployment_topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
+from .deployment_source_repairs import build_source_patch, persist_repair_bundle, snapshot_text_sources
 from .deployment_runtime_policy import data_compose_project, release_directories, validate_release
 from .deployment_runtime_ports import (
     compose_port_number as _compose_port_number,
@@ -8049,6 +8050,8 @@ def execute(deployment_id: str) -> None:
     public_access = None
     preempted_shared_containers: list[str] = []
     verification_paths: list[str] = []
+    source_repair_baseline: dict[str, str] | None = None
+    persist_source_repair = False
     with SessionLocal() as db:
         dep = db.get(Deployment, deployment_id)
         if not dep:
@@ -8076,6 +8079,7 @@ def execute(deployment_id: str) -> None:
             log(dep.id, "[准备] 正在获取项目源码...\n")
             ensure_active(dep.id)
             work, revision, cleanup_root, source_subpath = stage_source(project, db, dep.id)
+            source_repair_baseline = snapshot_text_sources(Path(work))
             ensure_active(dep.id)
             previous_error = ""
             # A user-requested retry must receive the same bounded repair
@@ -8255,6 +8259,7 @@ def execute(deployment_id: str) -> None:
             # before the first remote pull/build instead of waiting to fail.
             preflight_sources = optimize_staged_sources(work)
             repaired_files = apply_safe_build_repairs(work, previous_error, project.deployment_mode)
+            persist_source_repair = bool(previous_error and repaired_files)
             preflight_changes = list(dict.fromkeys(preflight_sources + repaired_files))
             if repaired_files:
                 repair_detail = "已修改发布副本中的 " + "、".join(repaired_files)
@@ -9328,6 +9333,33 @@ def execute(deployment_id: str) -> None:
             )[-200_000:]
             db.commit()
         finally:
+            if work and project and source_repair_baseline is not None and persist_source_repair:
+                try:
+                    final_dep = db.get(Deployment, deployment_id)
+                    patch = build_source_patch(source_repair_baseline, Path(work))
+                    verification_lines = [
+                        line for line in (final_dep.log_text or "").splitlines()
+                        if line.startswith(("[修复变更]", "[AI自动修复]", "[阶段完成]", "[阶段失败]", "[完成]", "[失败]"))
+                    ]
+                    bundle = persist_repair_bundle(
+                        Path(settings.build_data_root) / "builder" / "repairs",
+                        project_slug=project.slug,
+                        deployment_id=deployment_id,
+                        patch=patch,
+                        verified=final_dep.status == DeployStatus.success,
+                        report={
+                            "project_name": project.name,
+                            "release": final_dep.release,
+                            "trigger": final_dep.trigger,
+                            "summary": "隔离发布副本中的自动修复；未写回用户源码仓库",
+                        },
+                        verification_lines=verification_lines,
+                    )
+                    if bundle:
+                        log(final_dep.id, f"[修复候选] 已保存{('验证成功' if final_dep.status == DeployStatus.success else '最近失败')}补丁；原始源码未修改。\n")
+                except Exception as repair_bundle_exc:
+                    if dep:
+                        log(dep.id, f"[修复候选] 补丁归档失败但不影响发布结果：{repair_bundle_exc}\n")
             # The fixed source checkout is intentionally retained and replaced
             # on the next fetch. Only transfer artifacts are release-specific.
             if 'release' in locals() and project:
