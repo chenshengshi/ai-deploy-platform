@@ -383,6 +383,10 @@ def startup():
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS registry_namespace VARCHAR(100) NOT NULL DEFAULT 'yunzhou'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS analysis_concurrency INTEGER NOT NULL DEFAULT 2"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS build_cache_root VARCHAR(500) NOT NULL DEFAULT '/data/yunzhou/builder/cache'"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS build_cache_max_gb INTEGER NOT NULL DEFAULT 30"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS builder_min_free_gb INTEGER NOT NULL DEFAULT 20"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS builder_workspace_ttl_hours INTEGER NOT NULL DEFAULT 6"))
+        connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS docker_build_cache_keep_gb INTEGER NOT NULL DEFAULT 10"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS maven_cache_dir VARCHAR(255) NOT NULL DEFAULT '/root/.m2'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS gradle_cache_dir VARCHAR(255) NOT NULL DEFAULT '/home/gradle/.gradle'"))
         connection.execute(text("ALTER TABLE deployment_settings ADD COLUMN IF NOT EXISTS npm_cache_dir VARCHAR(255) NOT NULL DEFAULT '/root/.npm'"))
@@ -8220,6 +8224,10 @@ def update_deployment_settings(body: DeploymentSettingsIn, db: Session = Depends
     item.registry_endpoint = endpoint
     item.registry_namespace = body.registry_namespace.strip().lower()
     item.build_cache_root = body.build_cache_root.strip().rstrip("/")
+    item.build_cache_max_gb = body.build_cache_max_gb
+    item.builder_min_free_gb = body.builder_min_free_gb
+    item.builder_workspace_ttl_hours = body.builder_workspace_ttl_hours
+    item.docker_build_cache_keep_gb = body.docker_build_cache_keep_gb
     item.maven_cache_dir = body.maven_cache_dir.strip().rstrip("/")
     item.gradle_cache_dir = body.gradle_cache_dir.strip().rstrip("/")
     item.npm_cache_dir = body.npm_cache_dir.strip().rstrip("/")

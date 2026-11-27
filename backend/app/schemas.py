@@ -260,6 +260,10 @@ class DeploymentSettingsIn(BaseModel):
     registry_endpoint: str = Field(default="yunzhou.hub:5000", min_length=3, max_length=255)
     registry_namespace: str = Field(default="yunzhou", min_length=1, max_length=100, pattern=r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
     build_cache_root: str = Field(default="/data/yunzhou/builder/cache", min_length=1, max_length=500)
+    build_cache_max_gb: int = Field(default=30, ge=1, le=2048)
+    builder_min_free_gb: int = Field(default=20, ge=5, le=1024)
+    builder_workspace_ttl_hours: int = Field(default=6, ge=1, le=168)
+    docker_build_cache_keep_gb: int = Field(default=10, ge=1, le=1024)
     maven_cache_dir: str = Field(default="/root/.m2", min_length=1, max_length=255)
     gradle_cache_dir: str = Field(default="/home/gradle/.gradle", min_length=1, max_length=255)
     npm_cache_dir: str = Field(default="/root/.npm", min_length=1, max_length=255)
@@ -289,6 +293,10 @@ class DeploymentSettingsOut(ORM):
     registry_endpoint: str
     registry_namespace: str
     build_cache_root: str
+    build_cache_max_gb: int
+    builder_min_free_gb: int
+    builder_workspace_ttl_hours: int
+    docker_build_cache_keep_gb: int
     maven_cache_dir: str
     gradle_cache_dir: str
     npm_cache_dir: str

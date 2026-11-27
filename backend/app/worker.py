@@ -14,6 +14,7 @@ from sqlalchemy import select
 from .config import settings
 from .database import Base, SessionLocal, engine
 from .deployment_repair_policy import MAX_AI_RETRIES, assess_failure
+from .deployment_storage_policy import select_lru_evictions
 from .deployer import (
     cleanup_incomplete_release_images,
     deployment_compose_project_name,
@@ -178,6 +179,11 @@ def maintain_builder_storage() -> None:
         ).count()
         existing_project_slugs = set(db.scalars(select(Project.slug)).all())
         builder = platform_gateway_node(db)
+        policy = db.get(DeploymentSettings, "default")
+        cache_limit_gb = int((policy.build_cache_max_gb if policy else None) or settings.build_cache_max_gb or 30)
+        min_free_gb = int((policy.builder_min_free_gb if policy else None) or settings.builder_min_free_gb)
+        workspace_ttl_hours = int((policy.builder_workspace_ttl_hours if policy else None) or settings.builder_workspace_ttl_hours)
+        docker_cache_keep_gb = int((policy.docker_build_cache_keep_gb if policy else None) or settings.docker_build_cache_keep_gb)
         db.commit()
     if active_count or not builder:
         return
@@ -186,6 +192,15 @@ def maintain_builder_storage() -> None:
     for project_dir in project_root.iterdir() if project_root.exists() else []:
         if project_dir.is_dir() and project_dir.name not in existing_project_slugs:
             shutil.rmtree(project_dir, ignore_errors=True)
+            continue
+        runs_root = project_dir / "runs"
+        cutoff = now - max(1, workspace_ttl_hours) * 3600
+        for run_dir in runs_root.iterdir() if runs_root.exists() else []:
+            try:
+                if run_dir.is_dir() and run_dir.stat().st_mtime < cutoff:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+            except OSError:
+                continue
     # Cache leaves are <project>/<service>/<architecture>. Delete least recently
     # used leaves until the configured platform-wide limit is satisfied.
     leaves = []
@@ -201,20 +216,27 @@ def maintain_builder_storage() -> None:
                             leaves.append((arch_dir.stat().st_mtime, _tree_size(arch_dir), arch_dir))
                         except OSError:
                             continue
-    total = sum(size for _mtime, size, _path in leaves)
+            dependency_root = project_dir / "dependencies"
+            if dependency_root.is_dir():
+                try:
+                    leaves.append((dependency_root.stat().st_mtime, _tree_size(dependency_root), dependency_root))
+                except OSError:
+                    pass
+    shared_cache_root = Path(root) / "cache"
+    for tool_cache in shared_cache_root.iterdir() if shared_cache_root.exists() else []:
+        if tool_cache.is_dir():
+            try:
+                leaves.append((tool_cache.stat().st_mtime, _tree_size(tool_cache), tool_cache))
+            except OSError:
+                continue
     disk = shutil.disk_usage(settings.build_data_root)
-    reserve = max(1, settings.builder_min_free_gb) * 1024 ** 3
-    # A zero cache limit means unlimited: keep useful caches until disk free
-    # space reaches the safety floor. A positive value remains available for
-    # installations that explicitly want a hard cap.
-    free_space_limit = max(0, disk.free + total - reserve)
-    configured_limit = settings.build_cache_max_gb * 1024 ** 3
-    limit = min(configured_limit, free_space_limit) if configured_limit > 0 else free_space_limit
-    for _mtime, size, path in sorted(leaves):
-        if total <= limit:
-            break
+    reserve = max(1, min_free_gb) * 1024 ** 3
+    configured_limit = max(1, cache_limit_gb) * 1024 ** 3
+    for path in select_lru_evictions(
+        leaves, cache_limit_bytes=configured_limit,
+        disk_free_bytes=disk.free, reserve_bytes=reserve,
+    ):
         shutil.rmtree(path, ignore_errors=True)
-        total -= size
     with SSHNode(builder) as ssh:
         _code, cleanup_output = ssh.run(
             "removed=0; "
@@ -225,7 +247,7 @@ def maintain_builder_storage() -> None:
             "tags=$(docker image inspect -f '{{json .RepoTags}}' $image 2>/dev/null || echo tagged); "
             "test \"$labels\" = 0 -a \"$mounts\" = 0 -a \"$tags\" = null || continue; "
             "docker rm $id >/dev/null && removed=$((removed+1)); done; echo CLASSIC_BUILD_CONTAINERS_REMOVED=$removed; "
-            f"docker builder prune -af --filter until=168h --keep-storage {max(1, settings.docker_build_cache_keep_gb)}GB >/dev/null 2>&1 || true; "
+            f"docker builder prune -af --filter until=168h --keep-storage {max(1, docker_cache_keep_gb)}GB >/dev/null 2>&1 || true; "
             "docker image prune -f --filter dangling=true --filter until=24h >/dev/null 2>&1 || true"
         )
         if cleanup_output.strip():

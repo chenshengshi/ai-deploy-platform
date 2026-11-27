@@ -9822,6 +9822,22 @@ function DeploymentSettingsPanel({ notify }) {
                 <input value={form.build_cache_root ?? "/data/yunzhou/builder/cache"}
                   onChange={(e) => setForm({ ...form, build_cache_root: e.target.value })} />
               </Field>
+              <Field label="依赖缓存上限（GB）" hint="按最近使用顺序清理；默认最多保留 30 GB">
+                <input type="number" min="1" max="2048" value={form.build_cache_max_gb ?? 30}
+                  onChange={(e) => setForm({ ...form, build_cache_max_gb: Number(e.target.value) })} />
+              </Field>
+              <Field label="最小剩余空间（GB）" hint="低于此空间时优先回收最旧缓存">
+                <input type="number" min="5" max="1024" value={form.builder_min_free_gb ?? 20}
+                  onChange={(e) => setForm({ ...form, builder_min_free_gb: Number(e.target.value) })} />
+              </Field>
+              <Field label="临时工作区保留（小时）" hint="发布完成后的隔离副本到期自动删除；源码缓存不受影响">
+                <input type="number" min="1" max="168" value={form.builder_workspace_ttl_hours ?? 6}
+                  onChange={(e) => setForm({ ...form, builder_workspace_ttl_hours: Number(e.target.value) })} />
+              </Field>
+              <Field label="Docker 构建缓存（GB）" hint="保留可复用镜像层，超过上限时清理 7 天前内容">
+                <input type="number" min="1" max="1024" value={form.docker_build_cache_keep_gb ?? 10}
+                  onChange={(e) => setForm({ ...form, docker_build_cache_keep_gb: Number(e.target.value) })} />
+              </Field>
               <Field label="Maven 容器目录" hint="Maven 标准本地仓库">
                 <input value={form.maven_cache_dir ?? "/root/.m2"}
                   onChange={(e) => setForm({ ...form, maven_cache_dir: e.target.value })} />
