@@ -3982,12 +3982,12 @@ function ProjectDetail({
     setBusy(true);
     try {
       const result = await api(`/deployments/${rollbackConfirm.id}/rollback`, { method: "POST" });
-      notify?.(`已回滚到版本 ${result.release}，访问验证通过`, "success", 6000);
+      notify?.(`已切换到版本 ${result.release}，访问验证通过`, "success", 6000);
       setRollbackConfirm(null);
       await loadDeployments();
       loadRuntime(true);
     } catch (e) {
-      notify?.(e.message || "回滚失败，原线上版本已自动恢复", "error", 8000);
+      notify?.(e.message || "版本切换失败，原线上版本已自动恢复", "error", 8000);
     } finally {
       setBusy(false);
     }
@@ -4642,7 +4642,7 @@ function ProjectDetail({
                   </span>
                   {canEdit && d.rollback_allowed && (
                     <button className="ghost rollback-button" onClick={(event) => { event.stopPropagation(); setRollbackConfirm(d); }}>
-                      <RefreshCw />回滚到此版本
+                      <RefreshCw />切换到此版本
                     </button>
                   )}
                   <ChevronRight />
@@ -4679,10 +4679,10 @@ function ProjectDetail({
       )}
       {rollbackConfirm && (
         <ConfirmDialog
-          title="确认回滚版本"
-          text={`确定回滚到版本 ${rollbackConfirm.release}？`}
+          title="确认切换版本"
+          text={`确定切换到版本 ${rollbackConfirm.release}？`}
           description="平台会先校验并启动目标版本；健康检查和网关切换成功后，才停止当前线上应用。MySQL、Redis 与数据卷保持不动。任何步骤失败都会清理候选版本并保留当前线上版本。"
-          confirmText="确认回滚"
+          confirmText="确认切换"
           busy={busy}
           onClose={() => !busy && setRollbackConfirm(null)}
           onConfirm={rollback}

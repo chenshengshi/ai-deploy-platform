@@ -41,6 +41,7 @@ from .backup import router as backup_router, start_backup_scheduler
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
+from .deployment_log_rendering import compact_docker_pull_log, compact_stage_log
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectAccess, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
@@ -4302,80 +4303,6 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
     return item
 
 
-def compact_docker_pull_log(section: str) -> str:
-    """Collapse terminal-style Docker layer refreshes into one latest row per layer."""
-    lines = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", section).replace("\r", "\n").splitlines()
-    visible: list[str] = []
-    latest: dict[tuple[str, str], str] = {}
-    order: list[tuple[str, str]] = []
-    progress_pattern = re.compile(
-        r"^(?:\[[^\n]+?\]\s*)*([0-9a-f]{12})\s+(Downloading|Extracting)\s+\[.*",
-        re.IGNORECASE,
-    )
-    for line in lines:
-        match = progress_pattern.match(line.strip())
-        if not match:
-            visible.append(line)
-            continue
-        key = (match.group(1), match.group(2).lower())
-        if key not in latest:
-            order.append(key)
-        latest[key] = line
-    if latest:
-        visible.append("[镜像下载进度（每层仅保留最新状态）]")
-        visible.extend(latest[key] for key in order)
-    return "\n".join(visible).strip()
-
-
-def compact_stage_log(section: str) -> str:
-    """Keep live Docker progress readable without altering downloadable logs."""
-    lines = compact_docker_pull_log(section).splitlines()
-    visible: list[str] = []
-    latest_progress: tuple[str, str] | None = None
-    compose_progress: dict[str, str] = {}
-    progress_was_tail = False
-    for line in lines:
-        stripped = line.strip()
-        service_progress = re.search(
-            r"Service\s+(\S+)\s+Building(?:\s+.*?\s)?(\d+(?:\.\d+)?)s\s*$",
-            stripped,
-        )
-        generic_progress = re.search(r"(?:^|\]\s)(?:\[\+\]\s*)?Building\s+\d+/\d+\s*$", stripped)
-        orphan_duration = re.search(r"(?:^|\]\s)\d+(?:\.\d+)?s$", stripped)
-        compose_header = re.match(r"^\[\+\]\s+(?:Running|Pulling|Building|Stopping|Restarting)\s+\d+/\d+", stripped)
-        compose_item = re.match(
-            r"^[^A-Za-z0-9\[]*(Network|Container|Volume|Image)\s+(\S+)\s+"
-            r"(Created|Creating|Started|Starting|Waiting|Running|Healthy|Error|Pulling|Pulled|Removed|Removing)"
-            r"(?:\s+(\d+(?:\.\d+)?s))?\s*$",
-            stripped,
-        )
-        if compose_header:
-            progress_was_tail = True
-            continue
-        if compose_item:
-            kind, name, state, duration = compose_item.groups()
-            compose_progress[f"{kind}:{name}"] = f"{kind} {name} · {state}" + (f" · {duration}" if duration else "")
-            progress_was_tail = True
-            continue
-        if service_progress:
-            latest_progress = (service_progress.group(1), service_progress.group(2))
-            progress_was_tail = True
-            continue
-        if generic_progress or orphan_duration:
-            progress_was_tail = True
-            continue
-        if stripped:
-            progress_was_tail = False
-        visible.append(line)
-    if latest_progress and progress_was_tail:
-        service, seconds = latest_progress
-        visible.append(f"[构建进度] {service} · {seconds}秒")
-    if compose_progress:
-        visible.append("[Compose 最新状态]")
-        visible.extend(compose_progress.values())
-    return "\n".join(visible).strip()
-
-
 def build_log_streams(section: str) -> list[dict]:
     """Split timestamped concurrent build output into service-specific views."""
     channels: dict[str, dict] = {}
@@ -4923,6 +4850,16 @@ def deployment_view(
                 login_info["login_url"] = item.access_url.rstrip("/") + "/" + path.lstrip("/")
         except (TypeError, ValueError, json.JSONDecodeError):
             login_info = None
+    rollback_markers = ("[完成] 部署成功", "[启用确认]", "[回滚完成]")
+    rollback_verified = any(marker in lifecycle_log_text for marker in rollback_markers)
+    if (
+        not rollback_verified
+        and item.status == DeployStatus.stopped
+        and item.release
+        and item.access_url
+        and item.host_port
+    ):
+        rollback_verified = any(marker in read_deployment_log(item.id) for marker in rollback_markers)
     replica_rows = db.scalars(select(ProjectReplica).where(
         ProjectReplica.deployment_id == item.id,
         ProjectReplica.status == "running",
@@ -4968,7 +4905,7 @@ def deployment_view(
             and item.release
             and item.access_url
             and item.host_port
-            and any(marker in lifecycle_log_text for marker in ("[完成] 部署成功", "[启用确认]", "[回滚完成]"))
+            and rollback_verified
         ),
     })
     data["log_text"] = ""
