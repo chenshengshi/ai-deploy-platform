@@ -102,17 +102,19 @@ def chat_service(
         session.node_id = node_id if node_id and db.get(Node, node_id) else session.node_id
         session.updated_at = datetime.now(timezone.utc)
         elapsed_ms = max(0, round((time.perf_counter() - chat_started) * 1000))
-        db.add(ChatMessage(
+        assistant_message = ChatMessage(
             session_id=session.id,
             role="assistant",
             content=reply,
             action=action,
             deployment_id=deployment_id,
             elapsed_ms=elapsed_ms,
-        ))
+        )
+        db.add(assistant_message)
         db.commit()
         return ChatOut(
-            reply=reply, deployment_id=deployment_id, action=action,
+            reply=reply, message_id=assistant_message.id,
+            deployment_id=deployment_id, action=action,
             project_id=project_id, node_id=node_id, intent=intent,
             session_id=session.id, elapsed_ms=elapsed_ms,
         )

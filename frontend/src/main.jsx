@@ -1327,21 +1327,30 @@ function Chat() {
         : defaultAiConfig;
       setAiConfig(restoredModel || "");
       setIntent(null);
-      setMessages(data.messages.map((item) => ({
-        who: item.role === "assistant" ? "ai" : "user",
-        text: item.content,
-        deployment: item.deployment_id,
-        action: item.action,
-        projectId: data.session.project_id,
-        workflowProjectId: item.action?.startsWith("workflow_") ? data.session.project_id : undefined,
-        workflowSessionId: item.action?.startsWith("workflow_") ? id : undefined,
-        workflowMessageId: item.action?.startsWith("workflow_") ? item.id : undefined,
-        workflowDone: item.action?.startsWith("workflow_success") || item.action?.startsWith("workflow_failed"),
-        error: item.action?.startsWith("workflow_failed"),
-        autoRetryCount: Number(item.action?.match(/_retry_(\d+)/)?.[1] || 0),
-        elapsedMs: item.elapsed_ms,
-        createdAt: item.created_at,
-      })));
+      setMessages(data.messages.map((item) => {
+        const isWorkflow = item.action?.startsWith("workflow_");
+        const isTrackableDeployment = Boolean(
+          item.deployment_id
+          && data.session.project_id
+          && ["deploy", "existing_deployment", "repair_deploy"].includes(item.action),
+        );
+        const tracksWorkflow = isWorkflow || isTrackableDeployment;
+        return {
+          who: item.role === "assistant" ? "ai" : "user",
+          text: item.content,
+          deployment: item.deployment_id,
+          action: item.action,
+          projectId: data.session.project_id,
+          workflowProjectId: tracksWorkflow ? data.session.project_id : undefined,
+          workflowSessionId: tracksWorkflow ? id : undefined,
+          workflowMessageId: tracksWorkflow ? item.id : undefined,
+          workflowDone: item.action?.startsWith("workflow_success") || item.action?.startsWith("workflow_failed"),
+          error: item.action?.startsWith("workflow_failed"),
+          autoRetryCount: Number(item.action?.match(/_retry_(\d+)/)?.[1] || 0),
+          elapsedMs: item.elapsed_ms,
+          createdAt: item.created_at,
+        };
+      }));
     } finally {
       setSessionBusy(false);
     }
@@ -1417,9 +1426,26 @@ function Chat() {
       if (r.node_id) setNode(r.node_id);
       if (r.session_id) setSessionId(r.session_id);
       setIntent(r.intent || null);
+      const responseProjectId = r.project_id || project;
+      const tracksDeployment = Boolean(
+        r.deployment_id
+        && responseProjectId
+        && ["deploy", "existing_deployment", "repair_deploy"].includes(r.action),
+      );
       setMessages((x) => [
         ...x,
-        { who: "ai", text: r.reply, deployment: r.deployment_id, action: r.action, projectId: r.project_id || project, elapsedMs: r.elapsed_ms },
+        {
+          who: "ai",
+          text: r.reply,
+          deployment: r.deployment_id,
+          action: r.action,
+          projectId: responseProjectId,
+          elapsedMs: r.elapsed_ms,
+          workflowProjectId: tracksDeployment ? responseProjectId : undefined,
+          workflowSessionId: tracksDeployment ? r.session_id : undefined,
+          workflowMessageId: tracksDeployment ? r.message_id : undefined,
+          workflowDone: false,
+        },
       ]);
       loadSessions();
     } catch (e) {

@@ -437,6 +437,7 @@ class ChatIn(BaseModel):
 
 class ChatOut(BaseModel):
     reply: str
+    message_id: str | None = None
     deployment_id: str | None = None
     action: str | None = None
     project_id: str | None = None
