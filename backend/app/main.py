@@ -44,6 +44,7 @@ from .chat.external_services import extract_external_mysql_config
 from .chat.intents import explicit_project_match, fallback_action_from_message, fuzzy_project_match, is_confirmation, normalize_message
 from .chat.responses import format_failure_diagnosis
 from .chat.sessions import chat_session_dict, chat_session_for_user
+from .chat.status_queries import asks_active_deployment_summary
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .project_data.sql_safety import data_change_confirmation_token, extract_direct_sql, high_risk_matches, is_high_risk_sql, sql_kind
@@ -8106,6 +8107,40 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
             reply=reply, deployment_id=deployment_id, action=action,
             project_id=project_id, node_id=node_id, intent=intent,
             session_id=session.id, elapsed_ms=elapsed_ms,
+        )
+
+    # Platform state questions must come from the database, not from model
+    # context. This keeps answers exact even in a new conversation and avoids
+    # an LLM incorrectly claiming that no task information was supplied.
+    if asks_active_deployment_summary(body.message):
+        active_items = db.scalars(
+            select(Deployment)
+            .where(Deployment.status.in_([DeployStatus.queued, DeployStatus.running]))
+            .order_by(Deployment.created_at.asc())
+        ).all()
+        active_items = [
+            item for item in active_items
+            if _user_can_access_project(db, user, item.project_id)
+        ]
+        if not active_items:
+            return respond(
+                "结论：当前没有正在执行或排队中的发布任务。",
+                action="status", intent="active_deployments",
+            )
+        project_names = {
+            item.id: item.name for item in db.scalars(
+                select(Project).where(Project.id.in_({row.project_id for row in active_items}))
+            ).all()
+        }
+        lines = [f"结论：当前共有 {len(active_items)} 个正在执行或排队中的发布任务。"]
+        for item in active_items:
+            status_text = "正在执行" if item.status == DeployStatus.running else "排队中"
+            progress = f"，进度 {int(item.progress or 0)}%" if item.status == DeployStatus.running else ""
+            lines.append(
+                f"- {project_names.get(item.project_id, item.project_id)}：{status_text}{progress}，版本 {item.release or '待生成'}"
+            )
+        return respond(
+            "\n".join(lines), action="status", intent="active_deployments",
         )
 
     direct_sql = extract_direct_sql(body.message)
