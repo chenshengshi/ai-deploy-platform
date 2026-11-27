@@ -44,8 +44,10 @@ from .deployment_logs import deployment_log_path, read_deployment_log
 from .deployment_log_rendering import compact_docker_pull_log, compact_stage_log
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
+from .login_security import clear_login_failures, enforce_login_source_limit, login_source_ip as _login_source_ip, record_login_failure
 from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectAccess, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
 from .proxy import get_proxy_config, proxy_for, proxy_with_auth, redact_proxy
+from .runtime_cache import invalidate_runtime_cache, read_runtime_cache as _runtime_cache_read, runtime_cache_key as _runtime_cache_key, runtime_cache_lock, write_runtime_cache as _runtime_cache_write
 from .schemas import (
     AiConfigIn,
     AiConfigOut,
@@ -146,110 +148,6 @@ async def enforce_project_ownership(request: Request, call_next):
             if user and not allowed:
                 return JSONResponse(status_code=404, content={"detail": "资源不存在"})
     return await call_next(request)
-
-
-# Runtime discovery opens an SSH session and asks Docker for Compose state and
-# a one-shot resource sample. The project and deployment screens often request
-# the same deployment at the same time, so without a shared single-flight cache
-# both requests repeat the identical remote work. Keep the cache deliberately
-# short: it removes duplicate modal loads while normal polling still observes
-# changes within a few seconds. Explicit refreshes bypass it.
-_RUNTIME_CACHE_TTL = 4.0
-_runtime_cache: dict[tuple, tuple[float, dict]] = {}
-_runtime_cache_locks: dict[tuple, threading.Lock] = {}
-_runtime_cache_guard = threading.Lock()
-
-
-# Add a lightweight source-address limit on top of the existing per-account
-# lockout. This slows username rotation without another service dependency.
-_LOGIN_WINDOW_SECONDS = 15 * 60
-_LOGIN_MAX_FAILURES_PER_IP = 10
-_login_failures_by_ip: dict[str, list[float]] = {}
-_login_failure_guard = threading.Lock()
-
-
-def _login_source_ip(request: Request) -> str:
-    # The bundled Nginx proxy replaces this header with the connecting address.
-    forwarded = request.headers.get("x-real-ip", "").strip()
-    if forwarded:
-        try:
-            return str(ipaddress.ip_address(forwarded))
-        except ValueError:
-            pass
-    return request.client.host if request.client else "unknown"
-
-
-def _active_login_failures(source_ip: str, now: float) -> list[float]:
-    cutoff = now - _LOGIN_WINDOW_SECONDS
-    return [stamp for stamp in _login_failures_by_ip.get(source_ip, []) if stamp > cutoff]
-
-
-def enforce_login_source_limit(source_ip: str) -> None:
-    now = time.monotonic()
-    with _login_failure_guard:
-        failures = _active_login_failures(source_ip, now)
-        if failures:
-            _login_failures_by_ip[source_ip] = failures
-        else:
-            _login_failures_by_ip.pop(source_ip, None)
-        if len(failures) >= _LOGIN_MAX_FAILURES_PER_IP:
-            retry_after = max(1, int(_LOGIN_WINDOW_SECONDS - (now - failures[0])))
-            raise HTTPException(
-                status_code=429,
-                detail="登录尝试过于频繁，请稍后重试",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-
-def record_login_failure(source_ip: str) -> None:
-    now = time.monotonic()
-    with _login_failure_guard:
-        failures = _active_login_failures(source_ip, now)
-        failures.append(now)
-        _login_failures_by_ip[source_ip] = failures
-
-
-def clear_login_failures(source_ip: str) -> None:
-    with _login_failure_guard:
-        _login_failures_by_ip.pop(source_ip, None)
-
-
-def _runtime_cache_key(item: Deployment) -> tuple:
-    status = item.status.value if hasattr(item.status, "value") else str(item.status)
-    return (item.id, status, item.release or "", item.container_name or "", item.host_port or 0)
-
-
-def _runtime_cache_read(key: tuple) -> dict | None:
-    now = time.monotonic()
-    with _runtime_cache_guard:
-        cached = _runtime_cache.get(key)
-        if not cached or now - cached[0] > _RUNTIME_CACHE_TTL:
-            if cached:
-                _runtime_cache.pop(key, None)
-            return None
-        return copy.deepcopy(cached[1])
-
-
-def _runtime_cache_write(key: tuple, value: dict) -> None:
-    now = time.monotonic()
-    with _runtime_cache_guard:
-        _runtime_cache[key] = (now, copy.deepcopy(value))
-        # A worker process lives for a long time and sees many releases. Bound
-        # stale entries instead of allowing an unbounded per-deployment map.
-        if len(_runtime_cache) > 256:
-            expired = [cache_key for cache_key, (saved, _) in _runtime_cache.items() if now - saved > _RUNTIME_CACHE_TTL]
-            for cache_key in expired:
-                _runtime_cache.pop(cache_key, None)
-                lock = _runtime_cache_locks.get(cache_key)
-                if lock is not None and not lock.locked():
-                    _runtime_cache_locks.pop(cache_key, None)
-
-
-def invalidate_runtime_cache(deployment_id: str | None = None) -> None:
-    with _runtime_cache_guard:
-        for key in list(_runtime_cache):
-            if deployment_id is None or key[0] == deployment_id:
-                _runtime_cache.pop(key, None)
 
 
 def get_deployment_settings(db: Session) -> DeploymentSettings:
@@ -5468,8 +5366,7 @@ def runtime_snapshot(item: Deployment, db: Session, force: bool = False) -> dict
         cached = _runtime_cache_read(key)
         if cached is not None:
             return cached
-    with _runtime_cache_guard:
-        key_lock = _runtime_cache_locks.setdefault(key, threading.Lock())
+    key_lock = runtime_cache_lock(key)
     # Project runtime and deployment runtime can arrive concurrently. Only one
     # request performs SSH/Docker discovery; the other waits for and reuses it.
     with key_lock:
