@@ -4642,7 +4642,7 @@ function ProjectDetail({
                   </span>
                   {canEdit && d.rollback_allowed && (
                     <button className="ghost rollback-button" onClick={(event) => { event.stopPropagation(); setRollbackConfirm(d); }}>
-                      <RefreshCw />切换到此版本
+                      <RefreshCw />切换
                     </button>
                   )}
                   <ChevronRight />
