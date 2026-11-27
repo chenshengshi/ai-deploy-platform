@@ -1171,6 +1171,22 @@ tbody tr:last-child td {
   min-width: 0;
   max-width: 100%;
 }
+.message.user .message-user-bubble a,
+.message.user .message-user-bubble a:visited {
+  display: inline;
+  margin: 0;
+  color: #fff;
+  font-size: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: rgba(255, 255, 255, .72);
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+}
+.message.user .message-user-bubble a:hover {
+  color: #fff;
+  text-decoration-color: #fff;
+}
 .message-user-time {
   padding-right: 3px;
   color: #8a93a5;
