@@ -21,8 +21,6 @@ import {
   Copy,
   Database,
   Download,
-  Eye,
-  EyeOff,
   ExternalLink,
   FileArchive,
   FolderGit2,
@@ -48,44 +46,19 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api, login, logout, token } from "./api";
+import { api, logout, token } from "./api";
+import Login, { BrandLogo } from "./components/Login";
+import Modal from "./components/Modal";
+import { Badge, Empty, Field, PortInput, Toast, statusText } from "./components/Primitives";
+import { projectAnalysisFacts, projectCardState, projectSourceState } from "./projectState";
+import { formatElapsed, stripTerminalAnsi, time, validPort, withVisitPath } from "./formatters";
 import "./styles.css";
 
-const statusText = {
-  queued: "等待中",
-  running: "部署中",
-  success: "运行中",
-  failed: "失败",
-  stopped: "已停止",
-};
 
-const sourcePhaseText = {
-  queued: "等待处理",
-  pulling: "正在拉取源码",
-  analyzing: "正在分析源码",
-  preflight: "正在预演校验",
-  completed: "分析完成",
-  failed: "处理失败",
-  ready: "源码已保存",
-};
 
 const pendingAutoDeployKey = "yunzhou.pendingAutoDeploy";
 
-const formatElapsed = (milliseconds) => {
-  const seconds = Math.max(0, Number(milliseconds || 0) / 1000);
-  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}秒`;
-  return `${Math.floor(seconds / 60)}分${Math.round(seconds % 60)}秒`;
-};
 
-const stripTerminalAnsi = (value) => String(value ?? "")
-  .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
-  .replace(/\r(?!\n)/g, "");
-
-function projectSourceState(project) {
-  const analysis = project?.source_analysis || {};
-  const phase = analysis.phase || analysis.status || "ready";
-  return { ...analysis, phase, label: sourcePhaseText[phase] || "准备源码" };
-}
 
 function AnalysisSummaryDetails({ text, label = "展开分析说明" }) {
   if (!text) return null;
@@ -105,96 +78,6 @@ function AnalysisSummaryDetails({ text, label = "展开分析说明" }) {
   );
 }
 
-function projectAnalysisFacts(project) {
-  const analysis = project?.source_analysis || {};
-  if ((analysis.phase || analysis.status) !== "completed") return null;
-  const environment = analysis.build_environment?.find((item) => item?.runtime_version || item?.language);
-  const language = String(environment?.language || "").split("/")[0].trim();
-  const runtime = String(environment?.runtime_version || "").split("（")[0].trim();
-  const count = analysis.preflight?.service_count;
-  return {
-    summary: analysis.summary || "AI 已完成源码分析",
-    facts: [
-      count ? `方案含 ${count} 个服务` : null,
-      language || null,
-      runtime || null,
-      analysis.deployment_kind === "compose" ? "Compose" : analysis.deployment_kind,
-      analysis.preflight?.status === "passed" ? "静态预演通过" :
-        analysis.preflight?.status === "needs_configuration" ? "静态预演待配置" :
-          analysis.preflight ? "静态预演失败" : "尚未预演",
-    ].filter(Boolean),
-    services: (analysis.services || []).join(" · "),
-  };
-}
-
-function projectCardState(project, deployments, startingIds = new Set()) {
-  const source = projectSourceState(project);
-  const records = deployments
-    .filter((item) => item.project_id === project.id)
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  const starting = records.find((item) => startingIds.has(item.id));
-  if (starting) return { kind: "working", label: "启动中", action: "启动中", deployment: starting };
-  const pending = records.find((item) => ["queued", "running"].includes(item.status));
-  const active = records.find((item) => item.status === "success");
-  const sourceWorking = ["queued", "pulling", "analyzing", "preflight", "running"].includes(source.phase);
-  if (sourceWorking && active) return {
-    kind: "online",
-    label: "运行中",
-    secondaryLabel: "新版分析中",
-    secondaryKind: "working",
-    action: "访问",
-    deployment: active,
-  };
-  if (source.phase === "failed" && active) return {
-    kind: "online",
-    label: "运行中",
-    secondaryLabel: "新版分析失败",
-    secondaryKind: "error",
-    secondaryAction: "查看原因",
-    action: "访问",
-    deployment: active,
-  };
-  if (sourceWorking) {
-    return { kind: "working", label: source.label, action: "查看进度" };
-  }
-  if (pending && active) return {
-    kind: "online",
-    label: "运行中",
-    secondaryLabel: pending.status === "queued" ? "新版等待" : `新版 ${Number(pending.progress || 0)}%`,
-    secondaryKind: "working",
-    action: "访问",
-    deployment: active,
-    pendingDeployment: pending,
-  };
-  if (pending) return {
-    kind: "working",
-    label: pending.status === "queued" ? "等待部署" : `部署中 ${Number(pending.progress || 0)}%`,
-    action: "查看进度",
-    deployment: pending,
-  };
-  if (active) return { kind: "online", label: "运行中", action: "访问", deployment: active };
-  const stopped = records.find((item) => item.status === "stopped" && item.release && item.access_url);
-  if (stopped) return { kind: "stopped", label: "已停止", action: "重新启用", deployment: stopped };
-  const latest = records[0];
-  if (latest?.status === "failed") {
-    return { kind: "error", label: "上次发布失败", action: "查看原因", deployment: latest };
-  }
-  if (latest?.status === "stopped") {
-    return { kind: "ready", label: "部署已停止", action: "重新部署" };
-  }
-  return {
-    kind: source.phase === "failed" ? "error" : "ready",
-    label: source.phase === "failed" ? "分析异常" : "分析完成",
-    action: source.phase === "failed" ? "查看原因" : "部署",
-  };
-}
-const statusClass = {
-  queued: "warning",
-  running: "info",
-  success: "success",
-  failed: "danger",
-  stopped: "muted",
-};
 const roleText = { admin: "管理员", deployer: "发布人员", viewer: "只读人员" };
 const defaultBranding = {
   system_name: "自助发布平台",
@@ -208,94 +91,6 @@ const defaultFavicon = `data:image/svg+xml,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#756dff"/><stop offset="1" stop-color="#4f46e5"/></linearGradient></defs><rect width="64" height="64" rx="17" fill="url(#g)"/><path d="M20 39a9 9 0 0 1 2-17.8A13 13 0 0 1 47 25a7.5 7.5 0 0 1-1 14H20Z" fill="none" stroke="white" stroke-width="4" stroke-linecap="round"/><path d="M27 39v7m10-7v7" stroke="white" stroke-width="4" stroke-linecap="round"/></svg>',
 )}`;
 
-function BrandLogo({ branding, large = false }) {
-  return (
-    <div className={`logo${large ? " large" : ""}${branding?.logo_data_url ? " custom" : ""}`}>
-      {branding?.logo_data_url ? <img src={branding.logo_data_url} alt="平台 Logo" /> : <CloudCog />}
-    </div>
-  );
-}
-
-function Login({ onDone, branding }) {
-  const [showPassword, setShowPassword] = useState(false);
-  const [err, setErr] = useState("");
-  const [busy, setBusy] = useState(false);
-  const submit = async (e) => {
-    e.preventDefault();
-    const submitted = new FormData(e.currentTarget);
-    const username = String(submitted.get("username") || "").trim();
-    const password = String(submitted.get("password") || "");
-    setBusy(true);
-    setErr("");
-    try {
-      await login(username, password);
-      onDone();
-    } catch (x) {
-      setErr(x.message || "登录失败，请检查账号和密码");
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div className="login-shell">
-      <div className="login-brand">
-        <BrandLogo branding={branding} large />
-        <h1>{branding.system_name}</h1>
-        <p>{branding.login_slogan}</p>
-        <div className="login-capabilities">
-          <span><Bot /><b>AI 分析项目</b><small>识别架构与运行依赖</small></span>
-          <span><Server /><b>自动部署</b><small>构建、启动并验证访问</small></span>
-          <span><Activity /><b>持续管理</b><small>查看服务、日志和版本</small></span>
-        </div>
-      </div>
-      <form className="login-card" method="post" action="/api/auth/login" autoComplete="on" onSubmit={submit}>
-        <h2>欢迎回来</h2>
-        <p className="sub">登录后管理项目与发布任务</p>
-        <label>
-          用户名
-          <input
-            id="login-username"
-            name="username"
-            type="text"
-            autoComplete="username"
-            autoCapitalize="none"
-            spellCheck={false}
-            aria-invalid={Boolean(err)}
-            onInput={() => err && setErr("")}
-          />
-        </label>
-        <label>
-          密码
-          <span className="login-password-field">
-            <input
-              id="login-password"
-              name="password"
-              type={showPassword ? "text" : "password"}
-              autoComplete="current-password"
-              aria-invalid={Boolean(err)}
-              onInput={() => err && setErr("")}
-            />
-            <button
-              type="button"
-              className="login-password-toggle"
-              aria-label={showPassword ? "隐藏密码" : "显示密码"}
-              aria-pressed={showPassword}
-              title={showPassword ? "隐藏密码" : "显示密码"}
-              onClick={() => setShowPassword((current) => !current)}
-            >
-              {showPassword ? <EyeOff /> : <Eye />}
-            </button>
-          </span>
-        </label>
-        {err && <div className="login-error" role="alert">{err}</div>}
-        <button type="submit" className="primary full" disabled={busy}>
-          {busy ? <LoaderCircle className="spin" /> : <KeyRound />}{busy ? "登录中..." : "登录"}
-        </button>
-      </form>
-    </div>
-  );
-}
-
 const nav = [
   ["dashboard", "工作台", Gauge],
   ["chat", "AI 发布", MessageSquareText],
@@ -307,70 +102,6 @@ const nav = [
   ["settings", "系统设置", Settings],
 ];
 
-const modalStack = [];
-
-function Modal({ title, children, onClose, wide = false, drawer = false, className = "", closeOnMask = false, scrollRef = null, onScroll = null, headerActions = null }) {
-  const box = useRef(null),
-    scrollTop = useRef(0);
-  const modalId = useRef(Symbol("modal"));
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  useEffect(() => {
-    const id = modalId.current;
-    modalStack.push(id);
-    const close = (e) => {
-      if (e.key === "Escape" && modalStack[modalStack.length - 1] === id) {
-        if (document.querySelector(".terminal-file-menu")) return;
-        e.preventDefault();
-        onCloseRef.current();
-      }
-    };
-    window.addEventListener("keydown", close);
-    return () => {
-      window.removeEventListener("keydown", close);
-      const index = modalStack.lastIndexOf(id);
-      if (index >= 0) modalStack.splice(index, 1);
-    };
-  }, []);
-  useLayoutEffect(() => {
-    if (box.current && Math.abs(box.current.scrollTop - scrollTop.current) > 2)
-      box.current.scrollTop = scrollTop.current;
-  });
-  return createPortal(
-    (
-    <div
-      className={`modal-mask ${drawer ? "drawer-mask" : ""}`}
-      onMouseDown={(e) => closeOnMask && e.target === e.currentTarget && onClose()}
-    >
-      <div
-        ref={(node) => {
-          box.current = node;
-          if (scrollRef) scrollRef.current = node;
-        }}
-        onScroll={(e) => {
-          scrollTop.current = e.currentTarget.scrollTop;
-          onScroll?.(e);
-        }}
-        className={`modal ${wide ? "wide" : ""} ${drawer ? "drawer" : ""} ${className}`.trim()}
-        role="dialog"
-        aria-modal="true"
-      >
-        <div className="modal-head">
-          <h3>{title}</h3>
-          <div className="modal-head-actions">
-            {headerActions}
-            <button className="icon" title="关闭（Esc）" onClick={onClose}>
-              <X />
-            </button>
-          </div>
-        </div>
-        {children}
-      </div>
-    </div>
-    ),
-    document.body,
-  );
-}
 function ConfirmDialog({
   title,
   text,
@@ -620,92 +351,6 @@ function NetworkRouteDialog({ route, onClose }) {
       </div>
     </Modal>
   );
-}
-function Badge({ status }) {
-  return (
-    <span className={"badge " + (statusClass[status] || "muted")}>
-      <i />
-      {statusText[status] || status}
-    </span>
-  );
-}
-function Toast({ toast }) {
-  const type = toast?.type || "success";
-  return toast ? (
-    <div className={"toast " + type}>
-      <span>{type === "success" ? "✓" : type === "warning" ? "!" : "×"}</span>
-      <div>
-        <b>
-          {type === "success"
-            ? "操作成功"
-            : type === "warning"
-              ? "需要注意"
-              : "操作失败"}
-        </b>
-        <p>{toast.text}</p>
-      </div>
-    </div>
-  ) : null;
-}
-function Empty({ icon: Icon = Boxes, text, action }) {
-  return (
-    <div className="empty">
-      <Icon />
-      <h3>{text}</h3>
-      {action}
-    </div>
-  );
-}
-function Field({ label, children, hint, className = "" }) {
-  return (
-    <label className={`field ${className}`.trim()}>
-      <span>{label}</span>
-      {children}
-      {hint && <small>{hint}</small>}
-    </label>
-  );
-}
-function PortInput({ value, onChange, min = 1, max = 65535, ...props }) {
-  return (
-    <input
-      {...props}
-      type="text"
-      inputMode="numeric"
-      pattern="[0-9]*"
-      value={value ?? ""}
-      onChange={(event) => {
-        const digits = event.target.value.replace(/\D/g, "").slice(0, 5);
-        onChange?.(digits);
-      }}
-      onBlur={(event) => {
-        if (!event.target.value) return;
-        const normalized = Math.min(max, Math.max(min, Number(event.target.value)));
-        if (String(normalized) !== event.target.value) onChange?.(String(normalized));
-      }}
-    />
-  );
-}
-function validPort(value) {
-  if (value === "" || value == null) return true;
-  const port = Number(value);
-  return Number.isInteger(port) && port >= 1 && port <= 65535;
-}
-function withVisitPath(baseUrl, visitPath) {
-  const entry = String(visitPath || "").trim();
-  if (!baseUrl || !entry || entry === "/") return baseUrl;
-  try {
-    const url = new URL(baseUrl, window.location.origin);
-    const parsed = new URL(entry.startsWith("/") ? entry : `/${entry}`, url.origin);
-    url.pathname = parsed.pathname;
-    url.search = parsed.search;
-    url.hash = parsed.hash;
-    return url.toString();
-  } catch {
-    return `${String(baseUrl).replace(/\/+$/, "")}/${entry.replace(/^\/+/, "")}`;
-  }
-}
-function time(v) {
-  return v ? new Date(v).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "—";
 }
 const shanghaiLogClock = new Intl.DateTimeFormat("en-CA", {
   timeZone: "Asia/Shanghai",

@@ -47,8 +47,29 @@ from .deployment_integrations import (
     environment_values as _environment_values,
     external_integration_preflight as _external_integration_preflight,
     store_managed_values as _store_managed_values,
+    managed_mysql_image_for_source as _managed_mysql_image_for_source,
+    data_service_names,
+    integration_consumers,
+    is_backend_service,
+    normalize_service_environment,
+    managed_redis_values,
+    redis_is_required,
+    managed_mysql_values,
+    remove_empty_command_arguments,
 )
+from .deployment_source_optimization import optimize_staged_sources as _optimize_staged_sources
 from .deployment_build_repairs import apply_dockerfile_text_repairs
+from .deployment_build_handlers import detect_build as _detect_build, detect_container_port as _detect_container_port
+from .deployment_build_profiles import detect_build_profiles
+from .deployment_build_generators import generate_profile_build, generate_static_build
+from .deployment_runtime_policy import data_compose_project, release_directories, validate_release
+from .deployment_runtime_ports import (
+    compose_port_number as _compose_port_number,
+    compose_published_port as _compose_published_port,
+    project_traffic_plan as _project_traffic_plan,
+    replace_compose_published_port as _replace_compose_published_port,
+    traffic_service_roles as _traffic_service_roles,
+)
 from .deployment_architecture import (
     COMPOSE_NAMES,
     analyze_repository_topology,
@@ -692,28 +713,11 @@ def stage_source(project: Project, db, workspace_key: str | None = None) -> tupl
 
 
 def detect_build(path: str, requested: str) -> tuple[str, str | None]:
-    root = Path(path)
-    compose_path = _find_compose(root)
-    compose = compose_path.relative_to(root).as_posix() if compose_path else None
-    dockerfile = (root / "Dockerfile").exists()
-    if requested == "compose" and not compose:
-        raise RuntimeError("未找到 Compose 文件")
-    if requested == "dockerfile" and not dockerfile:
-        raise RuntimeError("未找到 Dockerfile")
-    if requested == "compose" or (requested == "auto" and compose):
-        return "compose", compose
-    if requested == "dockerfile" or dockerfile:
-        return "dockerfile", "Dockerfile"
-    raise RuntimeError("未找到 Dockerfile 或 Docker Compose 文件")
+    return _detect_build(path, requested)
 
 
 def detect_container_port(path: str, dockerfile_name: str = "Dockerfile") -> int | None:
-    dockerfile = Path(path) / dockerfile_name
-    if dockerfile.exists():
-        match = re.search(r"(?im)^\s*EXPOSE\s+(\d+)", dockerfile.read_text(errors="ignore"))
-        if match:
-            return int(match.group(1))
-    return None
+    return _detect_container_port(path, dockerfile_name)
 
 
 
@@ -732,36 +736,7 @@ def detect_container_port(path: str, dockerfile_name: str = "Dockerfile") -> int
 
 def optimize_staged_sources(path: str) -> list[str]:
     """Rewrite only the isolated release copy so nested build files use reachable mirrors."""
-    root = Path(path)
-    source_replacements = {
-        "registry.npmjs.org": "registry.npmmirror.com",
-        "https://pypi.org/simple": "https://pypi.tuna.tsinghua.edu.cn/simple",
-        "https://repo.maven.apache.org/maven2": "https://maven.aliyun.com/repository/public",
-        "http://deb.debian.org": "https://mirrors.tuna.tsinghua.edu.cn",
-        "http://archive.ubuntu.com": "https://mirrors.tuna.tsinghua.edu.cn",
-        "http://security.ubuntu.com": "https://mirrors.tuna.tsinghua.edu.cn",
-    }
-    changed = []
-    for candidate in root.rglob("Dockerfile*"):
-        if not candidate.is_file() or any(part in {".git", "node_modules", "target"} for part in candidate.parts):
-            continue
-        original = candidate.read_text(errors="ignore")
-        optimized = original
-        for old, new in source_replacements.items():
-            optimized = optimized.replace(old, new)
-        if "RUN apt-get update" in optimized and "mirrors.tuna.tsinghua.edu.cn|g" not in optimized:
-            optimized = optimized.replace(
-                "RUN apt-get update",
-                "RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; "
-                "s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g; "
-                "s|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g; "
-                "s|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' "
-                "/etc/apt/sources.list /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; apt-get update",
-            )
-        if optimized != original:
-            candidate.write_text(optimized)
-            changed.append(candidate.relative_to(root).as_posix())
-    return changed
+    return _optimize_staged_sources(path)
 
 
 def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: str = "managed_fresh") -> list[str]:
@@ -1760,6 +1735,7 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
 def prepare_build(path: str, requested: str) -> tuple[str, str, int | None]:
     """Generate a source-aware build for auto mode; explicit choices stay exact."""
     root = Path(path)
+    build_profiles = {profile.key: profile for profile in detect_build_profiles(root)}
     optimize_staged_sources(path)
     if requested in ("compose", "dockerfile"):
         build_type, build_file = detect_build(path, requested)
@@ -1927,64 +1903,17 @@ volumes:
 
     generated = root / ".yunzhou.Dockerfile"
     reference_port = detect_container_port(path)
-    package = root / "package.json"
-    if package.exists():
-        try:
-            meta = json.loads(package.read_text(errors="ignore"))
-        except Exception:
-            meta = {}
-        deps = {**meta.get("dependencies", {}), **meta.get("devDependencies", {})}
-        scripts = meta.get("scripts", {})
-        if "vite" in deps or "build" in scripts:
-            generated.write_text(
-                "FROM node:22-alpine AS build\nWORKDIR /app\nCOPY package*.json ./\n"
-                "RUN npm config set registry https://registry.npmmirror.com && npm install\nCOPY . .\nRUN npm run build\n"
-                f"FROM {PLATFORM_NGINX_IMAGE}\nCOPY --from=build /app/dist /usr/share/nginx/html\nEXPOSE 80\n"
-            )
-            return "dockerfile", generated.name, reference_port or 80
-        generated.write_text(
-            "FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm config set registry https://registry.npmmirror.com && npm install --omit=dev\n"
-            "COPY . .\nENV NODE_ENV=production\nEXPOSE 3000\nCMD [\"npm\",\"start\"]\n"
-        )
-        return "dockerfile", generated.name, reference_port or 3000
-
-    if (root / "pom.xml").exists():
-        java_version = detect_java_version(path)
-        (root / ".yunzhou.maven-settings.xml").write_text('<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"><mirrors><mirror><id>aliyun</id><mirrorOf>*</mirrorOf><name>Aliyun Maven</name><url>https://maven.aliyun.com/repository/public</url></mirror></mirrors></settings>')
-        generated.write_text(
-            f"FROM maven:3.9-eclipse-temurin-{java_version} AS build\nWORKDIR /app\nCOPY .yunzhou.maven-settings.xml /tmp/settings.xml\nCOPY . .\nRUN mvn -s /tmp/settings.xml -DskipTests package\n"
-            "RUN jar=\"$(find /app -path '*/target/*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name 'original-*.jar' -type f -printf '%s %p\\n' | sort -nr | head -n1 | cut -d' ' -f2-)\" && test -n \"$jar\" && cp \"$jar\" /tmp/app.jar\n"
-            f"FROM eclipse-temurin:{java_version}-jre\nWORKDIR /app\nCOPY --from=build /tmp/app.jar app.jar\n"
-            "EXPOSE 8080\nCMD [\"java\",\"-jar\",\"app.jar\"]\n"
-        )
-        return "dockerfile", generated.name, reference_port or 8080
-
-    if (root / "requirements.txt").exists() or (root / "pyproject.toml").exists():
-        candidates = list(root.rglob("*.py"))
-        app_file = next((p for p in candidates if "FastAPI(" in p.read_text(errors="ignore")), None)
-        module = app_file.relative_to(root).with_suffix("").as_posix().replace("/", ".") if app_file else "app"
-        install = "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt" if (root / "requirements.txt").exists() else "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple ."
-        cmd = f'uvicorn {module}:app --host 0.0.0.0 --port 8000' if app_file else "python app.py"
-        generated.write_text(
-            f"FROM python:3.12-slim\nWORKDIR /app\nCOPY . .\nRUN {install}\nEXPOSE 8000\nCMD [\"sh\",\"-c\",\"{cmd}\"]\n"
-        )
-        return "dockerfile", generated.name, reference_port or 8000
-
-    static_index = next(
-        (
-            item for item in root.rglob("index.html")
-            if item.is_file()
-            and not any(part in {".git", "node_modules", "target", "dist", "build"} for part in item.relative_to(root).parts)
-        ),
-        None,
-    )
-    if static_index:
-        static_dir = static_index.parent.relative_to(root).as_posix()
-        copy_source = "." if static_dir == "." else static_dir + "/"
-        generated.write_text(
-            f"FROM {PLATFORM_NGINX_IMAGE}\nCOPY {copy_source} /usr/share/nginx/html\nEXPOSE 80\n"
-        )
-        return "dockerfile", generated.name, 80
+    generated_build = generate_profile_build(
+        root,
+        build_profiles,
+        nginx_image=PLATFORM_NGINX_IMAGE,
+        java_version=detect_java_version,
+    ) or generate_static_build(root, nginx_image=PLATFORM_NGINX_IMAGE)
+    if generated_build:
+        for relative, content in (generated_build.supporting_files or {}).items():
+            (root / relative).write_text(content)
+        generated.write_text(generated_build.dockerfile)
+        return "dockerfile", generated.name, reference_port or generated_build.port
     if (root / "Dockerfile").exists():
         raise RuntimeError(
             "平台已将仓库 Dockerfile 作为参考完成扫描，但无法仅凭当前源码安全重新生成等价的经典构建文件；"
@@ -2832,29 +2761,7 @@ def ensure_managed_secrets(project: Project, compose_path: str, compose_file: st
 
 def managed_mysql_image_for_source(source_path: str, project: Project | None = None) -> tuple[str, str]:
     """Choose a managed MySQL line that matches the application's framework era."""
-    root = Path(source_path)
-    evidence = "平台默认"
-    analysis_text = json.dumps((project.source_analysis or {}) if project else {}, ensure_ascii=False)
-    if re.search(r"(?:Java|JDK)[^0-9]{0,12}(?:1\.)?8\b", analysis_text, re.I) or re.search(
-        r"Spring\s*Boot[^0-9]{0,12}[12]\.", analysis_text, re.I
-    ):
-        return "mysql:8.0", "源码分析识别为旧 Java/Spring 兼容线"
-    for pom in root.rglob("pom.xml"):
-        if any(part in {"target", ".git", "node_modules"} for part in pom.parts):
-            continue
-        text = pom.read_text(encoding="utf-8", errors="ignore")[:500_000]
-        spring = re.search(r"spring-boot(?:-dependencies|-starter-parent)?[\s\S]{0,300}?<version>\s*([0-9]+)\.", text, re.I)
-        java = re.search(r"<(?:java\.version|maven\.compiler\.source)>\s*(?:1\.)?([0-9]+)", text, re.I)
-        spring_major = int(spring.group(1)) if spring else None
-        java_major = int(java.group(1)) if java else None
-        if (spring_major is not None and spring_major < 3) or (java_major is not None and java_major <= 11):
-            details = []
-            if spring_major is not None:
-                details.append(f"Spring Boot {spring_major}.x")
-            if java_major is not None:
-                details.append(f"Java {java_major}")
-            return "mysql:8.0", "、".join(details) + " 使用兼容线"
-    return PLATFORM_MYSQL_IMAGE, evidence
+    return _managed_mysql_image_for_source(source_path, project, PLATFORM_MYSQL_IMAGE)
 
 
 def reconcile_managed_integrations(project: Project, compose_path: str, compose_file: str) -> list[str]:
@@ -2869,13 +2776,7 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
 
     external_mysql = user_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() == "external"
     if external_mysql:
-        mysql_names = {
-            name for name, service in services.items()
-            if isinstance(service, dict) and (
-                re.match(r"(?i)^(?:[^/]+/)?mysql(?::|$)", str(service.get("image") or ""))
-                or name.lower() in {"mysql", "db", "database"}
-            )
-        }
+        mysql_names = data_service_names(services, "mysql")
         for name in mysql_names:
             services.pop(name, None)
         spring_project = bool(
@@ -2891,17 +2792,8 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
                     depends.pop(mysql_name, None)
             elif isinstance(depends, list):
                 service["depends_on"] = [value for value in depends if value not in mysql_names]
-            raw_env = service.get("environment")
-            if isinstance(raw_env, list):
-                raw_env = {
-                    value.split("=", 1)[0]: value.split("=", 1)[1]
-                    for value in raw_env if isinstance(value, str) and "=" in value
-                }
-                service["environment"] = raw_env
-            backend_like = any(token in name.lower() for token in ("backend", "server", "api", "app"))
-            if raw_env is None and backend_like:
-                raw_env = {}
-                service["environment"] = raw_env
+            backend_like = is_backend_service(name)
+            raw_env = normalize_service_environment(service, create=backend_like)
             if not isinstance(raw_env, dict):
                 continue
             jdbc = "jdbc:mysql://${YUNZHOU_MYSQL_HOST}:${YUNZHOU_MYSQL_PORT}/${YUNZHOU_MYSQL_DATABASE}"
@@ -2968,41 +2860,15 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
     # line option before the application context starts. Environment variables
     # remain available, so omit only syntactically empty `--name=` arguments;
     # never remove a non-empty user value.
-    for service in services.values():
-        if not isinstance(service, dict):
-            continue
-        command = service.get("command")
-        if isinstance(command, list):
-            filtered = [
-                value for value in command
-                if not (isinstance(value, str) and re.fullmatch(r"--[A-Za-z0-9_.-]+=", value.strip()))
-            ]
-            if filtered != command:
-                service["command"] = filtered or None
-                changes.append("空启动参数")
-        elif isinstance(command, str):
-            filtered = re.sub(r"(?<!\S)--[A-Za-z0-9_.-]+=(?=\s|$)", "", command)
-            filtered = re.sub(r"\s{2,}", " ", filtered).strip()
-            if filtered != command.strip():
-                service["command"] = filtered or None
-                changes.append("空启动参数")
+    changes.extend(remove_empty_command_arguments(services))
 
     def consumers(prefix: str) -> list[str]:
-        return [name for name, service in services.items()
-                if isinstance(service, dict) and prefix in yaml.safe_dump(service, allow_unicode=True)]
+        return integration_consumers(services, prefix)
 
-    existing_redis_name = next((name for name, service in services.items() if isinstance(service, dict) and (
-        str(service.get("image") or "").lower().startswith("redis:") or name.lower() in {"redis", "cache"}
-    )), None)
-    analysis_text = json.dumps(project.source_analysis or {}, ensure_ascii=False)
-    redis_required = bool(
-        consumers("YUNZHOU_REDIS_")
-        or existing_redis_name
-        or re.search(r'"(?:service|services)"[^\n]{0,500}Redis', analysis_text, re.I)
-        or re.search(r"\b(?:requires?|uses?|needs?)\s+Redis\b", analysis_text, re.I)
-    )
+    redis_required, existing_redis_name = redis_is_required(project, services)
     if redis_required and user_values.get("YUNZHOU_REDIS_MODE", "managed").lower() != "external":
-        password = hashlib.sha256(f"{settings.app_secret}:{project.id}:redis".encode()).hexdigest()[:32]
+        redis_values = managed_redis_values(project)
+        password = redis_values["YUNZHOU_REDIS_PASSWORD"]
         redis_name = existing_redis_name
         if not redis_name:
             redis_name = "redis"
@@ -3081,21 +2947,15 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
         # as ``redis``.  Always publish the stable DNS alias to applications;
         # split_compose_runtime also adds this alias to newly created Redis
         # services, so both fresh and reused stacks resolve the same hostname.
-        store_managed_values(project, {"YUNZHOU_REDIS_HOST": "redis", "YUNZHOU_REDIS_PORT": "6379", "YUNZHOU_REDIS_DATABASE": "0", "YUNZHOU_REDIS_PASSWORD": password})
+        store_managed_values(project, redis_values)
         for name, service in services.items():
             if name == redis_name or not isinstance(service, dict):
                 continue
             service_uses_redis = "redis" in yaml.safe_dump(service, allow_unicode=True).lower()
-            backend_like = any(token in name.lower() for token in ("backend", "server", "api", "app"))
+            backend_like = is_backend_service(name)
             if not (service_uses_redis or backend_like):
                 continue
-            raw_env = service.setdefault("environment", {})
-            if isinstance(raw_env, list):
-                raw_env = {
-                    value.split("=", 1)[0]: value.split("=", 1)[1]
-                    for value in raw_env if isinstance(value, str) and "=" in value
-                }
-                service["environment"] = raw_env
+            raw_env = normalize_service_environment(service, create=True)
             if isinstance(raw_env, dict):
                 # Generated/source plans use several Spring generations and
                 # aliases (SPRING_REDIS_*, SPRING_DATA_REDIS_*, CRM_*). Bind
@@ -3130,8 +2990,7 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
         changes.append("Redis")
 
     if consumers("YUNZHOU_MYSQL_") and user_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() != "external":
-        digest = hashlib.sha256(f"{settings.app_secret}:{project.id}:mysql-managed".encode()).hexdigest()
-        database = re.sub(r"[^a-zA-Z0-9_]", "_", project.slug)[:48] or "app"
+        mysql_values = managed_mysql_values(project)
         mysql_image, mysql_evidence = managed_mysql_image_for_source(compose_path, project)
         services.setdefault("mysql", {
             "image": mysql_image,
@@ -3147,7 +3006,7 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
             services[mysql_name]["image"] = mysql_image
             changes.append(f"MySQL 版本 {mysql_image}（{mysql_evidence}）")
         document.setdefault("volumes", {}).setdefault(f"{project.slug}_mysql_data", {})
-        store_managed_values(project, {"YUNZHOU_MYSQL_HOST": "mysql", "YUNZHOU_MYSQL_PORT": "3306", "YUNZHOU_MYSQL_DATABASE": database, "YUNZHOU_MYSQL_USERNAME": "yunzhou", "YUNZHOU_MYSQL_PASSWORD": digest[:32], "YUNZHOU_MYSQL_ROOT_PASSWORD": hashlib.sha256((digest + ":root").encode()).hexdigest()[:32]})
+        store_managed_values(project, mysql_values)
         changes.append("MySQL")
 
     if changes:
@@ -4343,83 +4202,6 @@ def _service_container_name(
     safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
     version = f"-{safe_release}" if safe_release else ""
     return f"{safe_namespace}-{project_slug}{version}-{safe_service}-{max(1, int(sequence))}"
-
-
-def _project_traffic_plan(project: Project, deployment_plan: dict | None = None) -> dict:
-    """Return the versioned traffic plan saved by source analysis."""
-    candidates = [deployment_plan, project.source_analysis]
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        nested = candidate.get("traffic_plan")
-        if isinstance(nested, dict):
-            return nested
-        saved = candidate.get("deployment_plan")
-        if isinstance(saved, dict) and isinstance(saved.get("traffic_plan"), dict):
-            return saved["traffic_plan"]
-    return {}
-
-
-def _traffic_service_roles(traffic_plan: dict) -> dict[str, tuple[str, bool]]:
-    roles: dict[str, tuple[str, bool]] = {}
-    for row in traffic_plan.get("service_roles") or []:
-        if not isinstance(row, dict):
-            continue
-        service = str(row.get("service") or "").strip()
-        role = str(row.get("role") or "app").strip().lower()
-        if service:
-            if role in {"frontend", "backend", "app", "web", "api"}:
-                roles[service] = (role, True)
-            else:
-                roles[service] = (role, bool(row.get("scalable", False)))
-    return roles
-
-
-def _compose_port_number(value) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if 1 <= value <= 65535 else None
-    raw = str(value or "").strip().split("/", 1)[0]
-    # Compose short syntax is [ip:][published:]target. The last component is
-    # always the container-side target port.
-    target = raw.rsplit(":", 1)[-1]
-    match = re.search(r"(\d{1,5})$", target)
-    port = int(match.group(1)) if match else None
-    return port if port and 1 <= port <= 65535 else None
-
-
-def _compose_published_port(value, environment: dict[str, str] | None = None) -> int | None:
-    if isinstance(value, dict):
-        raw = value.get("published")
-        published = str(raw or "").strip()
-    else:
-        raw = str(value or "").strip().split("/", 1)[0]
-        parts = raw.rsplit(":", 2)
-        if len(parts) < 2:
-            return None
-        published = parts[-2]
-    if not published.isdigit() and environment:
-        variable = re.fullmatch(
-            r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::-|-)([^}]*))?\}",
-            published,
-        )
-        if variable:
-            published = str(environment.get(variable.group(1), variable.group(2) or "")).strip()
-    return int(published) if published.isdigit() and 1 <= int(published) <= 65535 else None
-
-
-def _replace_compose_published_port(value, published: int):
-    if isinstance(value, dict):
-        return {**value, "published": published}
-    raw = str(value)
-    base, separator, protocol = raw.partition("/")
-    parts = base.rsplit(":", 2)
-    if len(parts) < 2:
-        return value
-    parts[-2] = str(published)
-    replaced = ":".join(parts)
-    return replaced + (separator + protocol if separator else "")
 
 
 def _reserve_reactivation_port(db, deployment: Deployment, node: Node, service: str, port: int) -> None:
@@ -9682,8 +9464,7 @@ def stop_project_data_services(project: Project, node: Node, db=None) -> str:
     """
     policy = db.get(DeploymentSettings, "default") if db is not None else None
     runtime_namespace = (policy.registry_namespace if policy else "yunzhou") or "yunzhou"
-    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
-    data_project = f"{safe_namespace}-{project.slug}-data"
+    data_project = data_compose_project(runtime_namespace, project.slug)
     with SSHNode(node) as ssh:
         label = shlex.quote(f"label=com.docker.compose.project={data_project}")
         _, existing = ssh.run(f"docker ps -aq --filter {label}", timeout=30)
@@ -9710,8 +9491,7 @@ def start_project_data_services(
     data_file = ".yunzhou.data.yml"
     policy = db.get(DeploymentSettings, "default") if db is not None else None
     runtime_namespace = (policy.registry_namespace if policy else "yunzhou") or "yunzhou"
-    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(runtime_namespace).lower()).strip("-") or "yunzhou"
-    data_project = f"{safe_namespace}-{project.slug}-data"
+    data_project = data_compose_project(runtime_namespace, project.slug)
     with SSHNode(node) as ssh:
         if ssh.run(f"test -f {shlex.quote(directory + '/' + data_file)}", timeout=20)[0] != 0:
             return "该版本没有独立的项目共享数据服务"
@@ -9796,9 +9576,7 @@ def delete_deployment_resources(
     """
     if not project or not node:
         raise RuntimeError("项目或部署服务器已不存在，无法核验远端资源")
-    release = (deployment.release or "").strip()
-    if release and not re.fullmatch(r"[A-Za-z0-9_.-]+", release):
-        raise RuntimeError("发布版本号不安全，已拒绝清理")
+    release = validate_release(deployment.release)
     release_compose_project = deployment_compose_project_name(deployment, project)
     legacy_compose_project = compose_project_name(project.slug, namespace="yz")
     with SSHNode(node) as ssh:
@@ -9823,12 +9601,13 @@ def delete_deployment_resources(
                 f"awk -F'|' -v r={shlex.quote('/' + release + '/')} 'index($2,r) {{print $1}}' | "
                 "cut -d'|' -f1; } | sort -u | xargs -r docker rm -f >/dev/null 2>&1 || true"
             )
-        release_dirs = []
+        release_dirs = release_directories(
+            node.work_dir,
+            project_directory(project),
+            project.slug,
+            release,
+        )
         if release:
-            release_dirs = [
-                f"{node.work_dir.rstrip('/')}/{project_directory(project)}/{release}",
-                f"{node.work_dir.rstrip('/')}/{project.slug}/{release}",
-            ]
             if not deployment.image_name and not preserve_runtime:
                 for path in dict.fromkeys(release_dirs):
                     volume_flag = " -v" if remove_persistent_data else ""
@@ -10003,8 +9782,13 @@ def start_deployment(deployment: Deployment, project: Project, node: Node, db=No
     """Start an existing stopped release and verify that Docker really runs it."""
     with SSHNode(node) as ssh:
         compose_project = deployment_compose_project_name(deployment, project)
-        release_dir = f"{node.work_dir.rstrip('/')}/{project_directory(project)}/{deployment.release}"
-        legacy_dir = f"{node.work_dir.rstrip('/')}/{project.slug}/{deployment.release}"
+        directories = release_directories(
+            node.work_dir,
+            project_directory(project),
+            project.slug,
+            deployment.release,
+        )
+        release_dir, legacy_dir = directories
         _, resolved = ssh.run(
             f"if [ -d {shlex.quote(release_dir)} ]; then printf %s {shlex.quote(release_dir)}; "
             f"elif [ -d {shlex.quote(legacy_dir)} ]; then printf %s {shlex.quote(legacy_dir)}; fi"

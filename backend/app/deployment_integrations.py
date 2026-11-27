@@ -1,77 +1,148 @@
-from .config import decrypt
+import json
+import hashlib
+import re
+from pathlib import Path
+
+from .config import settings
 from .models import Project
+from .deployment_integration_environment import (
+    effective_project_environment,
+    environment_values,
+    external_integration_preflight,
+    store_managed_values,
+)
 
 
-INTEGRATION_FIELDS = {
-    "MYSQL": ("HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD"),
-    "POSTGRES": ("HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD"),
-    "REDIS": ("HOST", "PORT"),
-}
+def normalize_service_environment(service: dict, *, create: bool = False) -> dict | None:
+    raw = service.get("environment")
+    if raw is None and create:
+        raw = {}
+        service["environment"] = raw
+    if isinstance(raw, list):
+        raw = {
+            value.split("=", 1)[0]: value.split("=", 1)[1]
+            for value in raw if isinstance(value, str) and "=" in value
+        }
+        service["environment"] = raw
+    return raw if isinstance(raw, dict) else None
 
 
-def environment_values(text: str | None) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in (text or "").splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip()
-    return values
+def is_backend_service(name: str) -> bool:
+    return any(token in str(name).lower() for token in ("backend", "server", "api", "app"))
 
 
-def effective_project_environment(project: Project) -> str:
-    """Render dependency values before derived application values."""
-    managed_values = environment_values((project.managed_env_text or "").strip())
-    user_values = environment_values((decrypt(project.env_text_encrypted) or "").strip())
-    values = {**managed_values, **user_values}
-    for service in ("MYSQL", "REDIS"):
-        if user_values.get(f"YUNZHOU_{service}_MODE", "managed").lower() != "external":
-            for key, value in managed_values.items():
-                if key.startswith(f"YUNZHOU_{service}_") and key != f"YUNZHOU_{service}_MODE":
-                    values[key] = value
-    priority = [
-        f"YUNZHOU_{service}_{suffix}"
-        for service in ("MYSQL", "POSTGRES", "REDIS")
-        for suffix in ("MODE", "HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD")
+def integration_consumers(services: dict, prefix: str) -> list[str]:
+    import yaml
+
+    return [
+        name for name, service in services.items()
+        if isinstance(service, dict) and prefix in yaml.safe_dump(service, allow_unicode=True)
     ]
-    ordered = [key for key in priority if key in values]
-    ordered.extend(key for key in values if key not in ordered)
-    return "\n".join(f"{key}={values[key]}" for key in ordered)
 
 
-def external_integration_preflight(project: Project, env_text: str) -> list[str]:
-    user_values = environment_values(decrypt(project.env_text_encrypted) or "")
-    effective = environment_values(env_text)
-    errors: list[str] = []
-    for service, suffixes in INTEGRATION_FIELDS.items():
-        if user_values.get(f"YUNZHOU_{service}_MODE", "managed").lower() != "external":
-            continue
-        missing = [
-            f"YUNZHOU_{service}_{suffix}"
-            for suffix in suffixes
-            if not effective.get(f"YUNZHOU_{service}_{suffix}", "").strip()
-        ]
-        if missing:
-            errors.append(f"外接 {service} 已启用，但保存配置缺少：{'、'.join(missing)}")
-    return errors
-
-
-def store_managed_values(project: Project, values: dict[str, str]) -> list[str]:
-    lines = (project.managed_env_text or "").splitlines()
-    positions = {
-        line.split("=", 1)[0].strip(): index for index, line in enumerate(lines)
-        if "=" in line and not line.lstrip().startswith("#")
+def data_service_names(services: dict, kind: str) -> set[str]:
+    aliases = {
+        "mysql": {"mysql", "db", "database"},
+        "redis": {"redis", "cache"},
+        "postgres": {"postgres", "postgresql", "db", "database"},
     }
-    changed: list[str] = []
-    for key, value in values.items():
-        rendered = f"{key}={value}"
-        if key in positions:
-            if lines[positions[key]] != rendered:
-                lines[positions[key]] = rendered
-                changed.append(key)
-        else:
-            lines.append(rendered)
-            positions[key] = len(lines) - 1
-            changed.append(key)
-    if changed:
-        project.managed_env_text = "\n".join(lines).strip() + "\n"
-    return changed
+    image_pattern = {
+        "mysql": r"(?i)^(?:[^/]+/)?mysql(?::|$)",
+        "redis": r"(?i)^(?:[^/]+/)?redis(?::|$)",
+        "postgres": r"(?i)^(?:[^/]+/)?postgres(?::|$)",
+    }
+    return {
+        name for name, service in services.items()
+        if isinstance(service, dict) and (
+            re.match(image_pattern[kind], str(service.get("image") or ""))
+            or name.lower() in aliases[kind]
+        )
+    }
+
+
+def redis_is_required(project: Project, services: dict) -> tuple[bool, str | None]:
+    redis_names = data_service_names(services, "redis")
+    existing = next(iter(redis_names), None)
+    analysis_text = json.dumps(project.source_analysis or {}, ensure_ascii=False)
+    required = bool(
+        integration_consumers(services, "YUNZHOU_REDIS_")
+        or existing
+        or re.search(r'"(?:service|services)"[^\n]{0,500}Redis', analysis_text, re.I)
+        or re.search(r"\b(?:requires?|uses?|needs?)\s+Redis\b", analysis_text, re.I)
+    )
+    return required, existing
+
+
+def managed_redis_values(project: Project) -> dict[str, str]:
+    password = hashlib.sha256(f"{settings.app_secret}:{project.id}:redis".encode()).hexdigest()[:32]
+    return {
+        "YUNZHOU_REDIS_HOST": "redis",
+        "YUNZHOU_REDIS_PORT": "6379",
+        "YUNZHOU_REDIS_DATABASE": "0",
+        "YUNZHOU_REDIS_PASSWORD": password,
+    }
+
+
+def managed_mysql_values(project: Project) -> dict[str, str]:
+    digest = hashlib.sha256(f"{settings.app_secret}:{project.id}:mysql-managed".encode()).hexdigest()
+    database = re.sub(r"[^a-zA-Z0-9_]", "_", project.slug)[:48] or "app"
+    return {
+        "YUNZHOU_MYSQL_HOST": "mysql",
+        "YUNZHOU_MYSQL_PORT": "3306",
+        "YUNZHOU_MYSQL_DATABASE": database,
+        "YUNZHOU_MYSQL_USERNAME": "yunzhou",
+        "YUNZHOU_MYSQL_PASSWORD": digest[:32],
+        "YUNZHOU_MYSQL_ROOT_PASSWORD": hashlib.sha256((digest + ":root").encode()).hexdigest()[:32],
+    }
+
+
+def remove_empty_command_arguments(services: dict) -> list[str]:
+    changes: list[str] = []
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        command = service.get("command")
+        if isinstance(command, list):
+            filtered = [
+                value for value in command
+                if not (isinstance(value, str) and re.fullmatch(r"--[A-Za-z0-9_.-]+=", value.strip()))
+            ]
+            if filtered != command:
+                service["command"] = filtered or None
+                changes.append("空启动参数")
+        elif isinstance(command, str):
+            filtered = re.sub(r"(?<!\S)--[A-Za-z0-9_.-]+=(?=\s|$)", "", command)
+            filtered = re.sub(r"\s{2,}", " ", filtered).strip()
+            if filtered != command.strip():
+                service["command"] = filtered or None
+                changes.append("空启动参数")
+    return changes
+
+
+def managed_mysql_image_for_source(
+    source_path: str,
+    project: Project | None = None,
+    default_image: str = "mysql:8.4",
+) -> tuple[str, str]:
+    root = Path(source_path)
+    analysis_text = json.dumps((project.source_analysis or {}) if project else {}, ensure_ascii=False)
+    if re.search(r"(?:Java|JDK)[^0-9]{0,12}(?:1\.)?8\b", analysis_text, re.I) or re.search(
+        r"Spring\s*Boot[^0-9]{0,12}[12]\.", analysis_text, re.I
+    ):
+        return "mysql:8.0", "源码分析识别为旧 Java/Spring 兼容线"
+    for pom in root.rglob("pom.xml"):
+        if any(part in {"target", ".git", "node_modules"} for part in pom.parts):
+            continue
+        text = pom.read_text(encoding="utf-8", errors="ignore")[:500_000]
+        spring = re.search(r"spring-boot(?:-dependencies|-starter-parent)?[\s\S]{0,300}?<version>\s*([0-9]+)\.", text, re.I)
+        java = re.search(r"<(?:java\.version|maven\.compiler\.source)>\s*(?:1\.)?([0-9]+)", text, re.I)
+        spring_major = int(spring.group(1)) if spring else None
+        java_major = int(java.group(1)) if java else None
+        if (spring_major is not None and spring_major < 3) or (java_major is not None and java_major <= 11):
+            details = []
+            if spring_major is not None:
+                details.append(f"Spring Boot {spring_major}.x")
+            if java_major is not None:
+                details.append(f"Java {java_major}")
+            return "mysql:8.0", "、".join(details) + " 使用兼容线"
+    return default_image, "平台默认"
