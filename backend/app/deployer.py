@@ -62,6 +62,7 @@ from .deployment_build_repairs import apply_dockerfile_text_repairs
 from .deployment_build_handlers import detect_build as _detect_build, detect_container_port as _detect_container_port
 from .deployment_build_profiles import compatible_node_image, detect_build_profiles
 from .deployment_build_generators import generate_profile_build, generate_static_build
+from .deployment_topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
 from .deployment_runtime_policy import data_compose_project, release_directories, validate_release
 from .deployment_runtime_ports import (
     compose_port_number as _compose_port_number,
@@ -1246,35 +1247,8 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
             services = document.get("services") if isinstance(document, dict) else None
             if not isinstance(services, dict):
                 continue
-            normalized_services: dict[str, list[str]] = {}
-            for service_name in services:
-                normalized_services.setdefault(re.sub(r"[^a-z0-9]", "", service_name.lower()), []).append(service_name)
-            repaired = False
-            for host in sorted(upstream_hosts):
-                matches = normalized_services.get(re.sub(r"[^a-z0-9]", "", host.lower()), [])
-                if len(matches) != 1 or matches[0] == host:
-                    continue
-                target = services.get(matches[0])
-                if not isinstance(target, dict):
-                    continue
-                networks = target.get("networks")
-                if networks is None:
-                    networks = {"default": {"aliases": [host]}}
-                elif isinstance(networks, list):
-                    networks = {name: ({"aliases": [host]} if name == "default" else {}) for name in networks}
-                    networks.setdefault("default", {"aliases": [host]})
-                elif isinstance(networks, dict):
-                    default_network = networks.get("default")
-                    if not isinstance(default_network, dict):
-                        default_network = {}
-                    aliases = list(default_network.get("aliases") or [])
-                    if host not in aliases:
-                        aliases.append(host)
-                    default_network["aliases"] = aliases
-                    networks["default"] = default_network
-                target["networks"] = networks
-                repaired = True
-            if repaired:
+            alias_repairs = add_unambiguous_nginx_aliases(services, upstream_hosts)
+            if alias_repairs:
                 compose_file.write_text(yaml.safe_dump(document, allow_unicode=True, sort_keys=False), encoding="utf-8")
                 relative = compose_file.relative_to(root).as_posix()
                 if relative not in changed:
@@ -5622,6 +5596,12 @@ def central_build_and_distribute(
         for generated_dockerfile in generated_dockerfiles:
             context = generated_dockerfile.parent
             ensure_context_ignore(context)
+            if repair_generated_node_dependency_copy(context, generated_dockerfile):
+                log(
+                    deployment.id,
+                    "[平台兼容] 生成的运行镜像不能从源码上下文复制 node_modules；"
+                    "已改为在镜像内按锁文件安装运行依赖。\n",
+                )
             restored_inputs = ensure_generated_copy_inputs(context, generated_dockerfile)
             if restored_inputs:
                 log(

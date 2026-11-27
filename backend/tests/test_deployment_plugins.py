@@ -6,6 +6,7 @@ from app.deployment_build_generators import generate_profile_build, generate_sta
 from app.deployment_build_profiles import compatible_node_image, detect_build_profiles
 from app.deployment_runtime_policy import data_compose_project, release_directories, validate_release
 from app.deployment_runtime_ports import compose_port_number, compose_published_port, replace_compose_published_port
+from app.deployment_topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
 
 
 class DeploymentPluginTests(unittest.TestCase):
@@ -67,6 +68,30 @@ class DeploymentPluginTests(unittest.TestCase):
         self.assertEqual(compose_published_port("${APP_PORT:-10002}:8080", {"APP_PORT": "10003"}), 10003)
         self.assertEqual(replace_compose_published_port("127.0.0.1:10002:8080/tcp", 10004), "127.0.0.1:10004:8080/tcp")
         self.assertEqual(replace_compose_published_port({"target": 8080, "published": 10002}, 10004)["published"], 10004)
+
+    def test_generated_runtime_installs_instead_of_copying_node_modules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dockerfile = root / ".yunzhou.api.Dockerfile"
+            dockerfile.write_text(
+                "FROM node:22-alpine\nCOPY package.json ./package.json\n"
+                "COPY node_modules/ ./node_modules\nCOPY server.js ./server.js\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(repair_generated_node_dependency_copy(root, dockerfile))
+            repaired = dockerfile.read_text(encoding="utf-8")
+            self.assertIn("RUN npm install --omit=dev", repaired)
+            self.assertNotIn("COPY node_modules", repaired)
+
+    def test_unknown_nginx_upstream_aliases_unique_backend(self):
+        services = {
+            "frontend": {"image": "nginx:alpine"},
+            "backend": {"image": "company/api:latest"},
+            "mysql": {"image": "mysql:8.4"},
+        }
+        self.assertEqual(add_unambiguous_nginx_aliases(services, {"wmsapi"}), [("wmsapi", "backend")])
+        aliases = services["backend"]["networks"]["default"]["aliases"]
+        self.assertEqual(aliases, ["wmsapi"])
 
 
 if __name__ == "__main__":
