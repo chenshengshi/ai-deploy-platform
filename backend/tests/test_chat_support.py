@@ -1,9 +1,30 @@
 import unittest
+from unittest.mock import patch
 
-from app.chat_support import extract_external_mysql_config, format_failure_diagnosis
+import httpx
+
+from app.chat_support import diagnose_blank_frontend, extract_external_mysql_config, format_failure_diagnosis
 
 
 class ChatSupportTests(unittest.TestCase):
+    def test_blank_frontend_detects_html_returned_for_javascript(self):
+        def response(url, content_type, text=""):
+            return httpx.Response(200, headers={"content-type": content_type}, text=text, request=httpx.Request("GET", url))
+
+        def fake_get(_client, url):
+            if url.endswith("/merp/assets/app.js"):
+                return response(url, "text/html", "<html>fallback</html>")
+            if url.endswith("/assets/app.js"):
+                return response(url, "application/javascript", "console.log('ok')")
+            return response(url, "text/html", '<script src="/merp/assets/app.js"></script>')
+
+        with patch.object(httpx.Client, "get", fake_get):
+            diagnosis = diagnose_blank_frontend("http://example.test:30005")
+
+        self.assertEqual(diagnosis["kind"], "frontend_public_base_mismatch")
+        self.assertEqual(diagnosis["prefix"], "/merp")
+        self.assertEqual(diagnosis["evidence"][0]["working_path"], "/assets/app.js")
+
     def test_extract_external_mysql_config_from_chinese_request(self):
         config = extract_external_mysql_config(
             "把仓储改为外置 MySQL：地址 192.168.4.16，端口 60306，"

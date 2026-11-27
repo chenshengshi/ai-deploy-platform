@@ -39,7 +39,7 @@ from .archive_utils import safe_extract_zip
 from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
 from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
 from .backup import router as backup_router, start_backup_scheduler
-from .chat_support import extract_external_mysql_config, format_failure_diagnosis, session_task_state
+from .chat_support import diagnose_blank_frontend, extract_external_mysql_config, format_failure_diagnosis, session_task_state
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
@@ -8653,6 +8653,29 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
     nodes = db.scalars(select(Node).where(Node.enabled.is_(True))).all()
     project_id = decision.get("project_id") or body.project_id
     node_id = decision.get("node_id") or body.node_id
+    referenced_deployment = None
+    # A public platform URL is a durable deployment identifier. Resolve it
+    # before fuzzy project-name matching so users can paste a broken address
+    # without already knowing which project owns the port.
+    message_urls = re.findall(r"https?://[^\s，。；;<>]+", body.message, re.I)
+    for raw_url in message_urls:
+        requested = urlsplit(raw_url.rstrip("/）)]}"))
+        candidates = db.scalars(select(Deployment).where(
+            Deployment.access_url.is_not(None),
+        ).order_by(Deployment.created_at.desc())).all()
+        referenced_deployment = next((item for item in candidates if (
+            (lambda stored: (
+                stored.scheme.lower() == requested.scheme.lower()
+                and stored.hostname == requested.hostname
+                and (stored.port or (443 if stored.scheme == "https" else 80))
+                    == (requested.port or (443 if requested.scheme == "https" else 80))
+            ))(urlsplit(item.access_url or ""))
+        )), None)
+        if referenced_deployment and _user_can_access_project(db, user, referenced_deployment.project_id):
+            project_id = referenced_deployment.project_id
+            node_id = referenced_deployment.node_id
+            break
+        referenced_deployment = None
     if not db.get(Project, project_id) if project_id else False:
         project_id = None
     if not db.get(Node, node_id) if node_id else False:
@@ -8702,7 +8725,44 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         runner_up = ranked_projects[1][0] if len(ranked_projects) > 1 else 0
         if best_score >= 0.48 and best_score - runner_up >= 0.12:
             project_id = best_project.id
-    confirmed = normalized in {"是", "是的", "确认", "确认部署", "确认停止", "确认取消", "确认回滚", "确认重启", "确认执行表结构", "确认执行高风险表结构", "确认执行数据变更", "确认执行高风险数据变更", "开始", "开始部署", "可以", "执行", "上线", "停止", "取消", "回滚", "重启"}
+    confirmed = normalized in {"是", "是的", "确认", "确认部署", "确认停止", "确认取消", "确认回滚", "确认重启", "确认修复", "修复", "修复并重新发布", "确认修复并重新发布", "确认执行表结构", "确认执行高风险表结构", "确认执行数据变更", "确认执行高风险数据变更", "开始", "开始部署", "可以", "执行", "上线", "停止", "取消", "回滚", "重启"}
+    repair_frontend_deployment_id = (
+        body.intent.split(":", 1)[1]
+        if body.intent and body.intent.startswith("repair_frontend_path:")
+        else None
+    )
+    if repair_frontend_deployment_id and confirmed:
+        source_deployment = db.get(Deployment, repair_frontend_deployment_id)
+        target = db.get(Project, source_deployment.project_id) if source_deployment else None
+        target_node = db.get(Node, source_deployment.node_id) if source_deployment else None
+        if not source_deployment or not target or not target_node or not _user_can_access_project(db, user, target.id):
+            raise HTTPException(409, "待修复的项目版本已经变化，请重新诊断")
+        active = db.scalar(select(Deployment).where(
+            Deployment.project_id == target.id,
+            Deployment.node_id == target_node.id,
+            Deployment.status.in_([DeployStatus.queued, DeployStatus.running]),
+        ).order_by(Deployment.created_at.desc()))
+        if active:
+            return respond(
+                f"“{target.name}”已有进行中的发布任务，平台不会重复创建。",
+                deployment_id=active.id, action="existing_deployment",
+                project_id=target.id, node_id=target_node.id, intent=None,
+            )
+        plan = make_deployment_plan(target, target_node, db, allocate_port=True)
+        item = Deployment(
+            project_id=target.id, node_id=target_node.id, requested_by=user.id,
+            status=DeployStatus.queued, trigger="ai_autofix_1", host_port=plan["host_port"],
+            log_text=plan_log(plan) + "[修复问题] frontend_public_base_mismatch：前端静态资源基础路径与平台根路径不一致\n",
+        )
+        db.add(item)
+        db.flush()
+        audit(db, user, "ai_repair_and_deploy", "deployment", item.id, "frontend_public_base_mismatch")
+        db.commit()
+        return respond(
+            f"已在隔离发布副本中开始修复“{target.name}”的前端基础路径并重新发布；原 Git 仓库不会被修改。",
+            deployment_id=item.id, action="repair_deploy", project_id=target.id,
+            node_id=target_node.id, intent=None,
+        )
     delete_intent_id = body.intent.split(":", 1)[1] if body.intent and body.intent.startswith("delete:") else None
     wants_delete = (
         decision.get("action") == "delete_project"
@@ -9107,6 +9167,43 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
             return respond(
                 f"结论：“{target_project.name}”还没有发布记录。\n下一步：选择目标服务器后，可以让我发布这个项目。",
                 action="answer", project_id=project_id, node_id=node_id, intent=None,
+            )
+        asks_blank_page = any(word in body.message.lower() for word in (
+            "空白", "白屏", "打不开", "无法访问", "加载不出来", "页面没内容", "blank page",
+        ))
+        if asks_blank_page:
+            measured = (
+                referenced_deployment
+                if referenced_deployment and referenced_deployment.project_id == project_id
+                and referenced_deployment.status == DeployStatus.success
+                else online
+            )
+            if not measured or not measured.access_url:
+                return respond(
+                    f"结论：“{target_project.name}”目前没有可检测的成功版本访问地址。\n"
+                    "下一步：请先完成一次发布，平台才能检查页面和静态资源。",
+                    action="answer", project_id=project_id, node_id=node_id, intent=None,
+                )
+            frontend_issue = diagnose_blank_frontend(measured.access_url)
+            if frontend_issue:
+                evidence = frontend_issue["evidence"][0]
+                working = evidence.get("working_path") or "未找到"
+                return respond(
+                    f"结论：“{target_project.name}”空白页的根因已确认，不是服务未启动。\n"
+                    "问题类型：项目前端构建配置问题。\n"
+                    f"关键依据：页面引用 {evidence['reference']}，请求返回 {evidence['content_type']}；"
+                    f"去掉错误前缀后的资源 {working} 可以正常读取。\n"
+                    f"根因：{frontend_issue['summary']}\n"
+                    "下一步：可以让我在隔离发布副本中修正前端基础路径并重新发布；原 Git 仓库不会被修改。",
+                    deployment_id=measured.id, action="diagnose_frontend_path",
+                    project_id=project_id, node_id=measured.node_id,
+                    intent=f"repair_frontend_path:{measured.id}",
+                )
+            return respond(
+                f"结论：“{target_project.name}”入口可访问，但平台没有发现 JS/CSS 返回 HTML 的基础路径错误。\n"
+                "下一步：请查看浏览器控制台首条错误，平台会继续按具体资源或运行时错误诊断。",
+                deployment_id=measured.id, action="answer", project_id=project_id,
+                node_id=measured.node_id, intent=None,
             )
         asks_failure = any(word in body.message for word in ("失败", "原因", "为什么", "报错", "错误"))
         if asks_failure:

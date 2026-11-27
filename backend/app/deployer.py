@@ -40,6 +40,7 @@ from .build_planning import (
     strip_generated_code_fence,
     valid_generated_dockerfile,
 )
+from .chat_support import diagnose_blank_frontend
 from .database import SessionLocal
 from .deployment_logs import append_deployment_log, read_deployment_log
 from .deployment_integrations import (
@@ -751,6 +752,25 @@ def apply_safe_build_repairs(path: str, previous_error: str, deployment_mode: st
     error = (previous_error or "").lower()
     changed: list[str] = []
     root = Path(path)
+    # A verified SPA can still render blank when its production build embeds a
+    # subdirectory (for example /merp/) while the platform publishes it at the
+    # project root.  On an explicit, evidence-backed AI repair request, change
+    # only the isolated release copy. The user's Git checkout is never written.
+    if "frontend_public_base_mismatch" in error:
+        vite_files = list(root.rglob("vite.config.js")) + list(root.rglob("vite.config.ts")) + list(root.rglob("vite.config.mjs")) + list(root.rglob("vite.config.cjs"))
+        for config_file in vite_files:
+            if not config_file.is_file() or any(part in {".git", "node_modules", "dist", "build"} for part in config_file.relative_to(root).parts):
+                continue
+            original = config_file.read_text(encoding="utf-8", errors="replace")
+            repaired = re.sub(
+                r"(?m)(\bbase\s*:\s*)([\"'])/(?!\2)(?:[^\"']+/)+\2",
+                r"\g<1>\g<2>/\g<2>",
+                original,
+                count=1,
+            )
+            if repaired != original:
+                config_file.write_text(repaired, encoding="utf-8")
+                changed.append(config_file.relative_to(root).as_posix())
     # User-defined Spring String placeholders usually describe optional
     # business integrations (sync.*, sms.*, oss.*, callback.*, and so on).
     # Give every member of those namespaces an empty default in the isolated
@@ -4068,6 +4088,16 @@ def verify_access(db, deployment_id: str, access_url: str, required_paths: list[
                     log(deployment_id, f"[检查] 前端入口可达，但后端路由尚未就绪：{last_output}\n")
                     accepted = False
                 else:
+                    frontend_issue = diagnose_blank_frontend(access_url)
+                    if frontend_issue:
+                        evidence = frontend_issue["evidence"][0]
+                        detail = (
+                            "frontend_public_base_mismatch："
+                            f"页面引用 {evidence['reference']}，但返回 {evidence['content_type']}；"
+                            f"实际资源位于 {evidence.get('working_path') or '其他路径'}"
+                        )
+                        log(deployment_id, f"[前端完整性检查] {detail}\n")
+                        raise RuntimeError(detail)
                     qualifier = "（服务可达，需要鉴权）" if int(status) in {401, 403} else ""
                     log(deployment_id, f"[检查] 第 {attempt} 次访问验证通过：HTTP {status}{qualifier} · {access_url}\n")
                     ai_checkpoint(deployment_id, "验证访问地址", f"访问验证通过：HTTP {status}{qualifier}，地址 {access_url}")
@@ -8111,7 +8141,11 @@ def execute(deployment_id: str) -> None:
             work, revision, cleanup_root, source_subpath = stage_source(project, db, dep.id)
             source_repair_baseline = snapshot_text_sources(Path(work))
             ensure_active(dep.id)
-            previous_error = ""
+            previous_error = (
+                dep.log_text or ""
+                if str(dep.trigger or "").startswith("ai_autofix_") and "[修复问题]" in (dep.log_text or "")
+                else ""
+            )
             # A user-requested retry must receive the same bounded repair
             # context as an automatic retry.  Previously only ai_autofix
             # carried the last error, so clicking "retry" repeated a known
@@ -8147,7 +8181,10 @@ def execute(deployment_id: str) -> None:
                     ) if value)
                     if detail:
                         failure_evidence.append(detail)
-            previous_error = "\n\n".join(failure_evidence)
+            previous_error = "\n\n".join(value for value in (
+                previous_error,
+                "\n\n".join(failure_evidence),
+            ) if value)
             if source_subpath:
                 log(dep.id, f"[源码] 已定位仓库项目目录 /{source_subpath}\n")
             optimized_files = optimize_staged_sources(work)

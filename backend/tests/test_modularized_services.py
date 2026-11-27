@@ -14,6 +14,7 @@ from app.build_planning import (
 )
 from app.config import encrypt, settings
 from app.deployer import (
+    apply_safe_build_repairs,
     _compose_service_container_port,
     _compose_service_mapping,
     _dockerfile_exposed_port,
@@ -37,6 +38,15 @@ from app.source_inspection import (
 
 
 class DeploymentSourceContractTests(unittest.TestCase):
+    def test_frontend_base_repair_changes_only_isolated_vite_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "vite.config.ts"
+            config.write_text("export default { base: '/merp/' }\n", encoding="utf-8")
+            changed = apply_safe_build_repairs(directory, "frontend_public_base_mismatch")
+            self.assertEqual(changed, ["vite.config.ts"])
+            self.assertIn("base: '/'", config.read_text(encoding="utf-8"))
+
     def test_compose_port_uses_requested_multistage_target(self):
         dockerfile = (
             "FROM node:22 AS backend-runtime\nEXPOSE 8080\n"
