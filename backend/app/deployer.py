@@ -9512,6 +9512,50 @@ def stop_project_data_services(project: Project, node: Node, db=None) -> str:
     return f"已停止 {len(ids)} 个项目共享数据容器；数据卷和容器配置均已保留"
 
 
+def remove_project_managed_data_service(project: Project, node: Node, service: str, db=None) -> str:
+    """Remove one project-owned managed data service and its private volumes."""
+    family = str(service or "").lower().strip()
+    if family not in {"mysql", "redis", "postgres"}:
+        raise ValueError("不支持的托管数据服务")
+    policy = db.get(DeploymentSettings, "default") if db is not None else None
+    runtime_namespace = (policy.registry_namespace if policy else "yunzhou") or "yunzhou"
+    data_project = data_compose_project(runtime_namespace, project.slug)
+    aliases = {"mysql": {"mysql", "mariadb", "db", "database"}, "redis": {"redis", "cache"}, "postgres": {"postgres", "postgresql"}}[family]
+    with SSHNode(node) as ssh:
+        project_label = shlex.quote(f"label=com.docker.compose.project={data_project}")
+        _, rows = ssh.run(
+            "for id in $(docker ps -aq --filter " + project_label + "); do "
+            "svc=$(docker inspect -f '{{index .Config.Labels \"com.docker.compose.service\"}}' $id 2>/dev/null); "
+            "printf '%s|%s\\n' \"$id\" \"$svc\"; done",
+            timeout=30,
+        )
+        ids = []
+        for row in rows.splitlines():
+            container_id, _, service_name = row.partition("|")
+            if re.fullmatch(r"[0-9a-f]{12,64}", container_id) and service_name.lower() in aliases:
+                ids.append(container_id)
+        if not ids:
+            return f"未发现该项目的托管 {family.title()} 容器或数据卷"
+        words = " ".join(shlex.quote(value) for value in ids)
+        _, volume_rows = ssh.run(
+            "for id in " + words + "; do docker inspect -f '{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}}{{\"\\n\"}}{{end}}{{end}}' $id; done",
+            timeout=30,
+        )
+        volumes = sorted({value.strip() for value in volume_rows.splitlines() if re.fullmatch(r"[A-Za-z0-9_.-]+", value.strip())})
+        code, output = ssh.run(f"docker rm -f {words}", timeout=max(60, 45 * len(ids)))
+        if code:
+            raise RuntimeError(f"托管 {family.title()} 容器删除失败：" + output[-800:])
+        removed_volumes = 0
+        for volume in volumes:
+            volume_code, _ = ssh.run(f"docker volume rm {shlex.quote(volume)}", timeout=30)
+            if volume_code == 0:
+                removed_volumes += 1
+        inspect_code, _ = ssh.run(f"docker inspect {words}", timeout=20)
+        if inspect_code == 0:
+            raise RuntimeError(f"托管 {family.title()} 清理后复查发现仍有容器残留")
+    return f"已删除该项目的托管 {family.title()} 容器 {len(ids)} 个、私有数据卷 {removed_volumes} 个；未影响其他数据服务"
+
+
 def start_project_data_services(
     project: Project,
     node: Node,

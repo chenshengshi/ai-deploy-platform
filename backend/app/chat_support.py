@@ -1,3 +1,5 @@
+import re
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -6,6 +8,35 @@ from .models import ChatSession, DeployStatus, Deployment, Project
 
 _ACTIVE_ANALYSIS_STATES = {"queued", "running"}
 _ACTIVE_DEPLOYMENT_STATES = {DeployStatus.queued, DeployStatus.running}
+
+
+def extract_external_mysql_config(message: str) -> dict[str, str]:
+    """Extract an explicitly supplied external MySQL connection from Chinese text.
+
+    This is deliberately strict: all five connection fields must be present.
+    It complements the model so a compound request such as "save this external
+    database and remove the old managed one" cannot be mistaken for a status or
+    stop request merely because it contains the word ``stop``/``remove``.
+    """
+    text = str(message or "")
+    if "mysql" not in text.lower() or not any(word in text for word in ("外置", "外接", "外部")):
+        return {}
+
+    host = re.search(r"\b((?:\d{1,3}\.){3}\d{1,3})\b", text)
+    port = re.search(r"(?:端口\s*[:：]?\s*|\b\d{1,3}(?:\.\d{1,3}){3}\s*[:：])(\d{2,5})\b", text, re.I)
+    database = re.search(r"(?:数据库|库名)\s*[:：]?\s*([A-Za-z0-9_$.-]+)", text, re.I)
+    username = re.search(r"(?:用户名|账号|用户)\s*[:：]?\s*([^\s，。；;]+)", text, re.I)
+    password = re.search(r"(?:密码)\s*[:：]?\s*([^\s，。；;]+)", text, re.I)
+    if not all((host, port, database, username, password)):
+        return {}
+    return {
+        "YUNZHOU_MYSQL_MODE": "external",
+        "YUNZHOU_MYSQL_HOST": host.group(1),
+        "YUNZHOU_MYSQL_PORT": port.group(1),
+        "YUNZHOU_MYSQL_DATABASE": database.group(1),
+        "YUNZHOU_MYSQL_USERNAME": username.group(1),
+        "YUNZHOU_MYSQL_PASSWORD": password.group(1),
+    }
 
 
 def session_task_state(db: Session, session: ChatSession, latest_action: str | None) -> tuple[bool, str]:

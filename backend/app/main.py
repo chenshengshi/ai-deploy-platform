@@ -39,7 +39,7 @@ from .archive_utils import safe_extract_zip
 from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
 from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
 from .backup import router as backup_router, start_backup_scheduler
-from .chat_support import format_failure_diagnosis, session_task_state
+from .chat_support import extract_external_mysql_config, format_failure_diagnosis, session_task_state
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
@@ -47,7 +47,7 @@ from .deployment_log_rendering import build_log_streams, compact_docker_pull_log
 from .deployment_lifecycle import can_switch_to_release, is_verified_release
 from .deployment_pipeline import PIPELINE_DEFINITIONS, parse_stage_times, stage_timing
 from .deployment_source_repairs import repair_bundle_summary
-from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
+from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, remove_project_managed_data_service, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .login_security import clear_login_failures, enforce_login_source_limit, login_source_ip as _login_source_ip, record_login_failure
 from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectAccess, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
@@ -8662,6 +8662,20 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
     project_id = project_match.id if project_match else project_id
     node_id = node_match.id if node_match else node_id
     normalized = re.sub(r"[\s，。！!？?]", "", body.message)
+    external_mysql_changes = extract_external_mysql_config(body.message)
+    cleanup_managed_mysql = bool(
+        external_mysql_changes
+        and any(word in body.message for word in ("清理", "删除", "移除"))
+        and any(word in body.message for word in ("托管", "创建", "额外", "数据卷", "数据券"))
+    )
+    if external_mysql_changes:
+        decision = {
+            **decision,
+            "action": "configure",
+            "config_changes": external_mysql_changes,
+            "project_id": project_id,
+            "node_id": node_id,
+        }
     # Model semantics and the explicitly associated project remain the primary
     # signals.  If neither resolved a project, tolerate one-character typos in
     # conversational names (for example “仓除” -> “仓储系统”).  This only
@@ -8848,9 +8862,36 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
             else:
                 current_lines.append(line)
         target.env_text_encrypted = encrypt("\n".join(current_lines).strip() + "\n")
+        state = dict(target.source_analysis or {})
+        if state.get("status") == "completed":
+            state["runtime_services"] = _runtime_service_versions(
+                target,
+                state.get("deployment_plan") or {},
+                db,
+                state.get("workspace_path") or state.get("repository_cache_path"),
+            )
+            target.integration_analysis_json = json.dumps(state, ensure_ascii=False)
         audit(db, user, "ai_update_project_config", "project", target.id, detail=",".join(sorted(changes)))
         db.commit()
-        return respond(f"已更新“{target.name}”的 {len(changes)} 项配置。配置将在下一次发布或重新发布时生效；如需立即应用，请告诉我重新部署到哪个服务器。", action="configured", project_id=target.id, node_id=node_id, intent=None)
+        cleanup_result = ""
+        if configure_payload.get("cleanup_managed_mysql"):
+            cleanup_node_id = configure_payload.get("node_id") or node_id
+            cleanup_node = db.get(Node, cleanup_node_id) if cleanup_node_id else None
+            if not cleanup_node:
+                latest_deployment = db.scalar(select(Deployment).where(
+                    Deployment.project_id == target.id,
+                ).order_by(Deployment.created_at.desc()))
+                cleanup_node = db.get(Node, latest_deployment.node_id) if latest_deployment else None
+            if not cleanup_node:
+                raise HTTPException(409, "已保存外接 MySQL 配置，但找不到原托管数据库所在服务器，未执行清理")
+            cleanup_result = remove_project_managed_data_service(target, cleanup_node, "mysql", db)
+            audit(db, user, "ai_remove_managed_mysql", "project", target.id, cleanup_result)
+            db.commit()
+        reply = f"已更新“{target.name}”的 {len(changes)} 项配置。"
+        if cleanup_result:
+            reply += f"\n清理结果：{cleanup_result}。"
+        reply += "\n配置将在下一次发布或重新发布时生效；如需立即应用，请告诉我重新部署到哪个服务器。"
+        return respond(reply, action="configured", project_id=target.id, node_id=(cleanup_node.id if cleanup_result else node_id), intent=None)
     if decision.get("action") == "configure":
         changes = decision.get("config_changes") or {}
         target = db.get(Project, project_id) if project_id else None
@@ -8859,10 +8900,16 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         if not isinstance(changes, dict) or not changes:
             return respond(decision.get("reply") or "请告诉我要修改的配置名称和值，例如：为这个项目设置 REDIS_HOST=192.168.1.20。", action="none", project_id=target.id, node_id=node_id, intent="configure")
         safe_changes = {str(key): str(value) for key, value in changes.items()}
-        payload = base64.urlsafe_b64encode(json.dumps({"project_id": target.id, "changes": safe_changes}, ensure_ascii=False).encode()).decode()
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "project_id": target.id,
+            "node_id": node_id,
+            "changes": safe_changes,
+            "cleanup_managed_mysql": cleanup_managed_mysql,
+        }, ensure_ascii=False).encode()).decode()
         secret_words = ("password", "secret", "token", "key")
         preview = "\n".join(f"- {key}={'******' if any(word in key.lower() for word in secret_words) else value}" for key, value in safe_changes.items())
-        return respond(f"准备修改“{target.name}”的项目配置：\n{preview}\n\n这些配置只会写入项目的加密配置，不会立即修改正在运行的容器。回复“确认”后保存。", action="confirm_config", project_id=target.id, node_id=node_id, intent="configure:" + payload)
+        cleanup_preview = "\n确认后还会删除该项目原托管 MySQL 容器及其私有数据卷；不会删除 Redis、其他项目或外置数据库。" if cleanup_managed_mysql else ""
+        return respond(f"准备修改“{target.name}”的项目配置：\n{preview}\n\n这些配置只会写入项目的加密配置，不会立即修改正在运行的容器。{cleanup_preview}\n回复“确认”后保存。", action="confirm_config", project_id=target.id, node_id=node_id, intent="configure:" + payload)
     wants_migrate = decision.get("action") == "migrate" or any(
         phrase in body.message for phrase in ("执行表结构", "更新表结构", "同步表结构", "应用迁移", "执行迁移", "更新数据库结构")
     )
