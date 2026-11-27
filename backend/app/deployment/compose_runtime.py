@@ -2,7 +2,7 @@
 
 import shlex
 
-from ..deployment_architecture import COMPOSE_NAMES
+from .architecture import COMPOSE_NAMES
 
 
 def remote_compose_files(ssh, directory: str) -> list[str]:

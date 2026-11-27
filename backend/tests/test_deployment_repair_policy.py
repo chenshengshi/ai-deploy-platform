@@ -1,6 +1,6 @@
 import unittest
 
-from app.deployment_repair_policy import MAX_AI_RETRIES, assess_failure
+from app.deployment.repair_policy import MAX_AI_RETRIES, assess_failure
 
 
 class DeploymentRepairPolicyTests(unittest.TestCase):

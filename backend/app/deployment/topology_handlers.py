@@ -131,3 +131,5 @@ def handler_for(build_type: str) -> TopologyHandler:
         if normalized in handler.build_types:
             return handler
     raise ValueError(f"不支持的构建类型：{build_type or '空'}")
+"""Deployment package component."""
+

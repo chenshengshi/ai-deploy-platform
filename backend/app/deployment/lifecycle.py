@@ -1,5 +1,5 @@
-from .deployment_logs import read_deployment_log
-from .models import Deployment, DeployStatus
+from .logs import read_deployment_log
+from ..models import Deployment, DeployStatus
 
 
 VERIFIED_RELEASE_MARKERS = ("[完成] 部署成功", "[启用确认]", "[回滚完成]")
@@ -24,3 +24,5 @@ def can_switch_to_release(item: Deployment) -> bool:
         and item.host_port
         and is_verified_release(item)
     )
+"""Deployment package component."""
+

@@ -35,3 +35,5 @@ def optimize_staged_sources(path: str) -> list[str]:
             candidate.write_text(optimized)
             changed.append(candidate.relative_to(root).as_posix())
     return changed
+"""Deployment package component."""
+

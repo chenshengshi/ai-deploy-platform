@@ -12,8 +12,8 @@ from sqlalchemy import select
 
 from ..build_planning import PLATFORM_NGINX_IMAGE, detect_java_log_directories
 from ..config import decrypt
-from ..deployment_integrations import environment_values
-from ..deployment_runtime_ports import (
+from .integrations import environment_values
+from .runtime_ports import (
     compose_port_number as _compose_port_number,
     project_traffic_plan as _project_traffic_plan,
     traffic_service_roles as _traffic_service_roles,

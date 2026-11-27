@@ -59,3 +59,5 @@ def compatible_node_image(root: str | Path, current_image: str) -> str:
     if selected <= current_major:
         return current_image
     return re.sub(r"(?i)(node:)\d+", rf"\g<1>{selected}", current_image, count=1)
+"""Deployment package component."""
+

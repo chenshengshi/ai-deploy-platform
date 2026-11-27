@@ -47,10 +47,10 @@ from .chat.sessions import chat_session_dict, chat_session_for_user
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .project_data.sql_safety import data_change_confirmation_token, extract_direct_sql, high_risk_matches, is_high_risk_sql, sql_kind
-from .deployment_logs import deployment_log_path, read_deployment_log
-from .deployment_log_rendering import compact_docker_pull_log
-from .deployment_lifecycle import can_switch_to_release, is_verified_release
-from .deployment_pipeline_view import render_pipeline_steps
+from .deployment.logs import deployment_log_path, read_deployment_log
+from .deployment.log_rendering import compact_docker_pull_log
+from .deployment.lifecycle import can_switch_to_release, is_verified_release
+from .deployment.pipeline_view import render_pipeline_steps
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, remove_project_managed_data_service, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .login_security import clear_login_failures, enforce_login_source_limit, login_source_ip as _login_source_ip, record_login_failure

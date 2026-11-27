@@ -17,3 +17,5 @@ def select_lru_evictions(
         evictions.append(path)
         total -= max(0, size)
     return evictions
+"""Deployment package component."""
+

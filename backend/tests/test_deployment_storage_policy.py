@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from app.deployment_storage_policy import select_lru_evictions
+from app.deployment.storage_policy import select_lru_evictions
 
 
 class DeploymentStoragePolicyTests(unittest.TestCase):

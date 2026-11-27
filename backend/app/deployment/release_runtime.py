@@ -6,7 +6,7 @@ import shlex
 from sqlalchemy import select
 
 from ..database import SessionLocal
-from ..deployment_runtime_policy import release_directories
+from .runtime_policy import release_directories
 from ..models import Deployment, DeploymentPortReservation, Node, Project
 from ..ssh import SSHNode
 from .compose_runtime import compose_file_args, remote_compose_files

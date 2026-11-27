@@ -11,7 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .config import decrypt
-from .deployment_repair_policy import assess_failure
+from .deployment.repair_policy import assess_failure
 from .experience import experience_confidence, infer_experience_tags, normalized_state, rank_learning_experiences, sanitize_learning_text
 from .models import AiConfig, Deployment, DeploymentExperience, DeploymentSettings, Node, Project
 from .proxy import proxy_for

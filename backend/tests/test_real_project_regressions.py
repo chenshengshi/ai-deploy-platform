@@ -3,10 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.deployment_architecture import analyze_repository_topology
-from app.deployment_repair_policy import assess_failure
-from app.deployment_runtime_policy import release_directories
-from app.deployment_topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
+from app.deployment.architecture import analyze_repository_topology
+from app.deployment.repair_policy import assess_failure
+from app.deployment.runtime_policy import release_directories
+from app.deployment.topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
 
 
 class RealProjectRegressionTests(unittest.TestCase):

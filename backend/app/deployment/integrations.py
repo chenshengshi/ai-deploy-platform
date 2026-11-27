@@ -3,9 +3,9 @@ import hashlib
 import re
 from pathlib import Path
 
-from .config import settings
-from .models import Project
-from .deployment_integration_environment import (
+from ..config import settings
+from ..models import Project
+from .integration_environment import (
     effective_project_environment,
     environment_values,
     external_integration_preflight,
@@ -146,3 +146,5 @@ def managed_mysql_image_for_source(
                 details.append(f"Java {java_major}")
             return "mysql:8.0", "、".join(details) + " 使用兼容线"
     return default_image, "平台默认"
+"""Deployment package component."""
+

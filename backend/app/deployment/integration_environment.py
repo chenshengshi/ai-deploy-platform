@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .config import decrypt
-from .models import Project
+from ..config import decrypt
+from ..models import Project
 
 
 INTEGRATION_FIELDS = {
@@ -76,3 +76,5 @@ def store_managed_values(project: Project, values: dict[str, str]) -> list[str]:
     if changed:
         project.managed_env_text = "\n".join(lines).strip() + "\n"
     return changed
+"""Deployment package component."""
+

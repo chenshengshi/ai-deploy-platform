@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ..deployment_architecture import fullstack_roots, has_project_marker
+from .architecture import fullstack_roots, has_project_marker
 
 
 def git_source_location(raw_url: str, configured_branch: str | None = None) -> tuple[str, str, str]:

@@ -1,6 +1,6 @@
 import unittest
 
-from app.deployment_build_repairs import apply_dockerfile_text_repairs
+from app.deployment.build_repairs import apply_dockerfile_text_repairs
 
 
 class DeploymentBuildRepairTests(unittest.TestCase):

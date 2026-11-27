@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from .config import settings
+from ..config import settings
 
 
 def deployment_log_path(deployment_id: str) -> Path:
@@ -25,3 +25,5 @@ def append_deployment_log(deployment_id: str, content: str) -> None:
             handle.write(content)
     except OSError:
         pass
+"""Deployment package component."""
+

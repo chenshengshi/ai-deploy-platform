@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from .deployment_build_profiles import BuildProfile, compatible_node_image
+from .build_profiles import BuildProfile, compatible_node_image
 
 
 @dataclass(frozen=True)
@@ -176,3 +176,5 @@ def generate_static_build(root: Path, *, nginx_image: str) -> GeneratedBuild | N
         f"FROM {nginx_image}\nCOPY {copy_source} /usr/share/nginx/html\nEXPOSE 80\n",
         80,
     )
+"""Deployment package component."""
+

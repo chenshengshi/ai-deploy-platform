@@ -2,7 +2,7 @@
 
 import shlex
 
-from ..deployment_runtime_policy import release_directories, validate_release
+from .runtime_policy import release_directories, validate_release
 from ..models import Deployment, Node, Project
 from ..ssh import SSHNode
 from .compose_runtime import compose_file_args, remote_compose_files

@@ -13,8 +13,8 @@ from sqlalchemy import select
 
 from .config import settings
 from .database import Base, SessionLocal, engine
-from .deployment_repair_policy import MAX_AI_RETRIES, assess_failure
-from .deployment_storage_policy import select_lru_evictions
+from .deployment.repair_policy import MAX_AI_RETRIES, assess_failure
+from .deployment.storage_policy import select_lru_evictions
 from .deployer import (
     cleanup_incomplete_release_images,
     deployment_compose_project_name,

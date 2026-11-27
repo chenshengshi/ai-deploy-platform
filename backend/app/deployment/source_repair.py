@@ -8,8 +8,8 @@ from pathlib import Path
 import yaml
 
 from ..build_planning import PLATFORM_NGINX_IMAGE
-from ..deployment_build_repairs import apply_dockerfile_text_repairs
-from ..deployment_topology import add_unambiguous_nginx_aliases
+from .build_repairs import apply_dockerfile_text_repairs
+from .topology import add_unambiguous_nginx_aliases
 from ..source_inspection import _FRONTEND_API_ENV_KEYS, detect_frontend_api_routes
 
 

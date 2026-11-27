@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from app.models import DeployStatus
-from app.deployment_pipeline_view import render_pipeline_steps
+from app.deployment.pipeline_view import render_pipeline_steps
 from app.runtime_scaling import _next_service_instance_name, _service_instance_sequence
 from app.runtime_topology import _route_groups_for_services, _runtime_entry_is_data, _service_role
 

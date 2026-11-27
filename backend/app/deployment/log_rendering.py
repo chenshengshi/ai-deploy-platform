@@ -149,3 +149,5 @@ def build_log_streams(section: str) -> list[dict]:
         })
     order = {"web": 0, "api": 1, "package": 2, "distribute": 3}
     return sorted(result, key=lambda item: (order.get(item["key"], 99), item["label"]))
+"""Deployment package component."""
+

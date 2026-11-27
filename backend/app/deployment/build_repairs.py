@@ -112,3 +112,5 @@ def apply_dockerfile_text_repairs(
             current = updated
             applied.append(name)
     return current, applied
+"""Deployment package component."""
+

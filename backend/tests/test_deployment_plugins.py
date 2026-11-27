@@ -2,11 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.deployment_build_generators import generate_profile_build, generate_static_build
-from app.deployment_build_profiles import compatible_node_image, detect_build_profiles
-from app.deployment_runtime_policy import data_compose_project, release_directories, validate_release
-from app.deployment_runtime_ports import compose_port_number, compose_published_port, replace_compose_published_port
-from app.deployment_topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
+from app.deployment.build_generators import generate_profile_build, generate_static_build
+from app.deployment.build_profiles import compatible_node_image, detect_build_profiles
+from app.deployment.runtime_policy import data_compose_project, release_directories, validate_release
+from app.deployment.runtime_ports import compose_port_number, compose_published_port, replace_compose_published_port
+from app.deployment.topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
 
 
 class DeploymentPluginTests(unittest.TestCase):

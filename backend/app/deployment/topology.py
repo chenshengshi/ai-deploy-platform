@@ -67,3 +67,5 @@ def add_unambiguous_nginx_aliases(services: dict, upstream_hosts: set[str]) -> l
         networks["default"] = default_network
         target["networks"] = networks
     return changed
+"""Deployment package component."""
+

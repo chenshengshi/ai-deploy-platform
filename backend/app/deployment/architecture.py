@@ -12,8 +12,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .deployment_topology_handlers import TopologyContext, handler_for
-from .source_inspection import detect_frontend_api_routes
+from .topology_handlers import TopologyContext, handler_for
+from ..source_inspection import detect_frontend_api_routes
 
 
 COMPOSE_NAMES = (
@@ -224,3 +224,5 @@ def analyze_repository_topology(path: str, build_type: str, build_file: str) -> 
     )
     plan["persistent_mounts"] = sorted(set(plan["persistent_mounts"]))
     return plan
+"""Deployment package component."""
+

@@ -39,7 +39,8 @@ from app.deployment.release_runtime import (
     stop_deployment as modular_stop_deployment,
 )
 from app.deployment.source_repair import apply_safe_build_repairs as modular_apply_safe_build_repairs
-from app.deployment_architecture import (
+from app.deployment.integration_reconcile import reconcile_managed_integrations as modular_reconcile_managed_integrations
+from app.deployment.architecture import (
     analyze_repository_topology as architecture_analyze_repository_topology,
     analyze_runtime_dependencies,
     find_compose,
@@ -64,6 +65,7 @@ class DeploymentSourceContractTests(unittest.TestCase):
         self.assertIs(prepare_build, modular_prepare_build)
         self.assertIs(prepare_compose_image_override, modular_prepare_compose_image_override)
         self.assertIs(split_compose_runtime, modular_split_compose_runtime)
+        self.assertIs(reconcile_managed_integrations, modular_reconcile_managed_integrations)
 
     def test_frontend_base_repair_changes_only_isolated_vite_config(self):
         with tempfile.TemporaryDirectory() as directory:

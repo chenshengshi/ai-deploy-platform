@@ -2,12 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.deployment_architecture import (
+from app.deployment.architecture import (
     analyze_repository_topology,
     analyze_runtime_dependencies,
     find_compose,
 )
-from app.deployment_topology_handlers import (
+from app.deployment.topology_handlers import (
     ComposeTopologyHandler,
     DockerfileTopologyHandler,
     handler_for,

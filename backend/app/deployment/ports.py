@@ -17,7 +17,7 @@ from ..models import (
     ProjectReplica,
 )
 from ..ssh import SSHNode
-from ..deployment_runtime_ports import (
+from .runtime_ports import (
     compose_published_port as _compose_published_port,
     replace_compose_published_port as _replace_compose_published_port,
 )

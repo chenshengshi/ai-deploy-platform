@@ -1,3 +1,5 @@
+"""Runtime paths and release naming policy."""
+
 from __future__ import annotations
 
 import re

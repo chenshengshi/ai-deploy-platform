@@ -66,3 +66,5 @@ def replace_compose_published_port(value, published: int):
     parts[-2] = str(published)
     replaced = ":".join(parts)
     return replaced + (separator + protocol if separator else "")
+"""Deployment package component."""
+

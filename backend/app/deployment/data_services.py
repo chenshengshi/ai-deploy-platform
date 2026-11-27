@@ -6,8 +6,8 @@ import shlex
 import yaml
 
 from ..config import decrypt
-from ..deployment_integrations import data_service_names, environment_values
-from ..deployment_runtime_policy import data_compose_project
+from .integrations import data_service_names, environment_values
+from .runtime_policy import data_compose_project
 from ..models import DeploymentSettings, Node, Project
 from ..ssh import SSHNode
 

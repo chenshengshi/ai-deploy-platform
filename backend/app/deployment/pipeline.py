@@ -42,3 +42,5 @@ def stage_timing(stage_times: dict[str, dict[str, datetime]], key: str, running:
         "finished_at": finished.isoformat() if finished else None,
         "duration_seconds": round(duration, 1) if duration is not None else None,
     }
+"""Deployment package component."""
+

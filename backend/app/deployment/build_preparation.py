@@ -4,11 +4,11 @@ import re
 from pathlib import Path
 
 from ..build_planning import PLATFORM_NGINX_IMAGE
-from ..deployment_architecture import find_compose as _find_compose, fullstack_roots as _fullstack_roots
-from ..deployment_build_generators import generate_profile_build, generate_static_build
-from ..deployment_build_handlers import detect_build, detect_container_port
-from ..deployment_build_profiles import detect_build_profiles
-from ..deployment_source_optimization import optimize_staged_sources
+from .architecture import find_compose as _find_compose, fullstack_roots as _fullstack_roots
+from .build_generators import generate_profile_build, generate_static_build
+from .build_handlers import detect_build, detect_container_port
+from .build_profiles import detect_build_profiles
+from .source_optimization import optimize_staged_sources
 from ..source_inspection import detect_java_version
 
 

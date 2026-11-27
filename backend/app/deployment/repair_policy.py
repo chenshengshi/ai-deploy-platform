@@ -125,3 +125,5 @@ def assess_failure(error: str | None, ai_result: dict | None = None) -> FailureA
     return FailureAssessment(
         False, "unknown", "当前证据尚不足以确认归属；平台不会把未知错误直接判成源码问题，也不会盲目重试",
     )
+"""Deployment package component."""
+

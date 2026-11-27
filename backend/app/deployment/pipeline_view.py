@@ -2,9 +2,9 @@
 
 import re
 
-from .models import DeployStatus
-from .deployment_pipeline import PIPELINE_DEFINITIONS, parse_stage_times, stage_timing
-from .deployment_log_rendering import build_log_streams, compact_stage_log
+from ..models import DeployStatus
+from .pipeline import PIPELINE_DEFINITIONS, parse_stage_times, stage_timing
+from .log_rendering import build_log_streams, compact_stage_log
 
 def render_pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None = None, is_compose: bool = False) -> list[dict]:
     # Keep the user-facing pipeline compact. Detailed AI/preflight activity is
@@ -198,4 +198,6 @@ def render_pipeline_steps(log_text: str, status: DeployStatus, selected_key: str
 
 
 
+
+"""Deployment package component."""
 

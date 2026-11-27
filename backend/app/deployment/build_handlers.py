@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .deployment_architecture import find_compose
+from .architecture import find_compose
 
 
 @dataclass(frozen=True)
@@ -60,3 +60,5 @@ def detect_container_port(path: str, dockerfile_name: str = "Dockerfile") -> int
         if match:
             return int(match.group(1))
     return None
+"""Deployment package component."""
+
