@@ -44,7 +44,11 @@ export default function Login({ onDone, branding }) {
           <span><Activity /><b>持续管理</b><small>查看服务、日志和版本</small></span>
         </div>
       </div>
-      <form className="login-card" method="post" action="/api/auth/login" autoComplete="on" onSubmit={submit}>
+      {/* Authentication is handled by the JSON API above.  Declaring the
+          form as a native POST makes Chrome re-run compromised-password
+          checks after unrelated in-app tab changes.  The standard field
+          names and autocomplete tokens below still allow normal autofill. */}
+      <form className="login-card" autoComplete="on" onSubmit={submit}>
         <h2>欢迎回来</h2>
         <p className="sub">登录后管理项目与发布任务</p>
         <label>
