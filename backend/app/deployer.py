@@ -51,7 +51,7 @@ from .deployment.workspace import WORKSPACE_BRANCH, persist_verified_changes
 from .deployment.ports import (
     choose_node_port as _choose_node_port,
     choose_port,
-    reserve_reactivation_port,
+    prepare_stopped_release_ports,
     stopped_port_message,
     stopped_reservation_status,
 )
@@ -4030,118 +4030,6 @@ def node_platform(node: Node) -> str:
         raise RuntimeError("无法识别目标服务器 CPU 架构：" + output)
     machine = output.strip().lower()
     return "linux/arm64" if machine in {"aarch64", "arm64"} else "linux/amd64"
-
-
-def prepare_stopped_release_ports(
-    deployment: Deployment, project: Project, node: Node, actual_dir: str, db,
-) -> str:
-    """Validate and restore the ports retained by a stopped release.
-
-    A user-initiated stop keeps the release's reservations, so an ordinary
-    restart normally receives exactly the same addresses.  The reconciliation
-    below remains necessary for legacy records and for ports occupied by an
-    unmanaged process outside the platform.
-    """
-    if db is None:
-        return ""
-    old_entry_port = int(deployment.host_port or 0)
-    changes: list[tuple[str, int, int]] = []
-    reserved: set[int] = set()
-    try:
-        if deployment.image_name:
-            allocated = choose_node_port(
-                db, node, old_entry_port or None,
-                reserved=reserved, exclude_deployment_id=deployment.id,
-            )
-            reserved.add(allocated)
-            reserve_reactivation_port(db, deployment, node, "app", allocated)
-            if allocated != old_entry_port:
-                changes.append(("app", old_entry_port, allocated))
-            deployment.host_port = allocated
-        else:
-            app_file = ".yunzhou.app.yml"
-            remote_path = actual_dir.rstrip("/") + "/" + app_file
-            with SSHNode(node) as ssh:
-                if ssh.run(f"test -f {shlex.quote(remote_path)}", timeout=20)[0] != 0:
-                    # Legacy releases cannot be safely rewritten because their
-                    # source Compose file may still mix application and data.
-                    return ""
-                sftp = ssh.client.open_sftp()
-                try:
-                    with sftp.open(remote_path) as handle:
-                        original = handle.read().decode("utf-8", "replace")
-                    document = yaml.safe_load(original) or {}
-                    services = document.get("services") if isinstance(document, dict) else None
-                    if not isinstance(services, dict):
-                        raise RuntimeError("历史版本应用配置无效，无法重新分配端口")
-                    # Older managed releases interpolate published ports from
-                    # the release-local .env (for example
-                    # ${YUNZHOU_HOST_PORT}:80). Resolve those values before
-                    # deciding whether the historical port is still free. The
-                    # rewritten application file uses the newly allocated
-                    # number directly, so a stale .env value cannot reclaim it.
-                    compose_environment: dict[str, str] = {}
-                    for env_name in (".env.runtime", ".env"):
-                        try:
-                            with sftp.open(actual_dir.rstrip("/") + "/" + env_name) as handle:
-                                env_text = handle.read().decode("utf-8", "replace")
-                        except OSError:
-                            continue
-                        for line in env_text.splitlines():
-                            stripped = line.strip()
-                            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                                continue
-                            key, env_value = stripped.split("=", 1)
-                            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key.strip()):
-                                compose_environment[key.strip()] = env_value.strip().strip('"').strip("'")
-                    remapped_entry = None
-                    for service_name, service in services.items():
-                        if not isinstance(service, dict):
-                            continue
-                        mappings = list(service.get("ports") or [])
-                        updated = []
-                        for mapping in mappings:
-                            old_port = _compose_published_port(mapping, compose_environment)
-                            if not old_port:
-                                updated.append(mapping)
-                                continue
-                            allocated = choose_node_port(
-                                db, node, old_port,
-                                reserved=reserved, exclude_deployment_id=deployment.id,
-                            )
-                            reserved.add(allocated)
-                            reserve_reactivation_port(db, deployment, node, str(service_name), allocated)
-                            updated.append(_replace_compose_published_port(mapping, allocated))
-                            if allocated != old_port:
-                                changes.append((str(service_name), old_port, allocated))
-                            if old_port == old_entry_port:
-                                remapped_entry = allocated
-                        if mappings:
-                            service["ports"] = updated
-                    if old_entry_port and remapped_entry is None:
-                        raise RuntimeError("历史版本入口端口不在应用配置中，无法安全回滚")
-                    if remapped_entry:
-                        deployment.host_port = remapped_entry
-                    if changes:
-                        temporary = remote_path + ".port-remap"
-                        with sftp.open(temporary, "w") as handle:
-                            handle.write(yaml.safe_dump(document, allow_unicode=True, sort_keys=False))
-                        code, output = ssh.run(
-                            f"mv -f -- {shlex.quote(temporary)} {shlex.quote(remote_path)}",
-                            timeout=20,
-                        )
-                        if code:
-                            raise RuntimeError("写入历史版本端口映射失败：" + output[-300:])
-                finally:
-                    sftp.close()
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    if not changes:
-        return "历史端口仍可用，已重新登记"
-    detail = "、".join(f"{service} {old or '未分配'}→{new}" for service, old, new in changes)
-    return "历史端口已自动重新分配：" + detail
 
 
 def _compose_service_container_port(root: Path, service: dict) -> int | None:
