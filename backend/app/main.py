@@ -42,6 +42,8 @@ from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
 from .deployment_log_rendering import build_log_streams, compact_docker_pull_log, compact_stage_log
+from .deployment_lifecycle import can_switch_to_release, is_verified_release
+from .deployment_pipeline import PIPELINE_DEFINITIONS, parse_stage_times, stage_timing
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .login_security import clear_login_failures, enforce_login_source_limit, login_source_ip as _login_source_ip, record_login_failure
@@ -4204,50 +4206,14 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
 def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None = None, is_compose: bool = False) -> list[dict]:
     # Keep the user-facing pipeline compact. Detailed AI/preflight activity is
     # retained in the log for the active major stage.
-    definitions = [
-        ("analyze", "读取方案", ("方案",)),
-        ("prepare", "准备环境", ("准备", "源码", "依赖分析", "架构分析", "识别", "上传", "镜像")),
-        # Centralized builds are marked as [平台构建]. Keep these aliases in
-        # the build stage; otherwise the UI sees the earlier [识别] marker and
-        # incorrectly leaves "分析项目" active while BuildKit is running.
-        ("build", "构建应用", ("构建", "平台构建", "AI构建")),
-        ("start", "启动服务", ("启动",)),
-        ("verify", "验证访问", ("检查", "完成")),
-    ]
+    definitions = PIPELINE_DEFINITIONS
     skipped_stages = set()
     if re.search(r"(?m)^\[平台构建\].*(?:没有\s+build|固定镜像).*已跳过", log_text):
         skipped_stages.add("build")
-    stage_times: dict[str, dict[str, datetime]] = {}
-    for match in re.finditer(
-        r"(?m)^\[阶段时间\]\s+(analyze|prepare|build|start|verify)\s+"
-        r"(开始|完成|失败|停止)\s+(\S+)\s*$",
-        log_text,
-    ):
-        try:
-            moment = datetime.fromisoformat(match.group(3).replace("Z", "+00:00"))
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-        bucket = stage_times.setdefault(match.group(1), {})
-        if match.group(2) == "开始":
-            bucket["start"] = moment
-        else:
-            bucket["end"] = moment
+    stage_times = parse_stage_times(log_text)
 
     def timing_for(key: str) -> dict:
-        timing = stage_times.get(key) or {}
-        started = timing.get("start")
-        finished = timing.get("end")
-        if not started:
-            return {"started_at": None, "finished_at": None, "duration_seconds": None}
-        effective_end = finished or (datetime.now(timezone.utc) if status == DeployStatus.running else None)
-        duration = max(0, (effective_end - started).total_seconds()) if effective_end else None
-        return {
-            "started_at": started.isoformat(),
-            "finished_at": finished.isoformat() if finished else None,
-            "duration_seconds": round(duration, 1) if duration is not None else None,
-        }
+        return stage_timing(stage_times, key, status == DeployStatus.running)
     # New deployments emit explicit stage boundaries. Prefer them over
     # guessing from ordinary human-readable log messages.
     if "[阶段开始]" in log_text:
@@ -4655,16 +4621,6 @@ def deployment_view(
                 login_info["login_url"] = item.access_url.rstrip("/") + "/" + path.lstrip("/")
         except (TypeError, ValueError, json.JSONDecodeError):
             login_info = None
-    rollback_markers = ("[完成] 部署成功", "[启用确认]", "[回滚完成]")
-    rollback_verified = any(marker in lifecycle_log_text for marker in rollback_markers)
-    if (
-        not rollback_verified
-        and item.status == DeployStatus.stopped
-        and item.release
-        and item.access_url
-        and item.host_port
-    ):
-        rollback_verified = any(marker in read_deployment_log(item.id) for marker in rollback_markers)
     replica_rows = db.scalars(select(ProjectReplica).where(
         ProjectReplica.deployment_id == item.id,
         ProjectReplica.status == "running",
@@ -4705,13 +4661,7 @@ def deployment_view(
         "login_info": login_info,
         "rollback_transition": rollback_transition,
         "auto_repair": auto_repair,
-        "rollback_allowed": bool(
-            item.status == DeployStatus.stopped
-            and item.release
-            and item.access_url
-            and item.host_port
-            and rollback_verified
-        ),
+        "rollback_allowed": can_switch_to_release(item),
     })
     data["log_text"] = ""
     return data
@@ -7709,14 +7659,7 @@ def rollback_deployment(item_id: str, db: Session = Depends(get_db), user: User 
     target = db.get(Deployment, item_id)
     if not target:
         raise HTTPException(404, "发布版本不存在")
-    verified_markers = ("[完成] 部署成功", "[启用确认]", "[回滚完成]")
-    verification_text = target.log_text or ""
-    # Successful pipeline logs are append-only files while the database keeps
-    # only a compact live window.  Once a newer release stops the old one, its
-    # database window may be empty even though access verification succeeded.
-    # Read the authoritative retained log before deciding rollback eligibility.
-    verification_text += "\n" + read_deployment_log(target.id)
-    was_verified = any(marker in verification_text for marker in verified_markers)
+    was_verified = is_verified_release(target)
     if target.status != DeployStatus.stopped or not target.release or not target.access_url or not was_verified:
         raise HTTPException(409, "只有曾经成功上线并通过访问验证的历史版本可以回滚；失败或构建中途停止的版本不能回滚")
     project, node = db.get(Project, target.project_id), db.get(Node, target.node_id)
