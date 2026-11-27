@@ -2936,6 +2936,10 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
         }
         for name in mysql_names:
             services.pop(name, None)
+        spring_project = bool(
+            re.search(r"Spring\s*Boot|Java", json.dumps(project.source_analysis or {}, ensure_ascii=False), re.I)
+            or next(Path(compose_path).rglob("pom.xml"), None)
+        )
         for name, service in services.items():
             if not isinstance(service, dict):
                 continue
@@ -2951,6 +2955,10 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
                     value.split("=", 1)[0]: value.split("=", 1)[1]
                     for value in raw_env if isinstance(value, str) and "=" in value
                 }
+                service["environment"] = raw_env
+            backend_like = any(token in name.lower() for token in ("backend", "server", "api", "app"))
+            if raw_env is None and backend_like:
+                raw_env = {}
                 service["environment"] = raw_env
             if not isinstance(raw_env, dict):
                 continue
@@ -2970,10 +2978,18 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
                 "MYSQL_USER": "${YUNZHOU_MYSQL_USERNAME}",
                 "MYSQL_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
             }
-            backend_like = any(token in name.lower() for token in ("backend", "server", "api", "app"))
             for key, value in aliases.items():
                 if backend_like or key in raw_env:
                     raw_env[key] = value
+            if backend_like and spring_project:
+                raw_env.update({
+                    "SPRING_DATASOURCE_URL": jdbc,
+                    "SPRING_DATASOURCE_USERNAME": "${YUNZHOU_MYSQL_USERNAME}",
+                    "SPRING_DATASOURCE_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+                    "SPRING_DATASOURCE_DRUID_MASTER_URL": jdbc,
+                    "SPRING_DATASOURCE_DRUID_MASTER_USERNAME": "${YUNZHOU_MYSQL_USERNAME}",
+                    "SPRING_DATASOURCE_DRUID_MASTER_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+                })
         changes.append("外接 MySQL 最终裁决：移除内置数据库并重写应用连接参数")
     else:
         # MySQL 8 uses caching_sha2_password by default.  For platform-managed

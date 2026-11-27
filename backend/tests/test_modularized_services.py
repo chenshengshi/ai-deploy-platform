@@ -1,7 +1,10 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
+
+import yaml
 
 from app.backup import load_backup_config, save_backup_config
 from app.build_planning import (
@@ -9,11 +12,12 @@ from app.build_planning import (
     strip_generated_code_fence,
     valid_generated_dockerfile,
 )
-from app.config import settings
+from app.config import encrypt, settings
 from app.deployer import (
     _compose_service_mapping,
     _public_path_from_value as deployer_public_path_from_value,
     analyze_repository_topology,
+    reconcile_managed_integrations,
 )
 from app.deployment_architecture import (
     analyze_repository_topology as architecture_analyze_repository_topology,
@@ -36,6 +40,41 @@ class DeploymentSourceContractTests(unittest.TestCase):
 
         self.assertEqual(deployer._FRONTEND_API_ENV_KEYS, _FRONTEND_API_ENV_KEYS)
         self.assertIs(deployer._executable_jar_score, _executable_jar_score)
+
+    def test_external_database_is_injected_when_backend_has_no_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pom.xml").write_text("<project/>", encoding="utf-8")
+            compose = root / ".yunzhou.compose.yml"
+            compose.write_text(
+                "services:\n  backend:\n    image: app:latest\n  frontend:\n    image: nginx:alpine\n",
+                encoding="utf-8",
+            )
+            project = SimpleNamespace(
+                env_text_encrypted=encrypt(
+                    "YUNZHOU_MYSQL_MODE=external\n"
+                    "YUNZHOU_MYSQL_HOST=db.internal\n"
+                    "YUNZHOU_MYSQL_PORT=3306\n"
+                    "YUNZHOU_MYSQL_DATABASE=app\n"
+                    "YUNZHOU_MYSQL_USERNAME=user\n"
+                    "YUNZHOU_MYSQL_PASSWORD=secret\n"
+                ),
+                source_analysis={"summary": "Java Spring Boot"},
+                managed_env_text="",
+                id="project-id",
+                slug="project",
+            )
+
+            reconcile_managed_integrations(project, directory, compose.name)
+
+            rendered = yaml.safe_load(compose.read_text(encoding="utf-8"))
+            backend_env = rendered["services"]["backend"]["environment"]
+            self.assertEqual(backend_env["DB_HOST"], "${YUNZHOU_MYSQL_HOST}")
+            self.assertEqual(
+                backend_env["SPRING_DATASOURCE_DRUID_MASTER_URL"],
+                "jdbc:mysql://${YUNZHOU_MYSQL_HOST}:${YUNZHOU_MYSQL_PORT}/${YUNZHOU_MYSQL_DATABASE}",
+            )
+            self.assertNotIn("environment", rendered["services"]["frontend"])
 
 
 class BackupModuleTests(unittest.TestCase):
