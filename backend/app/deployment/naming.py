@@ -7,6 +7,12 @@ import re
 from ..models import Deployment, Project
 
 
+def project_directory(project: Project) -> str:
+    """Human-readable, safe remote directory; Docker names still use the slug."""
+    value = re.sub(r"[^\w.-]+", "-", (project.name or "").strip(), flags=re.UNICODE).strip("-.")
+    return (value or project.slug)[:80]
+
+
 def compose_project_name(project_slug: str, release: str | None = None, namespace: str = "yunzhou") -> str:
     safe_slug = re.sub(r"[^a-z0-9-]", "-", str(project_slug).lower()).strip("-") or "project"
     safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
