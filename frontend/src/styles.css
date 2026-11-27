@@ -1537,7 +1537,17 @@ tbody tr:last-child td {
   flex: 0 0 24px;
   color: #665ee8;
 }
-.chat-session-running svg { width: 14px; height: 14px; }
+.chat-session-running::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border: 2px solid #d9d6ff;
+  border-top-color: #6259e8;
+  border-right-color: #6259e8;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
 .chat-session-actions button,
 .chat-session-archive {
   border: 0;

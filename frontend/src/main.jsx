@@ -1587,7 +1587,12 @@ function Chat() {
                   <span>{item.project_name} · {item.message_count} 条</span>
                 </button>
                 {item.has_active_task
-                  && <span className="chat-session-running" title={item.active_task_label || "正在处理"}><LoaderCircle className="spin" /></span>}
+                  && <span
+                    className="chat-session-running"
+                    title={item.active_task_label || "正在处理"}
+                    aria-label={item.active_task_label || "正在处理"}
+                    role="status"
+                  />}
                 <div className="chat-session-actions">
                   {showArchived
                     ? <button title="恢复到最近" onClick={() => restoreSession(item.id)}><RefreshCw /></button>
