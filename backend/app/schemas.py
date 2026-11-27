@@ -1,7 +1,8 @@
 from datetime import datetime
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .models import AuthType, DeployStatus, Role, SourceType
 
@@ -27,9 +28,17 @@ class TokenOut(BaseModel):
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=64)
-    display_name: str = ""
+    display_name: str = Field(min_length=2, max_length=20)
     password: str = Field(min_length=8)
-    role: Role = Role.viewer
+    role: Role = Role.deployer
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff·]{2,20}", value):
+            raise ValueError("请输入 2 至 20 个汉字的真实姓名")
+        return value
 
 
 class UserUpdate(BaseModel):
@@ -38,6 +47,16 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=8)
     role: Role | None = None
     active: bool | None = None
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        value = value.strip()
+        if not re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff·]{2,20}", value):
+            raise ValueError("请输入 2 至 20 个汉字的真实姓名")
+        return value
 
 
 class UserProjectsUpdate(BaseModel):

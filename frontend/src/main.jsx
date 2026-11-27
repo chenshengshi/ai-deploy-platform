@@ -8362,7 +8362,7 @@ function UserModal({ user, onClose, onDone }) {
             username: "",
             display_name: "",
             password: "",
-            role: "viewer",
+            role: "deployer",
             active: true,
           },
     ),
@@ -8391,6 +8391,10 @@ function UserModal({ user, onClose, onDone }) {
   });
   const submit = async () => {
     if (editing && !hasChanges) return;
+    if (!/^[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF·]{2,20}$/.test(f.display_name.trim())) {
+      setErr("请输入 2 至 20 个汉字的真实姓名");
+      return;
+    }
     setBusy(true);
     setErr("");
     try {
@@ -8436,8 +8440,10 @@ function UserModal({ user, onClose, onDone }) {
             onChange={(e) => setF({ ...f, username: e.target.value })}
           />
         </Field>
-        <Field label="显示名称">
+        <Field label="姓名" hint="用于发布记录和日志审计，请填写真实中文姓名">
           <input
+            placeholder="请输入真实中文姓名，如：张三"
+            maxLength={20}
             value={f.display_name}
             onChange={(e) => setF({ ...f, display_name: e.target.value })}
           />
