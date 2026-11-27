@@ -7,9 +7,20 @@ from app.deployment_architecture import (
     analyze_runtime_dependencies,
     find_compose,
 )
+from app.deployment_topology_handlers import (
+    ComposeTopologyHandler,
+    DockerfileTopologyHandler,
+    handler_for,
+)
 
 
 class DeploymentArchitectureTests(unittest.TestCase):
+    def test_build_types_are_dispatched_to_isolated_handlers(self):
+        self.assertIsInstance(handler_for("compose"), ComposeTopologyHandler)
+        self.assertIsInstance(handler_for("dockerfile"), DockerfileTopologyHandler)
+        with self.assertRaisesRegex(ValueError, "不支持的构建类型"):
+            handler_for("unknown")
+
     def test_integrated_fullstack_dockerfile_is_one_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
