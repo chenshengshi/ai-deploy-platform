@@ -53,6 +53,7 @@ from .deployment_architecture import (
 from .models import AiConfig, DeployStatus, Deployment, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, Project, ProjectDomainConfig, ProjectReplica, SourceType
 from .proxy import get_proxy_config, proxy_with_auth
 from .source_inspection import (
+    _FRONTEND_API_ENV_KEYS,
     _select_runnable_jar,
     _public_path_from_value,
     detect_frontend_api_routes,

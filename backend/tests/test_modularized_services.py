@@ -22,10 +22,18 @@ from app.deployment_architecture import (
 )
 from app.main import app
 from app.source_inspection import (
+    _FRONTEND_API_ENV_KEYS,
     detect_frontend_api_routes,
     detect_frontend_public_base,
     detect_java_version,
 )
+
+
+class DeploymentSourceContractTests(unittest.TestCase):
+    def test_frontend_api_environment_keys_remain_available_to_deployer(self):
+        from app import deployer
+
+        self.assertEqual(deployer._FRONTEND_API_ENV_KEYS, _FRONTEND_API_ENV_KEYS)
 
 
 class BackupModuleTests(unittest.TestCase):
