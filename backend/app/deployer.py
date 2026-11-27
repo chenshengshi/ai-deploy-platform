@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from git import Repo
 import httpx
@@ -44,6 +44,7 @@ from .chat.diagnostics import diagnose_blank_frontend
 from .database import SessionLocal
 from .deployment_logs import append_deployment_log, read_deployment_log
 from .deployment.verification import frontend_code_warning, has_fatal_startup_error, http_status_accepted, required_route_accepted
+from .deployment.source_paths import discover_source_root, git_source_location
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -457,76 +458,6 @@ def log_stage(deployment_id: str, action: str, stage: str, detail: str = "") -> 
         f"[阶段{action}] {stage}{suffix}\n"
         f"[阶段时间] {stage} {action} {timestamp}\n",
     )
-
-
-def git_source_location(raw_url: str, configured_branch: str | None = None) -> tuple[str, str, str]:
-    """Turn a TFS/Azure DevOps browser URL into clone URL, branch and repo subdirectory."""
-    parts = urlsplit((raw_url or "").strip())
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    source_path = (query.get("path") or "").replace("\\", "/").strip("/")
-    if source_path and (source_path == ".." or source_path.startswith("../") or "/../" in f"/{source_path}/"):
-        raise RuntimeError("Git 项目子目录不安全")
-    version = (query.get("version") or "").strip()
-    url_branch = version[2:] if version.startswith("GB") and len(version) > 2 else ""
-    branch = url_branch or (configured_branch or "").strip()
-    # path/version/_a are browser navigation parameters and must not be sent to git clone.
-    clone_query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key not in {"path", "version", "_a"}]
-    clone_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clone_query), ""))
-    return clone_url, branch, source_path
-
-
-def discover_source_root(repo_root: Path, requested_path: str = "") -> tuple[Path, str]:
-    if requested_path:
-        selected = (repo_root / requested_path).resolve()
-        try:
-            selected.relative_to(repo_root.resolve())
-        except ValueError as exc:
-            raise RuntimeError("Git 项目子目录不安全") from exc
-        if not selected.is_dir():
-            raise RuntimeError(f"Git 仓库中不存在项目目录 /{requested_path}")
-        if not _has_project_marker(selected):
-            raise RuntimeError(f"目录 /{requested_path} 中未找到 package.json、pom.xml 或其他项目入口文件")
-        # Browser URLs often point at the folder currently open in TFS/Azure
-        # DevOps.  Do not mistake that navigation path for the whole product
-        # when the repository contains a matching frontend/backend topology.
-        frontend_roots, backend_roots = _fullstack_roots(repo_root)
-        if frontend_roots and backend_roots and (selected in frontend_roots or selected in backend_roots):
-            counterpart = backend_roots[0] if selected in frontend_roots else frontend_roots[0]
-            common = Path(os.path.commonpath([str(selected), str(counterpart)])).resolve()
-            relative = common.relative_to(repo_root.resolve()).as_posix()
-            return common, "" if relative == "." else relative
-        return selected, requested_path
-    if _has_project_marker(repo_root):
-        return repo_root, ""
-    ignored = {".git", "node_modules", "target", "dist", "build", "vendor", ".idea", ".vscode"}
-    candidates = []
-    for path in repo_root.rglob("*"):
-        if not path.is_dir() or any(part in ignored for part in path.relative_to(repo_root).parts):
-            continue
-        relative = path.relative_to(repo_root)
-        if len(relative.parts) <= 3 and _has_project_marker(path):
-            candidates.append(path)
-    # A single nested application can be selected safely. Multiple applications
-    # mean a repository topology: keep the full checkout so deployment files
-    # can reference sibling frontend/backend directories.
-    if len(candidates) == 1:
-        relative = candidates[0].relative_to(repo_root).as_posix()
-        return candidates[0], relative
-    # Tutorial repositories commonly keep an intentionally incomplete sample
-    # beside the runnable result (for example ``initial`` and ``complete``).
-    # Selecting the uniquely named completed application is deterministic and
-    # avoids treating teaching scaffolding as a multi-service topology.
-    completed = [
-        path for path in candidates
-        if path.name.lower() in {"complete", "completed", "final", "solution"}
-    ]
-    frontend_roots, backend_roots = _fullstack_roots(repo_root)
-    if len(completed) == 1 and not (frontend_roots and backend_roots):
-        relative = completed[0].relative_to(repo_root).as_posix()
-        return completed[0], relative
-    if len(candidates) > 1:
-        return repo_root, ""
-    return repo_root, ""
 
 
 def stage_source(project: Project, db, workspace_key: str | None = None) -> tuple[str, str, str | None, str]:
