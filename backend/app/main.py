@@ -43,7 +43,7 @@ from .chat.diagnostics import deployment_from_message_url, diagnose_blank_fronte
 from .chat.external_services import extract_external_mysql_config
 from .chat.intents import explicit_project_match, fallback_action_from_message, fuzzy_project_match, is_confirmation, normalize_message
 from .chat.responses import format_failure_diagnosis
-from .chat.session_state import session_task_state
+from .chat.sessions import chat_session_dict, chat_session_for_user
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
@@ -8367,31 +8367,6 @@ def test_system_proxy(body: ProxyConfigIn, db: Session = Depends(get_db), _: Use
         raise HTTPException(502, f"代理地址不可用：{exc}") from exc
 
 
-def _chat_session_for_user(db: Session, session_id: str, user: User) -> ChatSession:
-    session = db.get(ChatSession, session_id)
-    if not session or (user.role != Role.admin and session.owner_id != user.id):
-        raise HTTPException(404, "对话不存在或无权访问")
-    return session
-
-
-def _chat_session_dict(db: Session, session: ChatSession) -> dict:
-    project = db.get(Project, session.project_id) if session.project_id else None
-    message_count = db.scalar(select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session.id)) or 0
-    latest_message = db.scalar(select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at.desc()).limit(1))
-    has_active_task, active_task_label = session_task_state(db, session, latest_message.action if latest_message else None)
-    return {
-        "id": session.id, "title": session.title, "project_id": session.project_id,
-        "project_name": project.name if project else "全局助手", "node_id": session.node_id,
-        "ai_config_id": session.ai_config_id,
-        "visibility": session.visibility, "archived": session.archived,
-        "latest_action": latest_message.action if latest_message else None,
-        "has_active_task": has_active_task,
-        "active_task_label": active_task_label,
-        "message_count": message_count, "created_at": session.created_at,
-        "updated_at": session.updated_at,
-    }
-
-
 @app.post("/api/chat/workflow")
 def save_chat_workflow(body: dict, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     project_id = str(body.get("project_id") or "").strip()
@@ -8399,7 +8374,7 @@ def save_chat_workflow(body: dict, db: Session = Depends(get_db), user: User = D
     if not project or not _user_can_access_project(db, user, project.id):
         raise HTTPException(404, "项目不存在或无权访问")
     session_id = str(body.get("session_id") or "").strip()
-    session = _chat_session_for_user(db, session_id, user) if session_id else None
+    session = chat_session_for_user(db, session_id, user) if session_id else None
     if not session:
         session = ChatSession(
             owner_id=user.id,
@@ -8445,7 +8420,7 @@ def save_chat_workflow(body: dict, db: Session = Depends(get_db), user: User = D
         db.delete(duplicate)
     db.commit()
     return {
-        "session": _chat_session_dict(db, session),
+        "session": chat_session_dict(db, session),
         "message": {
             "id": message.id, "role": message.role, "content": message.content,
             "action": message.action, "deployment_id": message.deployment_id,
@@ -8461,15 +8436,15 @@ def chat_sessions(project_id: str | None = None, archived: bool = False, db: Ses
         query = query.where(ChatSession.owner_id == user.id)
     if project_id:
         query = query.where(ChatSession.project_id == project_id)
-    return [_chat_session_dict(db, item) for item in db.scalars(query.order_by(ChatSession.updated_at.desc()).limit(200)).all()]
+    return [chat_session_dict(db, item) for item in db.scalars(query.order_by(ChatSession.updated_at.desc()).limit(200)).all()]
 
 
 @app.get("/api/chat/sessions/{session_id}/messages")
 def chat_session_messages(session_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    session = _chat_session_for_user(db, session_id, user)
+    session = chat_session_for_user(db, session_id, user)
     messages = db.scalars(select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at)).all()
     return {
-        "session": _chat_session_dict(db, session),
+        "session": chat_session_dict(db, session),
         "messages": [
             {"id": item.id, "role": item.role, "content": item.content, "action": item.action,
              "deployment_id": item.deployment_id, "elapsed_ms": item.elapsed_ms, "created_at": item.created_at}
@@ -8480,7 +8455,7 @@ def chat_session_messages(session_id: str, db: Session = Depends(get_db), user: 
 
 @app.post("/api/chat/sessions/{session_id}/archive")
 def archive_chat_session(session_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    session = _chat_session_for_user(db, session_id, user)
+    session = chat_session_for_user(db, session_id, user)
     session.archived = True
     audit(db, user, "archive_chat_session", "chat_session", session.id, session.title)
     db.commit()
@@ -8489,7 +8464,7 @@ def archive_chat_session(session_id: str, db: Session = Depends(get_db), user: U
 
 @app.post("/api/chat/sessions/{session_id}/restore")
 def restore_chat_session(session_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    session = _chat_session_for_user(db, session_id, user)
+    session = chat_session_for_user(db, session_id, user)
     session.archived = False
     audit(db, user, "restore_chat_session", "chat_session", session.id, session.title)
     db.commit()
@@ -8498,7 +8473,7 @@ def restore_chat_session(session_id: str, db: Session = Depends(get_db), user: U
 
 @app.delete("/api/chat/sessions/{session_id}")
 def delete_chat_session(session_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    session = _chat_session_for_user(db, session_id, user)
+    session = chat_session_for_user(db, session_id, user)
     title = session.title
     db.delete(session)
     audit(db, user, "delete_chat_session", "chat_session", session_id, title)
@@ -8547,7 +8522,7 @@ def purge_chat_sessions(body: dict, db: Session = Depends(get_db), user: User = 
 @app.post("/api/chat", response_model=ChatOut)
 def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     chat_started = time.perf_counter()
-    session = _chat_session_for_user(db, body.session_id, user) if body.session_id else None
+    session = chat_session_for_user(db, body.session_id, user) if body.session_id else None
     requested_ai = db.get(AiConfig, body.ai_config_id) if body.ai_config_id else None
     if requested_ai and not requested_ai.enabled:
         requested_ai = None
