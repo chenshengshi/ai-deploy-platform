@@ -46,7 +46,7 @@ def deployment_repair_evidence(log_text: str | None, limit: int = 12) -> list[st
         if not line.startswith(REPAIR_EVIDENCE_PREFIXES):
             continue
         if any(fragment in line for fragment in (
-            "已创建后续修复任务", "正在对隔离发布副本", "正在根据真实错误生成修复方案",
+            "已创建后续修复任务", "正在对项目工作区", "正在根据真实错误生成修复方案",
         )):
             continue
         cleaned = sanitize_learning_text(line, 500)
@@ -452,7 +452,7 @@ def maybe_schedule_ai_retry(deployment_id: str) -> None:
             trigger=f"ai_autofix_{next_attempt}",
             host_port=failed.host_port,
             log_text=(f"[AI自动修复] 已分析任务 {failed.id[:8]} 的失败日志，"
-                      f"正在对隔离发布副本应用受控修复并重新部署（第 {next_attempt}/{MAX_AI_RETRIES} 次）。\n"
+                      f"正在对项目工作区应用受控修复并重新部署（第 {next_attempt}/{MAX_AI_RETRIES} 次）。\n"
                       f"[修复问题] {problem_summary}\n"),
         )
         db.add(retry)

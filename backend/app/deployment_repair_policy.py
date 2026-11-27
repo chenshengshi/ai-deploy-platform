@@ -66,7 +66,7 @@ RULES = (
         "frontend_public_base_mismatch",
         "cannot find native binding", "optional dependencies", "@rolldown/binding-",
         "lockfile needs to be updated", "requires node.js >=24", "nginx -t", "nginx: [emerg]",
-    ), True, "平台识别到可在隔离发布副本中处理的运行故障", "应用确定性兼容规则后进行一次受控重试"),
+    ), True, "平台识别到可在项目工作区中处理的运行故障", "记录修改并应用确定性兼容规则后进行一次受控重试"),
 )
 
 

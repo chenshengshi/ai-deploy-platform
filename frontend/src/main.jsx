@@ -9872,7 +9872,7 @@ function DeploymentSettingsPanel({ notify }) {
                 <input type="number" min="5" max="1024" value={form.builder_min_free_gb ?? 20}
                   onChange={(e) => setForm({ ...form, builder_min_free_gb: Number(e.target.value) })} />
               </Field>
-              <Field label="临时工作区保留（小时）" hint="发布完成后的隔离副本到期自动删除；源码缓存不受影响">
+              <Field label="构建临时目录保留（小时）" hint="发布完成后的临时构建目录到期自动删除；项目工作区和依赖缓存不受影响">
                 <input type="number" min="1" max="168" value={form.builder_workspace_ttl_hours ?? 6}
                   onChange={(e) => setForm({ ...form, builder_workspace_ttl_hours: Number(e.target.value) })} />
               </Field>

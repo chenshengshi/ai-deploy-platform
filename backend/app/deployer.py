@@ -47,6 +47,7 @@ from .deployment.verification import frontend_code_warning, has_fatal_startup_er
 from .deployment.source_paths import discover_source_root, git_source_location
 from .deployment.source_cache import source_cache_guard, source_cache_lock
 from .deployment.naming import compose_project_name, deployment_compose_project_name, service_container_name as _service_container_name
+from .deployment.workspace import WORKSPACE_BRANCH, persist_verified_changes
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -68,7 +69,6 @@ from .deployment_build_handlers import detect_build as _detect_build, detect_con
 from .deployment_build_profiles import compatible_node_image, detect_build_profiles
 from .deployment_build_generators import generate_profile_build, generate_static_build
 from .deployment_topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
-from .deployment_source_repairs import build_source_patch, persist_repair_bundle, snapshot_text_sources
 from .deployment_runtime_policy import data_compose_project, release_directories, validate_release
 from .deployment_runtime_ports import (
     compose_port_number as _compose_port_number,
@@ -560,10 +560,9 @@ def stage_source(project: Project, db, workspace_key: str | None = None) -> tupl
     key_path = locals().get("key_path")
     try:
         with source_cache_guard(project.id, workspace_root):
-            # Keep one shallow, immutable checkout as the Git object cache.
-            # Every analysis/deployment receives its own shared local clone,
-            # so git clean and package-manager cleanup can never race another
-            # task of the same project.
+            # Keep one shallow persistent project workspace. Verified AI
+            # repairs are committed to WORKSPACE_BRANCH; fresh remote changes
+            # are rebased underneath those commits before each build.
             checkout = workspace_root / "source-cache"
             shallow_marker = checkout / ".git" / "shallow"
             if checkout.exists() and not shallow_marker.exists():
@@ -573,20 +572,38 @@ def stage_source(project: Project, db, workspace_key: str | None = None) -> tupl
                 repo = Repo.clone_from(
                     url, str(checkout), branch=branch or None, depth=1, single_branch=True,
                 )
+                fetch_branch = branch or repo.active_branch.name
+                repo.git.config("yunzhou.remoteBranch", fetch_branch)
+                repo.git.checkout("-B", WORKSPACE_BRANCH)
                 repo.remote("origin").set_url(safe_url)
             else:
                 repo = Repo(str(checkout))
                 origin = repo.remote("origin")
                 origin.set_url(url)
                 try:
-                    fetch_branch = branch or repo.active_branch.name
+                    try:
+                        saved_branch = repo.git.config("--get", "yunzhou.remoteBranch").strip()
+                    except Exception:
+                        saved_branch = ""
+                    current_branch = repo.active_branch.name
+                    fetch_branch = branch or saved_branch or (current_branch if current_branch != WORKSPACE_BRANCH else "main")
+                    repo.git.config("yunzhou.remoteBranch", fetch_branch)
                     origin.fetch(
                         refspec=f"+refs/heads/{fetch_branch}:refs/remotes/origin/{fetch_branch}",
-                        depth=1,
+                        depth=50,
                         prune=True,
                     )
-                    repo.git.checkout("-B", fetch_branch, f"origin/{fetch_branch}")
-                    repo.git.reset("--hard", f"origin/{fetch_branch}")
+                    if WORKSPACE_BRANCH in {head.name for head in repo.heads}:
+                        repo.git.checkout(WORKSPACE_BRANCH)
+                        try:
+                            repo.git.rebase(f"origin/{fetch_branch}")
+                        except Exception as exc:
+                            repo.git.rebase("--abort")
+                            raise RuntimeError(
+                                "远端新代码与平台 AI 修复提交发生冲突；工作区已保持原状，等待 AI 合并冲突"
+                            ) from exc
+                    else:
+                        repo.git.checkout("-B", WORKSPACE_BRANCH, f"origin/{fetch_branch}")
                     repo.git.clean("-fdx")
                 finally:
                     origin.set_url(safe_url)
@@ -7964,8 +7981,7 @@ def execute(deployment_id: str) -> None:
     public_access = None
     preempted_shared_containers: list[str] = []
     verification_paths: list[str] = []
-    source_repair_baseline: dict[str, str] | None = None
-    persist_source_repair = False
+    workspace_repaired_files: list[str] = []
     with SessionLocal() as db:
         dep = db.get(Deployment, deployment_id)
         if not dep:
@@ -7993,7 +8009,6 @@ def execute(deployment_id: str) -> None:
             log(dep.id, "[准备] 正在获取项目源码...\n")
             ensure_active(dep.id)
             work, revision, cleanup_root, source_subpath = stage_source(project, db, dep.id)
-            source_repair_baseline = snapshot_text_sources(Path(work))
             ensure_active(dep.id)
             previous_error = (
                 dep.log_text or ""
@@ -8180,14 +8195,14 @@ def execute(deployment_id: str) -> None:
             # before the first remote pull/build instead of waiting to fail.
             preflight_sources = optimize_staged_sources(work)
             repaired_files = apply_safe_build_repairs(work, previous_error, project.deployment_mode)
-            persist_source_repair = bool(previous_error and repaired_files)
+            workspace_repaired_files = list(repaired_files)
             preflight_changes = list(dict.fromkeys(preflight_sources + repaired_files))
             if repaired_files:
-                repair_detail = "已修改发布副本中的 " + "、".join(repaired_files)
+                repair_detail = "已修改项目工作区中的 " + "、".join(repaired_files)
                 lowered_error = (previous_error or "").lower()
                 if "find" in lowered_error and "target" in lowered_error and "no such file or directory" in lowered_error:
                     repair_detail += "；将 Maven 根目录 target 查找改为递归查找各模块 target，并选择实际可执行 JAR"
-                log(dep.id, "[修复变更] " + repair_detail + "。用户源码仓库未被修改。\n")
+                log(dep.id, "[修复变更] " + repair_detail + "；验证成功后保留修改记录。\n")
             if repair_analysis:
                 repair_actions = []
                 if repair_plan_changed:
@@ -9086,6 +9101,15 @@ def execute(deployment_id: str) -> None:
             access = verify_access(db, dep.id, access, verification_paths)
             log_stage(dep.id, "完成", "verify")
             ensure_active(dep.id)
+            if workspace_repaired_files:
+                workspace_result = persist_verified_changes(
+                    project,
+                    work,
+                    source_subpath,
+                    workspace_repaired_files,
+                    dep.id,
+                )
+                log(dep.id, f"[工作区提交] {workspace_result}\n")
             dep = db.get(Deployment, deployment_id)
             replaced = db.scalars(
                 select(Deployment).where(
@@ -9254,35 +9278,7 @@ def execute(deployment_id: str) -> None:
             )[-200_000:]
             db.commit()
         finally:
-            if work and project and source_repair_baseline is not None and persist_source_repair:
-                try:
-                    final_dep = db.get(Deployment, deployment_id)
-                    patch = build_source_patch(source_repair_baseline, Path(work))
-                    verification_lines = [
-                        line for line in (final_dep.log_text or "").splitlines()
-                        if line.startswith(("[修复变更]", "[AI自动修复]", "[阶段完成]", "[阶段失败]", "[完成]", "[失败]"))
-                    ]
-                    bundle = persist_repair_bundle(
-                        Path(settings.build_data_root) / "builder" / "repairs",
-                        project_slug=project.slug,
-                        deployment_id=deployment_id,
-                        patch=patch,
-                        verified=final_dep.status == DeployStatus.success,
-                        report={
-                            "project_name": project.name,
-                            "release": final_dep.release,
-                            "trigger": final_dep.trigger,
-                            "summary": "隔离发布副本中的自动修复；未写回用户源码仓库",
-                        },
-                        verification_lines=verification_lines,
-                    )
-                    if bundle:
-                        log(final_dep.id, f"[修复候选] 已保存{('验证成功' if final_dep.status == DeployStatus.success else '最近失败')}补丁；原始源码未修改。\n")
-                except Exception as repair_bundle_exc:
-                    if dep:
-                        log(dep.id, f"[修复候选] 补丁归档失败但不影响发布结果：{repair_bundle_exc}\n")
-            # The fixed source checkout is intentionally retained and replaced
-            # on the next fetch. Only transfer artifacts are release-specific.
+            # Transfer artifacts are release-specific and can be removed.
             if 'release' in locals() and project:
                 try:
                     builder_node = platform_gateway_node(db)

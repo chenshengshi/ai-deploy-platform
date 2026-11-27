@@ -51,7 +51,6 @@ from .deployment_logs import deployment_log_path, read_deployment_log
 from .deployment_log_rendering import build_log_streams, compact_docker_pull_log, compact_stage_log
 from .deployment_lifecycle import can_switch_to_release, is_verified_release
 from .deployment_pipeline import PIPELINE_DEFINITIONS, parse_stage_times, stage_timing
-from .deployment_source_repairs import repair_bundle_summary
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, remove_project_managed_data_service, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .login_security import clear_login_failures, enforce_login_source_limit, login_source_ip as _login_source_ip, record_login_failure
@@ -132,30 +131,6 @@ def _user_can_access_project(db: Session, user: User, project_id: str) -> bool:
         Project.id == project_id,
         (Project.owner_id == user.id) | Project.id.in_(select(ProjectAccess.project_id).where(ProjectAccess.user_id == user.id)),
     )))
-
-
-@app.get("/api/projects/{item_id}/repair-candidates")
-def list_project_repair_candidates(item_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    project = db.get(Project, item_id)
-    if not project or not _user_can_access_project(db, user, project.id):
-        raise HTTPException(404, "项目不存在")
-    return repair_bundle_summary(Path(settings.build_data_root) / "builder" / "repairs", project.slug)
-
-
-@app.get("/api/projects/{item_id}/repair-candidates/{slot}/patch")
-def download_project_repair_patch(item_id: str, slot: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    project = db.get(Project, item_id)
-    if not project or not _user_can_access_project(db, user, project.id):
-        raise HTTPException(404, "项目不存在")
-    if slot not in {"verified", "latest-failed"}:
-        raise HTTPException(404, "修复候选不存在")
-    safe_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", project.slug).strip("-.") or "project"
-    patch = Path(settings.build_data_root) / "builder" / "repairs" / safe_slug / slot / "changes.patch"
-    if not patch.is_file():
-        raise HTTPException(404, "修复补丁不存在")
-    audit(db, user, "download_repair_patch", "project", project.id, f"slot={slot}")
-    db.commit()
-    return FileResponse(patch, media_type="text/x-diff", filename=f"{safe_slug}-{slot}.patch")
 
 
 def _user_can_access_deployment(db: Session, user: User, deployment_id: str) -> bool:
@@ -8650,7 +8625,7 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         audit(db, user, "ai_repair_and_deploy", "deployment", item.id, "frontend_public_base_mismatch")
         db.commit()
         return respond(
-            f"已在隔离发布副本中开始修复“{target.name}”的前端基础路径并重新发布；原 Git 仓库不会被修改。",
+            f"已开始修复“{target.name}”的项目工作区并重新发布；验证成功后会保留本次修改记录。",
             deployment_id=item.id, action="repair_deploy", project_id=target.id,
             node_id=target_node.id, intent=None,
         )
@@ -9092,7 +9067,7 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
                     f"关键依据：页面引用 {evidence['reference']}，请求返回 {evidence['content_type']}；"
                     f"去掉错误前缀后的资源 {working} 可以正常读取。\n"
                     f"根因：{frontend_issue['summary']}\n"
-                    "下一步：可以让我在隔离发布副本中修正前端基础路径并重新发布；原 Git 仓库不会被修改。",
+                    "下一步：可以让我直接修正项目工作区中的前端基础路径并重新发布；修改会记录并参与后续代码合并。",
                     deployment_id=measured.id, action="diagnose_frontend_path",
                     project_id=project_id, node_id=measured.node_id,
                     intent=f"repair_frontend_path:{measured.id}",
