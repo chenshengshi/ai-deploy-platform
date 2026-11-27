@@ -48,7 +48,14 @@ from .deployment.source_paths import discover_source_root, git_source_location
 from .deployment.source_cache import source_cache_guard, source_cache_lock
 from .deployment.naming import compose_project_name, deployment_compose_project_name, service_container_name as _service_container_name
 from .deployment.workspace import WORKSPACE_BRANCH, persist_verified_changes
-from .deployment.ports import stopped_port_message, stopped_reservation_status
+from .deployment.ports import (
+    choose_node_port as _choose_node_port,
+    choose_port,
+    reserve_reactivation_port,
+    stopped_port_message,
+    stopped_reservation_status,
+)
+from .deployment.runtime_environment import application_environment
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -3236,79 +3243,18 @@ def _run_temporary_privileged_preflight(db, rehearsal: Path, build_type: str, bu
             pass
 
 
-def choose_port(db, preferred: int | None, exclude_deployment_id: str | None = None) -> int:
-    # Port selection and the subsequent Deployment/ProjectReplica write must be
-    # serialized across worker and API processes.  Without this transaction
-    # lock a release and a simultaneous scale request can both observe the same
-    # free port and one of the Docker starts then fails with "port allocated".
-    db.execute(text("SELECT pg_advisory_xact_lock(hashtext('node-port-allocation'))"))
-    policy = db.get(DeploymentSettings, "default")
-    internal_start = policy.internal_port_start if policy else 30000
-    internal_end = policy.internal_port_end if policy else 39999
-    external_start = policy.external_port_start if policy else 20000
-    external_end = policy.external_port_end if policy else 21000
-    deployment_filter = [Deployment.status.in_([DeployStatus.queued, DeployStatus.running, DeployStatus.success])]
-    if exclude_deployment_id:
-        deployment_filter.append(Deployment.id != exclude_deployment_id)
-    used = set(db.scalars(select(Deployment.host_port).where(*deployment_filter)).all())
-    used.update(db.scalars(select(ProjectReplica.host_port).where(ProjectReplica.status == "running")).all())
-    used.update(db.scalars(select(DeploymentPortReservation.host_port).where(
-        DeploymentPortReservation.status.in_(["reserved", "active"]),
-        *([DeploymentPortReservation.deployment_id != exclude_deployment_id] if exclude_deployment_id else []),
-    )).all())
-    used.discard(None)
-    if preferred:
-        if external_start <= preferred <= external_end:
-            raise RuntimeError("项目指定的服务器端口占用了公网网关端口段，请改用内网实例端口段")
-        if preferred not in used:
-            return preferred
-    for port in range(internal_start, internal_end + 1):
-        if port not in used:
-            return port
-    raise RuntimeError("内网实例端口池已用完，请在系统设置中扩大端口范围")
-
-
 def choose_node_port(
     db, node: Node, preferred: int | None, reserved: set[int] | None = None,
     exclude_deployment_id: str | None = None,
 ) -> int:
-    """Choose a port that is free in both platform state and the real node.
-
-    Old containers can outlive a deleted deployment record.  Looking only at
-    the database can therefore select a port which Docker still owns.  Reserve
-    the first database candidate, verify it on the target node, and advance
-    within the configured internal pool when necessary.
-    """
-    policy = db.get(DeploymentSettings, "default")
-    internal_end = policy.internal_port_end if policy else 39999
-    candidate = choose_port(db, preferred, exclude_deployment_id)
-    deployment_filters = [
-        Deployment.status.in_([DeployStatus.queued, DeployStatus.running, DeployStatus.success])
-    ]
-    if exclude_deployment_id:
-        deployment_filters.append(Deployment.id != exclude_deployment_id)
-    used = set(db.scalars(select(Deployment.host_port).where(*deployment_filters)).all())
-    used.update(db.scalars(select(ProjectReplica.host_port).where(
-        ProjectReplica.status == "running"
-    )).all())
-    used.update(db.scalars(select(DeploymentPortReservation.host_port).where(
-        DeploymentPortReservation.status.in_(["reserved", "active"]),
-        *([DeploymentPortReservation.deployment_id != exclude_deployment_id] if exclude_deployment_id else []),
-    )).all())
-    locally_reserved = {int(port) for port in (reserved or set()) if port}
-    used.update(locally_reserved)
-    with SSHNode(node) as ssh:
-        while candidate <= internal_end:
-            code, _ = ssh.run(
-                "(ss -ltnH 2>/dev/null | awk '{print $4}' | "
-                f"grep -Eq ':{candidate}$') || "
-                "(docker ps --format '{{.Ports}}' 2>/dev/null | "
-                f"grep -Eq '(^|[^0-9]){candidate}->')"
-            )
-            if code != 0 and candidate not in locally_reserved and candidate not in used:
-                return candidate
-            candidate += 1
-    raise RuntimeError("目标服务器内网实例端口池已被占满")
+    return _choose_node_port(
+        db,
+        node,
+        preferred,
+        ssh_factory=SSHNode,
+        reserved=reserved,
+        exclude_deployment_id=exclude_deployment_id,
+    )
 
 
 def platform_gateway_node(db) -> Node | None:
@@ -4085,28 +4031,6 @@ def node_platform(node: Node) -> str:
     return "linux/arm64" if machine in {"aarch64", "arm64"} else "linux/amd64"
 
 
-def _reserve_reactivation_port(db, deployment: Deployment, node: Node, service: str, port: int) -> None:
-    reservation = db.scalar(select(DeploymentPortReservation).where(
-        DeploymentPortReservation.node_id == node.id,
-        DeploymentPortReservation.host_port == port,
-    ))
-    if reservation:
-        if reservation.status in {"reserved", "active"} and reservation.deployment_id != deployment.id:
-            raise RuntimeError(f"端口 {port} 已被其他发布任务占用")
-        reservation.deployment_id = deployment.id
-        reservation.service_name = service
-        reservation.status = "reserved"
-        reservation.created_at = datetime.now(timezone.utc)
-    else:
-        db.add(DeploymentPortReservation(
-            deployment_id=deployment.id,
-            node_id=node.id,
-            service_name=service,
-            host_port=port,
-            status="reserved",
-        ))
-
-
 def prepare_stopped_release_ports(
     deployment: Deployment, project: Project, node: Node, actual_dir: str, db,
 ) -> str:
@@ -4129,7 +4053,7 @@ def prepare_stopped_release_ports(
                 reserved=reserved, exclude_deployment_id=deployment.id,
             )
             reserved.add(allocated)
-            _reserve_reactivation_port(db, deployment, node, "app", allocated)
+            reserve_reactivation_port(db, deployment, node, "app", allocated)
             if allocated != old_entry_port:
                 changes.append(("app", old_entry_port, allocated))
             deployment.host_port = allocated
@@ -4185,7 +4109,7 @@ def prepare_stopped_release_ports(
                                 reserved=reserved, exclude_deployment_id=deployment.id,
                             )
                             reserved.add(allocated)
-                            _reserve_reactivation_port(db, deployment, node, str(service_name), allocated)
+                            reserve_reactivation_port(db, deployment, node, str(service_name), allocated)
                             updated.append(_replace_compose_published_port(mapping, allocated))
                             if allocated != old_port:
                                 changes.append((str(service_name), old_port, allocated))
@@ -4478,6 +4402,7 @@ def prepare_compose_image_override(
             ))
         db.commit()
 
+    user_runtime_values = environment_values(decrypt(project.env_text_encrypted) or "")
     for service_name, service in (document.get("services") or {}).items():
         if not isinstance(service, dict):
             continue
@@ -4500,6 +4425,12 @@ def prepare_compose_image_override(
         # zone file also fixes minimal images (for example nginx/alpine) that
         # do not ship the IANA tzdata database.
         managed_environment = {"TZ": "Asia/Shanghai"}
+        managed_environment.update(application_environment(
+            user_runtime_values,
+            service_name=str(service_name),
+            service=service,
+            routed_services=routed_services,
+        ))
         if django_ssl_redirect_default and (service_name in routed_services or service.get("build")):
             # The application must not redirect an HTTP-only platform route to
             # an unconfigured port 443. Once HTTPS is enabled for the project,

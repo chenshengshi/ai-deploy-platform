@@ -48,15 +48,17 @@ from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .project_data.sql_safety import data_change_confirmation_token, extract_direct_sql, high_risk_matches, is_high_risk_sql, sql_kind
 from .deployment_logs import deployment_log_path, read_deployment_log
-from .deployment_log_rendering import build_log_streams, compact_docker_pull_log, compact_stage_log
+from .deployment_log_rendering import compact_docker_pull_log
 from .deployment_lifecycle import can_switch_to_release, is_verified_release
-from .deployment_pipeline import PIPELINE_DEFINITIONS, parse_stage_times, stage_timing
+from .deployment_pipeline_view import render_pipeline_steps
 from .deployer import _complete_source_compose, cleanup_registry_versions, choose_port, compose_project_name, configure_platform_gateway, delete_deployment_resources, deployment_compose_project_name, detect_frontend_api_routes, effective_project_environment, environment_values, external_integration_preflight, git_source_location, platform_gateway_node, preflight_ai_deployment_plan, project_directory, reconcile_runtime_frontend_routes, remove_project_managed_data_service, stage_source, start_deployment, stop_deployment, stop_project_data_services, verify_access
 from .experience import contains_corruption, portable_experience, prepare_new_experience
 from .login_security import clear_login_failures, enforce_login_source_limit, login_source_ip as _login_source_ip, record_login_failure
 from .models import AiConfig, AuditLog, CertificateStore, ChatMessage, ChatSession, DeployStatus, Deployment, DeploymentExperience, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, PasswordHistory, Project, ProjectAccess, ProjectDomainConfig, ProjectReplica, Role, SecurityConfig, SourceType, SystemProxy, User
 from .proxy import get_proxy_config, proxy_for, proxy_with_auth, redact_proxy
 from .runtime_cache import invalidate_runtime_cache, read_runtime_cache as _runtime_cache_read, runtime_cache_key as _runtime_cache_key, runtime_cache_lock, write_runtime_cache as _runtime_cache_write
+from .runtime_scaling import _next_service_instance_name, _replicas_for_scale_down, _service_instance_prefix, _service_instance_sequence
+from .runtime_topology import _NON_SCALABLE_SERVICES, _route_groups_for_services, _runtime_entry_is_data, _runtime_entry_is_running, _service_role, _traffic_plan
 from .schemas import (
     AiConfigIn,
     AiConfigOut,
@@ -4220,195 +4222,7 @@ def deploy(item_id: str, body: DeployIn, db: Session = Depends(get_db), user: Us
 
 
 def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None = None, is_compose: bool = False) -> list[dict]:
-    # Keep the user-facing pipeline compact. Detailed AI/preflight activity is
-    # retained in the log for the active major stage.
-    definitions = PIPELINE_DEFINITIONS
-    skipped_stages = set()
-    if re.search(r"(?m)^\[平台构建\].*(?:没有\s+build|固定镜像).*已跳过", log_text):
-        skipped_stages.add("build")
-    stage_times = parse_stage_times(log_text)
-
-    def timing_for(key: str) -> dict:
-        return stage_timing(stage_times, key, status == DeployStatus.running)
-    # New deployments emit explicit stage boundaries. Prefer them over
-    # guessing from ordinary human-readable log messages.
-    if "[阶段开始]" in log_text:
-        starts = {}
-        for match in re.finditer(r"(?m)^\[阶段开始\]\s+(analyze|prepare|build|start|verify)\s*$", log_text):
-            starts[match.group(1)] = match.start()
-        completed = {match.group(1) for match in re.finditer(
-            r"(?m)^\[阶段完成\]\s+(analyze|prepare|build|start|verify)\s*$", log_text
-        )}
-        failed = {match.group(1) for match in re.finditer(
-            r"(?m)^\[阶段失败\]\s+(analyze|prepare|build|start|verify)(?:\s+\|.*)?$", log_text
-        )}
-        stopped = {match.group(1) for match in re.finditer(
-            r"(?m)^\[阶段停止\]\s+(analyze|prepare|build|start|verify)\s*$", log_text
-        )}
-        active_key = max(starts, key=starts.get) if starts else "analyze"
-        stage_order = {key: index for index, (key, _title, _tags) in enumerate(definitions)}
-        active_index = stage_order.get(active_key, 0)
-        failure_key = next((key for key, _title, _tags in definitions if key in failed), None)
-        default_key = failure_key or active_key
-        valid_keys = {item[0] for item in definitions}
-        # Keep the stage the user clicked even when an older/retried worker
-        # emitted explicit boundaries for only the tail of the deployment.
-        # The per-stage legacy markers below can still provide that log.  The
-        # previous `selected_key in starts` guard silently switched the API to
-        # the latest stage while the UI continued to display the clicked card,
-        # producing an empty panel with "等待该步骤开始...".
-        log_key = selected_key if selected_key in valid_keys else default_key
-        ordered_starts = sorted((position, key) for key, position in starts.items())
-        # Some releases were completed by a worker that only emitted explicit
-        # boundaries for part of the pipeline.  The detailed, human-readable
-        # markers are still present (for example [启动] and [检查]).  Use those
-        # markers as a per-stage fallback so a successful card never opens an
-        # empty log panel merely because one boundary marker is missing.
-        legacy_positions = {}
-        for legacy_key, _legacy_title, legacy_tags in definitions:
-            legacy_positions[legacy_key] = max(
-                (log_text.rfind(f"[{tag}]") for tag in legacy_tags),
-                default=-1,
-            )
-        result = []
-        for key, title, _tags in definitions:
-            stream_rows = []
-            start = starts.get(key)
-            if start is None:
-                # A successful deployment is authoritative even when an
-                # older worker did not emit the final explicit stage marker.
-                # Leaving the last card at "waiting" after progress reached
-                # 100% makes a healthy release look unfinished.
-                # Retried/resumed workers may only emit explicit boundaries
-                # for the tail of a deployment.  Once a later stage has
-                # started, every earlier stage is necessarily complete even
-                # if its boundary was written by an older worker version.
-                stage_status = (
-                    "success"
-                    if status == DeployStatus.success or stage_order[key] < active_index
-                    else "waiting"
-                )
-                legacy_start = legacy_positions.get(key, -1)
-                later_legacy = [
-                    position for candidate, position in legacy_positions.items()
-                    if candidate != key and position > legacy_start
-                ] if legacy_start >= 0 else []
-                legacy_end = min(later_legacy) if later_legacy else len(log_text)
-                section = log_text[legacy_start:legacy_end].strip() if key == log_key and legacy_start >= 0 else ""
-                if key == log_key and not section and status == DeployStatus.success:
-                    section = log_text.strip()
-            else:
-                end = next((position for position, _next_key in ordered_starts if position > start), len(log_text))
-                section = log_text[start:end].strip() if key == log_key else ""
-                if key in failed:
-                    stage_status = "failed"
-                elif key in stopped:
-                    stage_status = "stopped"
-                elif key in completed or status == DeployStatus.success:
-                    stage_status = "success"
-                elif key == active_key and status == DeployStatus.running:
-                    stage_status = "running"
-                elif key == active_key and status == DeployStatus.failed:
-                    stage_status = "failed"
-                elif key == active_key and status == DeployStatus.stopped:
-                    stage_status = "stopped"
-                else:
-                    stage_status = "waiting"
-            if section:
-                if key == "build":
-                    stream_rows = build_log_streams(section)
-                section = re.sub(r"(?m)^\[AI跟进\].*$", "", section).rstrip()
-                section = compact_stage_log(section)[-30_000:]
-            result.append({"key": key, "title": title, "status": stage_status, "skipped": key in skipped_stages, "log": section, "build_streams": stream_rows, **timing_for(key)})
-        return result
-    positions = []
-    for key, title, tags in definitions:
-        # A worker restart can retry the same task. Use the latest attempt's marker.
-        pos = max((log_text.rfind(f"[{tag}]") for tag in tags), default=-1)
-        positions.append(pos)
-    available = [index for index, pos in enumerate(positions) if pos >= 0]
-    # The active stage is the marker written latest in the log, not merely the
-    # first/last definition containing any historical marker.
-    active_index = max(available, key=lambda index: positions[index]) if available else None
-    inferred_index = None
-    if not available and status in (DeployStatus.running, DeployStatus.stopped):
-        lower = log_text.lower()
-        if any(word in lower for word in ("load build definition", "building", "docker:default", "transferring context")):
-            inferred_index = 2
-        elif any(word in lower for word in ("pulling", "pull complete", "downloading")):
-            inferred_index = 1
-    default_key = definitions[active_index][0] if active_index is not None else definitions[0][0]
-    if inferred_index is not None:
-        default_key = definitions[inferred_index][0]
-    # A failure may happen before the first normal stage marker (for example
-    # while preparing an isolated checkout). Keep the failure visible instead
-    # of rendering every step as waiting with an empty log panel.
-    if status == DeployStatus.failed and active_index is None:
-        active_index = inferred_index if inferred_index is not None else 0
-        default_key = definitions[active_index][0]
-    selected_index = next((i for i, item in enumerate(definitions) if item[0] == selected_key), None)
-    if status == DeployStatus.failed and (selected_index is None or positions[selected_index] < 0):
-        log_key = default_key
-    else:
-        log_key = selected_key if selected_key in {x[0] for x in definitions} else default_key
-    result = []
-    for index, (key, title, _tags) in enumerate(definitions):
-        stream_rows = []
-        start = positions[index]
-        later = [x for x in positions[index + 1:] if x >= 0]
-        end = min(later) if later else len(log_text)
-        section = log_text[start:end].strip() if start >= 0 and key == log_key else ""
-        if status == DeployStatus.failed and index == active_index and key == log_key and not section:
-            section = log_text.strip()
-        # AI follow-up records are metadata, not build output. Keep raw stage
-        # logs clean even for records created by older platform versions.
-        if key == "build" and section:
-            stream_rows = build_log_streams(section)
-        section = re.sub(r"(?m)^\[AI跟进\].*$", "", section).rstrip()
-        section = compact_stage_log(section)[-30_000:]
-        # Long dependency output can push the useful cache result outside the
-        # active 30k window, especially while a build waits for the serialized
-        # image-store lock. Keep a compact, evidence-based summary visible so
-        # the UI never looks as if earlier logs or cache results disappeared.
-        if key == "build" and key == log_key:
-            cache_lines = re.findall(r"(?m)^\[缓存命中\].*$", log_text)
-            if cache_lines:
-                cache_summary = "[本次缓存摘要]\n" + "\n".join(cache_lines[-6:])
-                if not all(line in section for line in cache_lines[-6:]):
-                    section = cache_summary + "\n\n" + section
-        if status == DeployStatus.success:
-            stage_status = "success"
-            if key == log_key and start < 0:
-                section = compact_stage_log(log_text)[-30_000:]
-        elif inferred_index is not None and not available:
-            stage_status = "success" if index < inferred_index else (("stopped" if status == DeployStatus.stopped else "running") if index == inferred_index else "waiting")
-            if index == inferred_index and key == log_key:
-                section = compact_stage_log(log_text)[-30_000:]
-        elif status == DeployStatus.failed and index == active_index:
-            # Legacy workers and failures during task initialization may not
-            # have emitted a normal stage marker.  The deployment status is
-            # still authoritative: show the first/last inferred stage as
-            # failed instead of rendering all five stages as "waiting".
-            stage_status = "failed"
-            if key == log_key and not section:
-                section = compact_stage_log(log_text)[-30_000:]
-        elif start < 0:
-            stage_status = "waiting"
-        elif active_index is not None and index < active_index:
-            stage_status = "success"
-        elif active_index is not None and index > active_index:
-            stage_status = "waiting"
-        elif status == DeployStatus.failed:
-            stage_status = "failed"
-        elif status == DeployStatus.stopped:
-            stage_status = "stopped"
-        elif status == DeployStatus.success:
-            stage_status = "success"
-        else:
-            stage_status = "running"
-        result.append({"key": key, "title": title, "status": stage_status, "skipped": key in skipped_stages, "log": section, "build_streams": stream_rows, **timing_for(key)})
-    return result
-
+    return render_pipeline_steps(log_text, status, selected_key, is_compose)
 
 def deployment_view(
     item: Deployment, db: Session, include_log: bool = True, stage: str | None = None,
@@ -5357,60 +5171,6 @@ def project_runtime(item_id: str, refresh: bool = False, db: Session = Depends(g
     return {"project_id": project.id, "project_name": project.name, "environments": environments}
 
 
-def _service_instance_prefix(
-    project_slug: str, service_name: str, release: str | None = None, namespace: str = "yunzhou",
-) -> str:
-    safe_service = re.sub(r"[^a-z0-9-]", "-", str(service_name).lower()).strip("-") or "app"
-    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(namespace).lower()).strip("-") or "yunzhou"
-    safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
-    version = f"-{safe_release}" if safe_release else ""
-    return f"{safe_namespace}-{project_slug}{version}-{safe_service}"
-
-
-def _service_instance_sequence(
-    name: str, project_slug: str, service_name: str, release: str | None = None, namespace: str = "yunzhou",
-) -> int | None:
-    matched = re.fullmatch(re.escape(_service_instance_prefix(project_slug, service_name, release, namespace)) + r"-([1-9][0-9]*)", name or "")
-    return int(matched.group(1)) if matched else None
-
-
-def _next_service_instance_name(
-    project_slug: str,
-    service_name: str,
-    existing_names: set[str],
-    minimum: int = 2,
-    release: str | None = None,
-    namespace: str = "yunzhou",
-) -> str:
-    """Reserve the smallest free sequence; sequence 1 belongs to the primary."""
-    prefix = _service_instance_prefix(project_slug, service_name, release, namespace)
-    sequence = max(1, int(minimum))
-    while f"{prefix}-{sequence}" in existing_names:
-        sequence += 1
-    name = f"{prefix}-{sequence}"
-    existing_names.add(name)
-    return name
-
-
-def _replicas_for_scale_down(
-    replicas: list[ProjectReplica],
-    project_slug: str,
-    service_name: str,
-    release: str | None = None,
-    namespace: str = "yunzhou",
-) -> list[ProjectReplica]:
-    """Remove legacy random names first, then the highest numeric sequence."""
-    numbered: list[tuple[int, ProjectReplica]] = []
-    legacy: list[ProjectReplica] = []
-    for replica in replicas:
-        sequence = _service_instance_sequence(replica.container_name, project_slug, service_name, release, namespace)
-        if sequence is None:
-            legacy.append(replica)
-        else:
-            numbered.append((sequence, replica))
-    return list(reversed(legacy)) + [replica for _, replica in sorted(numbered, key=lambda item: item[0], reverse=True)]
-
-
 @app.post("/api/projects/{item_id}/scale")
 def scale_project(item_id: str, body: ScaleProjectIn, db: Session = Depends(get_db), user: User = Depends(require(Role.admin, Role.deployer))):
     project = db.get(Project, item_id)
@@ -5674,115 +5434,6 @@ def scale_project(item_id: str, body: ScaleProjectIn, db: Session = Depends(get_
     return {"ok": True, "desired": body.replicas, "ready": body.replicas, "access_url": deployment.access_url,
             "instances": [{"name": base_name, "port": deployment.host_port, "status": "running"}] +
                          [{"name": x.container_name, "port": x.host_port, "status": x.status} for x in active]}
-
-
-_NON_SCALABLE_SERVICES = re.compile(
-    r"(?:^|[-_.])(mysql|mariadb|postgres|postgresql|redis|mongo|mongodb|oracle|"
-    r"minio|elastic|elasticsearch|kafka|rabbitmq|zookeeper|worker|scheduler|"
-    r"cron|job|sync)(?:$|[-_.])", re.I,
-)
-
-
-def _runtime_entry_is_data(container: dict) -> bool:
-    identity = " ".join(str(container.get(key) or "") for key in ("service", "name", "image")).lower()
-    return bool(_NON_SCALABLE_SERVICES.search(identity))
-
-
-def _runtime_entry_is_running(container: dict) -> bool:
-    state = f"{container.get('state') or ''} {container.get('status') or ''}".lower()
-    return "running" in state or state.startswith("up") or " up " in state or "healthy" in state
-
-
-def _traffic_plan(project: Project) -> dict:
-    try:
-        analysis = json.loads(project.integration_analysis_json or "{}")
-    except (TypeError, ValueError):
-        analysis = {}
-    plan = analysis.get("traffic_plan") if isinstance(analysis, dict) else None
-    if isinstance(plan, dict):
-        return plan
-    deployment_plan = analysis.get("deployment_plan") if isinstance(analysis, dict) else None
-    if isinstance(deployment_plan, dict):
-        nested = deployment_plan.get("traffic_plan")
-        return nested if isinstance(nested, dict) else deployment_plan
-    return analysis if isinstance(analysis, dict) else {}
-
-
-def _service_role(project: Project, service: str) -> tuple[str, bool]:
-    plan = _traffic_plan(project)
-    roles = plan.get("service_roles") or []
-    for row in roles:
-        if isinstance(row, dict) and str(row.get("service") or "") == service:
-            role = str(row.get("role") or "app").lower()
-            # Application services are always eligible for horizontal scaling.
-            # Older AI analyses occasionally persisted scalable=false for a
-            # backend, which made the UI mislabel a healthy API as a fixed
-            # dependency. Only data/background roles are true singletons.
-            if role in {"frontend", "backend", "app", "web", "api"}:
-                return role, True
-            return role, bool(row.get("scalable", False))
-    lowered = service.lower()
-    if _NON_SCALABLE_SERVICES.search(lowered):
-        return ("worker" if re.search(r"worker|scheduler|cron|job|sync", lowered) else "data"), False
-    if re.search(r"front|web|ui", lowered):
-        return "frontend", True
-    if re.search(r"back|api|server", lowered):
-        return "backend", True
-    return "app", True
-
-
-def _route_groups_for_services(project: Project, service_targets: dict[str, list[tuple[str, int]]]) -> list[dict]:
-    """Translate the versioned AI traffic plan into auditable Nginx routes."""
-    plan = _traffic_plan(project)
-    routes = plan.get("traffic_routes") or plan.get("routes") or []
-    default_service = str(plan.get("default_service") or plan.get("entry_service") or "")
-    if not default_service:
-        default_service = next((name for name in service_targets if _service_role(project, name)[0] == "frontend"), "")
-    if not default_service and service_targets:
-        default_service = next(iter(service_targets))
-    paths_by_service: dict[str, list[dict]] = {}
-    for route in routes:
-        if not isinstance(route, dict):
-            continue
-        service = str(route.get("service") or route.get("target_service") or "")
-        path = str(route.get("path") or "/")
-        if service in service_targets and path.startswith("/"):
-            paths_by_service.setdefault(service, []).append({
-                "path": path,
-                "strip_prefix": bool(route.get("strip_prefix", False)),
-            })
-    if default_service in service_targets and default_service not in paths_by_service:
-        paths_by_service.setdefault(default_service, []).append({"path": "/", "strip_prefix": False})
-    # Compatibility fallback for analyses created before traffic_routes was
-    # introduced.  Reuse only paths recorded by source analysis.  A missing
-    # path is safer than inventing /api and silently routing a project whose
-    # actual production prefix is /prod-api, /gateway, or something custom.
-    if not routes:
-        backend = next((name for name in service_targets if _service_role(project, name)[0] == "backend"), "")
-        frontend = next((name for name in service_targets if _service_role(project, name)[0] == "frontend"), "")
-        if frontend:
-            paths_by_service.setdefault(frontend, []).append({"path": "/", "strip_prefix": False})
-        api_paths = plan.get("api_paths") or []
-        for path in api_paths:
-            if backend and str(path).startswith("/"):
-                canonical_path = str(path)
-                if canonical_path != "/" and not canonical_path.endswith("/"):
-                    canonical_path += "/"
-                paths_by_service.setdefault(backend, []).append({
-                    "path": canonical_path,
-                    "strip_prefix": bool(plan.get("strip_api_prefix", True)),
-                })
-    groups = []
-    for service, paths in paths_by_service.items():
-        unique_paths = list({(row["path"], row["strip_prefix"]): row for row in paths}.values())
-        if service_targets.get(service) and unique_paths:
-            groups.append({
-                "name": service,
-                "paths": unique_paths,
-                "targets": service_targets[service],
-                "strategy": project.load_balance_strategy,
-            })
-    return groups
 
 
 @app.post("/api/projects/{item_id}/services/{service_name}/scale")
