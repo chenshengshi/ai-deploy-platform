@@ -59,7 +59,7 @@ class DeploymentSourceContractTests(unittest.TestCase):
                     "YUNZHOU_MYSQL_USERNAME=user\n"
                     "YUNZHOU_MYSQL_PASSWORD=secret\n"
                 ),
-                source_analysis={"summary": "Java Spring Boot"},
+                source_analysis={"summary": "Java Spring Boot application requires Redis"},
                 managed_env_text="",
                 id="project-id",
                 slug="project",
@@ -74,6 +74,8 @@ class DeploymentSourceContractTests(unittest.TestCase):
                 backend_env["SPRING_DATASOURCE_DRUID_MASTER_URL"],
                 "jdbc:mysql://${YUNZHOU_MYSQL_HOST}:${YUNZHOU_MYSQL_PORT}/${YUNZHOU_MYSQL_DATABASE}",
             )
+            self.assertEqual(backend_env["SPRING_REDIS_HOST"], "${YUNZHOU_REDIS_HOST}")
+            self.assertIn("redis", rendered["services"])
             self.assertNotIn("environment", rendered["services"]["frontend"])
 
 

@@ -3053,7 +3053,12 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
         str(service.get("image") or "").lower().startswith("redis:") or name.lower() in {"redis", "cache"}
     )), None)
     analysis_text = json.dumps(project.source_analysis or {}, ensure_ascii=False)
-    redis_required = bool(consumers("YUNZHOU_REDIS_") or existing_redis_name or re.search(r'"(?:service|services)"[^\n]{0,500}Redis', analysis_text, re.I))
+    redis_required = bool(
+        consumers("YUNZHOU_REDIS_")
+        or existing_redis_name
+        or re.search(r'"(?:service|services)"[^\n]{0,500}Redis', analysis_text, re.I)
+        or re.search(r"\b(?:requires?|uses?|needs?)\s+Redis\b", analysis_text, re.I)
+    )
     if redis_required and user_values.get("YUNZHOU_REDIS_MODE", "managed").lower() != "external":
         password = hashlib.sha256(f"{settings.app_secret}:{project.id}:redis".encode()).hexdigest()[:32]
         redis_name = existing_redis_name
@@ -3138,6 +3143,10 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
         for name, service in services.items():
             if name == redis_name or not isinstance(service, dict):
                 continue
+            service_uses_redis = "redis" in yaml.safe_dump(service, allow_unicode=True).lower()
+            backend_like = any(token in name.lower() for token in ("backend", "server", "api", "app"))
+            if not (service_uses_redis or backend_like):
+                continue
             raw_env = service.setdefault("environment", {})
             if isinstance(raw_env, list):
                 raw_env = {
@@ -3145,8 +3154,7 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
                     for value in raw_env if isinstance(value, str) and "=" in value
                 }
                 service["environment"] = raw_env
-            service_uses_redis = "redis" in yaml.safe_dump(service, allow_unicode=True).lower()
-            if isinstance(raw_env, dict) and service_uses_redis:
+            if isinstance(raw_env, dict):
                 # Generated/source plans use several Spring generations and
                 # aliases (SPRING_REDIS_*, SPRING_DATA_REDIS_*, CRM_*). Bind
                 # every Redis connection credential to the one stable
