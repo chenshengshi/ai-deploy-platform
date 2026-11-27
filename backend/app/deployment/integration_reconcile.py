@@ -25,6 +25,114 @@ from ..models import Project
 PLATFORM_MYSQL_IMAGE = "mysql:8.4"
 PLATFORM_REDIS_IMAGE = "redis:7.4-alpine"
 
+def adapt_plan_to_current_integrations(plan: dict, project: Project) -> tuple[dict, list[str]]:
+    """Apply the form's current integration choices to a saved AI plan.
+
+    Source analysis is reusable, while external credentials and managed versus
+    external choices can change immediately before deployment.  The current
+    submitted configuration is authoritative and must not be shadowed by an
+    older managed-service Compose plan.
+    """
+    adapted = json.loads(json.dumps(plan))
+    values = environment_values(decrypt(project.env_text_encrypted) or "")
+    changes: list[str] = []
+    if project.deployment_mode != "preserve_integrations":
+        return adapted, changes
+    if values.get("YUNZHOU_MYSQL_MODE", "managed").lower() != "external":
+        return adapted, changes
+    compose_text = str(adapted.get("compose_yaml") or "")
+    try:
+        compose = yaml.safe_load(compose_text)
+    except yaml.YAMLError:
+        return adapted, changes
+    services = compose.get("services") if isinstance(compose, dict) else None
+    if not isinstance(services, dict):
+        return adapted, changes
+    mysql_services = {
+        name for name, service in services.items()
+        if isinstance(service, dict) and re.match(r"(?i)^(?:[^/]+/)?mysql(?::|$)", str(service.get("image") or ""))
+    }
+    for name in mysql_services:
+        services.pop(name, None)
+    variable_map = {
+        "DB_HOST": "YUNZHOU_MYSQL_HOST", "MYSQL_HOST": "YUNZHOU_MYSQL_HOST",
+        "DB_PORT": "YUNZHOU_MYSQL_PORT", "MYSQL_PORT": "YUNZHOU_MYSQL_PORT",
+        "DB_NAME": "YUNZHOU_MYSQL_DATABASE", "DB_DATABASE": "YUNZHOU_MYSQL_DATABASE",
+        "MYSQL_DATABASE": "YUNZHOU_MYSQL_DATABASE",
+        "DB_USERNAME": "YUNZHOU_MYSQL_USERNAME", "DB_USER": "YUNZHOU_MYSQL_USERNAME",
+        "MYSQL_USER": "YUNZHOU_MYSQL_USERNAME",
+        "DB_PASSWORD": "YUNZHOU_MYSQL_PASSWORD", "MYSQL_PASSWORD": "YUNZHOU_MYSQL_PASSWORD",
+    }
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        depends = service.get("depends_on")
+        if isinstance(depends, dict):
+            for name in mysql_services:
+                depends.pop(name, None)
+        elif isinstance(depends, list):
+            service["depends_on"] = [name for name in depends if name not in mysql_services]
+        env = service.get("environment")
+        if isinstance(env, dict):
+            for key, source in variable_map.items():
+                if key in env:
+                    env[key] = "${" + source + "}"
+            # Frameworks frequently expose one complete JDBC URL instead of
+            # separate DB_HOST/DB_PORT variables (for example Spring/Druid).
+            # Rewrite the endpoint generically while preserving driver query
+            # parameters, then bind matching credentials to the user's saved
+            # external integration values.
+            for key, current in list(env.items()):
+                rendered = str(current or "")
+                if re.search(r"(?i)jdbc:mysql://", rendered):
+                    env[key] = re.sub(
+                        r"(?i)jdbc:mysql://[^/:?\s]+(?::\d+)?/[^?\s]+",
+                        "jdbc:mysql://${YUNZHOU_MYSQL_HOST}:${YUNZHOU_MYSQL_PORT}/${YUNZHOU_MYSQL_DATABASE}",
+                        rendered,
+                        count=1,
+                    )
+                    prefix = re.sub(r"(?i)(?:URL|JDBC_URL)$", "", key)
+                    username_key = prefix + "USERNAME"
+                    password_key = prefix + "PASSWORD"
+                    if username_key in env:
+                        env[username_key] = "${YUNZHOU_MYSQL_USERNAME}"
+                    if password_key in env:
+                        env[password_key] = "${YUNZHOU_MYSQL_PASSWORD}"
+            # Spring Boot does not understand the platform's YUNZHOU_* names
+            # by itself.  Older RuoYi/Druid projects commonly keep a complete
+            # datasource URL in application-druid.yml, so merely passing the
+            # generic values leaves the baked-in address active.  Bind both
+            # the standard Spring datasource keys and the Druid master keys
+            # whenever this looks like a Spring/Java application.  Environment
+            # variables have higher precedence than the packaged YAML and the
+            # actual secrets remain in the deployment .env file.
+            spring_service = any(
+                key in env for key in ("SPRING_PROFILES_ACTIVE", "SERVER_PORT", "JAVA_OPTS")
+            ) or str(service.get("image") or "").lower().startswith(("openjdk", "eclipse-temurin"))
+            if spring_service:
+                jdbc = "jdbc:mysql://${YUNZHOU_MYSQL_HOST}:${YUNZHOU_MYSQL_PORT}/${YUNZHOU_MYSQL_DATABASE}"
+                env.update({
+                    "SPRING_DATASOURCE_URL": jdbc,
+                    "SPRING_DATASOURCE_USERNAME": "${YUNZHOU_MYSQL_USERNAME}",
+                    "SPRING_DATASOURCE_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+                    "SPRING_DATASOURCE_DRUID_MASTER_URL": jdbc,
+                    "SPRING_DATASOURCE_DRUID_MASTER_USERNAME": "${YUNZHOU_MYSQL_USERNAME}",
+                    "SPRING_DATASOURCE_DRUID_MASTER_PASSWORD": "${YUNZHOU_MYSQL_PASSWORD}",
+                    "SPRING_REDIS_HOST": "${YUNZHOU_REDIS_HOST:-redis}",
+                    "SPRING_REDIS_PORT": "${YUNZHOU_REDIS_PORT:-6379}",
+                    "SPRING_REDIS_DATABASE": "${YUNZHOU_REDIS_DATABASE:-0}",
+                    "SPRING_REDIS_PASSWORD": "${YUNZHOU_REDIS_PASSWORD:-}",
+                })
+    adapted["compose_yaml"] = yaml.safe_dump(compose, allow_unicode=True, sort_keys=False)
+    adapted["services"] = [name for name in (adapted.get("services") or []) if name not in mysql_services and "mysql" not in str(name).lower()]
+    adapted["inferred_config"] = [
+        row for row in (adapted.get("inferred_config") or [])
+        if str(row.get("key") or "") not in variable_map
+    ]
+    changes.append("已按当前表单绑定外部 MySQL 到应用实际读取的运行参数，并移除平台托管 MySQL 服务")
+    return adapted, changes
+
+
 def reconcile_managed_integrations(project: Project, compose_path: str, compose_file: str) -> list[str]:
     """Guarantee that every unchecked integration has a real managed Compose service."""
     target = Path(compose_path) / compose_file
