@@ -2052,6 +2052,24 @@ tbody tr:last-child td {
   align-items: flex-start;
   animation: toast-in 0.2s ease;
 }
+.toast-copy {
+  flex: 1;
+  min-width: 0;
+}
+.toast-close {
+  width: 30px;
+  height: 30px;
+  margin: -5px -7px -5px 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #7b8597;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.toast-close:hover { background: #f1f3f7; color: #24314b; }
+.toast-close svg { width: 16px; height: 16px; }
 .toast > span {
   width: 25px;
   height: 25px;

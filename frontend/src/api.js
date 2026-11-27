@@ -41,7 +41,16 @@ export async function api(path, options = {}) {
           payload = await response.json()
           const raw = payload.detail
           if (Array.isArray(raw)) {
-            detail = raw.map(item => item.msg || JSON.stringify(item)).join('；')
+            const labels = {slug: '项目标识', name: '项目名称', git_url: 'Git 仓库地址', git_branch: '分支名称'}
+            detail = raw.map(item => {
+              const field = item.loc?.[item.loc.length - 1]
+              if (field === 'slug' && item.type === 'string_pattern_mismatch') {
+                return '项目标识格式不正确：请使用 2–63 位小写字母、数字或短横线，并以字母或数字开头'
+              }
+              const label = labels[field] || field
+              const message = item.msg || JSON.stringify(item)
+              return label ? `${label}：${message}` : message
+            }).join('；')
           } else if (raw && typeof raw === 'object') {
             detail = raw.message || raw.msg || JSON.stringify(raw)
           } else {

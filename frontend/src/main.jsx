@@ -2186,12 +2186,17 @@ function ProjectModal({ onClose, onDone, onBackground, onWorkflowStart, onProgre
       setErr("请先填写 Git 仓库地址");
       return;
     }
+    const candidateSlug = (form.slug || slugify(form.name || "新项目")).trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(candidateSlug)) {
+      setErr("项目标识格式不正确：请使用 2–63 位小写字母、数字或短横线，并以字母或数字开头");
+      return;
+    }
     setBusy(true);
     setErr("");
     setProcessingStage("正在创建项目并上传源码…");
     try {
       const name = form.name || "新项目",
-        slug = form.slug || slugify(name);
+        slug = candidateSlug;
       const body = {
         ...form,
         name,
