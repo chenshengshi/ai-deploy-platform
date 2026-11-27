@@ -17,6 +17,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo
@@ -33,7 +34,7 @@ from sqlalchemy import desc, func, or_, select, text
 from sqlalchemy.orm import Session
 from jose import JWTError, jwt
 
-from .ai import analyze_delete_scope, analyze_project_deployment, deployment_followup, understand
+from .ai import analyze_delete_scope, analyze_project_deployment, deployment_followup, reconcile_followup_live_state, understand
 from .archive_utils import safe_extract_zip
 from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
 from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
@@ -89,7 +90,13 @@ from .schemas import (
 from .ssh import SSHNode, ensure_node_runtime, test_node
 
 
-app = FastAPI(title=settings.app_name, docs_url=None, redoc_url=None, openapi_url=None)
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    startup()
+    yield
+
+
+app = FastAPI(title=settings.app_name, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[value.strip().rstrip("/") for value in settings.cors_origins.split(",") if value.strip()],
@@ -314,7 +321,6 @@ def require_reachable_node(node: Node, db: Session) -> None:
         raise HTTPException(502, f"目标服务器无法连接，未创建部署任务：{str(exc)[:300]}") from exc
 
 
-@app.on_event("startup")
 def startup():
     settings.ensure_dirs()
     Base.metadata.create_all(engine)
@@ -4426,10 +4432,15 @@ def pipeline_steps(log_text: str, status: DeployStatus, selected_key: str | None
 def deployment_view(
     item: Deployment, db: Session, include_log: bool = True, stage: str | None = None,
     port_reservations: list[DeploymentPortReservation] | None = None,
+    requester_by_id: dict[str, User] | None = None,
 ) -> dict:
     data = DeploymentOut.model_validate(item).model_dump()
     project, node = db.get(Project, item.project_id), db.get(Node, item.node_id)
-    requester = db.get(User, item.requested_by)
+    requester = (
+        requester_by_id.get(item.requested_by)
+        if requester_by_id is not None
+        else db.get(User, item.requested_by)
+    )
     database_log_text = item.log_text or ""
     log_text = database_log_text
     # The database value is deliberately a compact live window and can lose a
@@ -4742,6 +4753,11 @@ def list_deployments(project_id: str | None = None, db: Session = Depends(get_db
         deployments.extend(item for item in summary_rows if item.id not in known_ids)
         deployments.sort(key=lambda item: item.created_at, reverse=True)
     ids = [item.id for item in deployments]
+    requester_ids = {item.requested_by for item in deployments}
+    requesters = {
+        item.id: item
+        for item in db.scalars(select(User).where(User.id.in_(requester_ids))).all()
+    } if requester_ids else {}
     reservations: dict[str, list[DeploymentPortReservation]] = {}
     if ids:
         for row in db.scalars(select(DeploymentPortReservation).where(
@@ -4752,6 +4768,7 @@ def list_deployments(project_id: str | None = None, db: Session = Depends(get_db
     return [deployment_view(
         item, db, include_log=bool(project_id and item.status in (DeployStatus.queued, DeployStatus.running)),
         port_reservations=reservations.get(item.id, []),
+        requester_by_id=requesters,
     ) for item in deployments]
 
 
@@ -6815,7 +6832,8 @@ def deployment_ai_followup(item_id: str, db: Session = Depends(get_db), _: User 
             if item.status == DeployStatus.running
             else "按修复方案处理后重新发布，并由平台完成启动和访问验证。"
         )
-    result.update({"cache_key": cache_key, "stage": active["title"], "status": item.status.value, "generated_at": datetime.now(timezone.utc).isoformat()})
+    result, reconciled_stage = reconcile_followup_live_state(result, item, active["title"], combined_evidence)
+    result.update({"cache_key": cache_key, "stage": reconciled_stage, "status": item.status.value, "generated_at": datetime.now(timezone.utc).isoformat()})
     if result.get("source") == "ai":
         item.log_text = ((item.log_text or "") + "\n" + marker + json.dumps(result, ensure_ascii=False) + "\n")[-200_000:]
         db.commit()

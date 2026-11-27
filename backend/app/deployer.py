@@ -26,7 +26,7 @@ import yaml
 from sqlalchemy import select, text
 
 from .config import decrypt, encrypt, settings
-from .ai import MANAGED_MINIO_FALLBACK, analyze_project_deployment, deployment_followup
+from .ai import MANAGED_MINIO_FALLBACK, analyze_project_deployment, deployment_followup, reconcile_followup_live_state
 from .build_planning import (
     PLATFORM_NGINX_IMAGE,
     detect_java_log_directories,
@@ -41,7 +41,7 @@ from .build_planning import (
     valid_generated_dockerfile,
 )
 from .database import SessionLocal
-from .deployment_logs import append_deployment_log
+from .deployment_logs import append_deployment_log, read_deployment_log
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -3971,7 +3971,11 @@ def ai_checkpoint(deployment_id: str, stage: str, evidence: str) -> None:
                 if not dep:
                     return
                 result = deployment_followup(db, dep, db.get(Project, dep.project_id), db.get(Node, dep.node_id), stage, evidence[-5000:])
-                result.update({"stage": stage, "status": dep.status.value, "generated_at": datetime.now(timezone.utc).isoformat()})
+                db.expire_all()
+                dep = db.get(Deployment, deployment_id)
+                live_log = read_deployment_log(deployment_id) or evidence
+                result, live_stage = reconcile_followup_live_state(result, dep, stage, live_log)
+                result.update({"stage": live_stage, "status": dep.status.value, "generated_at": datetime.now(timezone.utc).isoformat()})
                 log(deployment_id, "[AI跟进] " + json.dumps(result, ensure_ascii=False) + "\n")
         except Exception as exc:
             log(deployment_id, "[AI跟进] " + json.dumps({"source": "system", "stage": stage, "summary": "AI 分析暂时不可用，部署继续执行。", "advice": str(exc)[:300]}, ensure_ascii=False) + "\n")

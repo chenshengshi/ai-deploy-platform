@@ -763,3 +763,47 @@ def deployment_followup(db: Session, deployment: Deployment, project: Project, n
         "retry_safe": bool(result.get("retry_safe", False)),
     }
 
+
+def reconcile_followup_live_state(
+    result: dict, deployment: Deployment, stage: str, log_text: str,
+) -> tuple[dict, str]:
+    """Make asynchronous AI commentary agree with the newest pipeline facts."""
+    reconciled = dict(result or {})
+    status = getattr(deployment.status, "value", str(deployment.status))
+    stage_titles = {
+        "analyze": "读取方案", "prepare": "准备环境", "build": "构建应用",
+        "start": "启动服务", "verify": "验证访问",
+    }
+    starts = re.findall(r"(?m)^\[阶段开始\]\s+(analyze|prepare|build|start|verify)\s*$", log_text or "")
+    if starts:
+        stage = stage_titles.get(starts[-1], stage)
+    completed = re.findall(r"(?m)^\[完成\]\s*部署成功，访问地址：\s*(https?://\S+)", log_text or "")
+    gateway = re.findall(r"(?m)^\[检查\]\s*平台网关映射完成：\s*(https?://\S+)", log_text or "")
+    verified = re.findall(r"访问验证通过：HTTP\s+2\d\d\s*[·，,]?\s*(https?://\S+)", log_text or "", re.I)
+    access_url = deployment.access_url or (completed[-1] if completed else None) or (verified[-1] if verified else None) or (gateway[-1] if gateway else None)
+    if status == "success" or completed:
+        stage = "部署完成"
+        reconciled.update({
+            "source": "system",
+            "summary": f"部署成功，服务已经通过访问验证{f'：{access_url}' if access_url else '。'}",
+            "advice": "可以直接访问服务，无需继续等待或重新发布。",
+            "scope": "platform",
+            "confidence": "high",
+            "retry_safe": False,
+        })
+    elif status == "running" and access_url:
+        reconciled.update({
+            "source": "system",
+            "summary": f"项目正在{stage}，平台已生成访问地址 {access_url}，正在完成后续验证。",
+            "advice": "无需处理；平台会继续验证并自动更新最终状态。",
+            "scope": "platform",
+            "confidence": "high",
+            "retry_safe": False,
+        })
+    reconciled["evidence"] = list(dict.fromkeys([
+        *[str(value)[:300] for value in reconciled.get("evidence", [])],
+        *([f"最新流水线阶段：{stage}"] if stage else []),
+        *([f"平台访问地址：{access_url}"] if access_url else []),
+    ]))[-3:]
+    return reconciled, stage
+
