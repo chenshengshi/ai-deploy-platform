@@ -9570,10 +9570,32 @@ def start_project_data_services(
     with SSHNode(node) as ssh:
         if ssh.run(f"test -f {shlex.quote(directory + '/' + data_file)}", timeout=20)[0] != 0:
             return "该版本没有独立的项目共享数据服务"
+        _, data_yaml = ssh.run(f"cat {shlex.quote(directory + '/' + data_file)}", timeout=20)
+        data_document = yaml.safe_load(data_yaml) or {}
+        data_services = data_document.get("services") if isinstance(data_document, dict) else {}
+        if not isinstance(data_services, dict):
+            data_services = {}
+        allowed_services = set(data_services)
+        user_values = environment_values(decrypt(project.env_text_encrypted) or "")
+        external_modes = {
+            "mysql": user_values.get("YUNZHOU_MYSQL_MODE", "managed").lower() == "external",
+            "redis": user_values.get("YUNZHOU_REDIS_MODE", "managed").lower() == "external",
+            "postgres": user_values.get("YUNZHOU_POSTGRES_MODE", "managed").lower() == "external",
+        }
+        for family, external in external_modes.items():
+            if external:
+                allowed_services.difference_update(data_service_names(data_services, family))
+        if not allowed_services:
+            return "当前项目数据服务均已切换为外接，不启动历史版本的托管数据容器"
+        service_args = " ".join(shlex.quote(value) for value in sorted(allowed_services))
         label = shlex.quote(f"label=com.docker.compose.project={data_project}")
-        _, all_output = ssh.run(f"docker ps -aq --filter {label}", timeout=20)
+        compose_prefix = (
+            f"cd {shlex.quote(directory)} && docker compose -p {shlex.quote(data_project)} "
+            f"-f {shlex.quote(data_file)}"
+        )
+        _, all_output = ssh.run(f"{compose_prefix} ps -aq {service_args}", timeout=20)
         all_ids = [value for value in all_output.split() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
-        _, running_output = ssh.run(f"docker ps -q --filter {label}", timeout=20)
+        _, running_output = ssh.run(f"{compose_prefix} ps -q {service_args}", timeout=20)
         running_ids = [value for value in running_output.split() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
         if running_ids and len(running_ids) == len(all_ids):
             words = " ".join(shlex.quote(value) for value in running_ids)
@@ -9591,12 +9613,7 @@ def start_project_data_services(
                 # data stack with a historical Compose file. Even an innocent
                 # `up -d` can recreate MySQL when old service metadata differs.
                 return f"已复用健康的项目共享数据服务（{len(running_ids)} 个容器），未重建或重启"
-        _, service_output = ssh.run(
-            f"cd {shlex.quote(directory)} && "
-            f"docker compose -p {shlex.quote(data_project)} -f {shlex.quote(data_file)} config --services",
-            timeout=30,
-        )
-        expected_services = [value for value in service_output.splitlines() if value.strip()]
+        expected_services = sorted(allowed_services)
         reuse_stopped = bool(all_ids) and len(all_ids) == len(expected_services)
         if reuse_stopped:
             words = " ".join(shlex.quote(value) for value in all_ids)
@@ -9605,7 +9622,7 @@ def start_project_data_services(
             command = (
                 f"cd {shlex.quote(directory)} && "
                 f"docker compose -p {shlex.quote(data_project)} -f {shlex.quote(data_file)} "
-                "up -d --no-build"
+                f"up -d --no-build {service_args}"
             )
         code, output = ssh.run(command, timeout=300)
         if code:
@@ -9614,7 +9631,7 @@ def start_project_data_services(
         health = (
             f"cd {shlex.quote(directory)} && ok=0; "
             "for i in $(seq 1 60); do bad=0; "
-            f"ids=$(docker compose -p {shlex.quote(data_project)} -f {shlex.quote(data_file)} ps -q); "
+            f"ids=$(docker compose -p {shlex.quote(data_project)} -f {shlex.quote(data_file)} ps -q {service_args}); "
             "[ -n \"$ids\" ] || bad=1; for id in $ids; do "
             "state=$(docker inspect -f '{{.State.Status}}' $id 2>/dev/null); "
             "health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $id 2>/dev/null); "
@@ -9627,7 +9644,7 @@ def start_project_data_services(
         if code:
             raise RuntimeError("项目共享数据服务启动后未就绪：" + output[-800:])
         _, count = ssh.run(
-            "docker ps -q --filter " + shlex.quote(f"label=com.docker.compose.project={data_project}") + " | wc -l",
+            f"{compose_prefix} ps -q {service_args} | wc -l",
             timeout=20,
         )
     mode = "原有数据容器已重新启动" if reuse_stopped else "缺失的数据容器已按配置恢复"
