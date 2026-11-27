@@ -60,7 +60,7 @@ from .deployment_integrations import (
 from .deployment_source_optimization import optimize_staged_sources as _optimize_staged_sources
 from .deployment_build_repairs import apply_dockerfile_text_repairs
 from .deployment_build_handlers import detect_build as _detect_build, detect_container_port as _detect_container_port
-from .deployment_build_profiles import detect_build_profiles
+from .deployment_build_profiles import compatible_node_image, detect_build_profiles
 from .deployment_build_generators import generate_profile_build, generate_static_build
 from .deployment_runtime_policy import data_compose_project, release_directories, validate_release
 from .deployment_runtime_ports import (
@@ -5877,6 +5877,18 @@ def central_build_and_distribute(
                         pid_prefix=f"yunzhou-eager-package-{role}",
                         stream_channel="package", stream_label="镜像封装",
                     )
+                    eager_storage_error = any(marker in output.lower() for marker in (
+                        "lease does not exist", "failed to prepare snapshot", "failed to commit",
+                        "failed to export layer", "content/ingest", "snapshotter",
+                        "does not exist: not found",
+                    ))
+                    if code and eager_storage_error:
+                        log(deployment.id, f"[平台自愈] {service_name} 即时封装遇到 Docker 存储抖动，保持写入锁自动重试。\n")
+                        code, output = tracked_run(
+                            package_ssh, deployment.id, locked_command, stream=stream, timeout=1500,
+                            pid_prefix=f"yunzhou-eager-package-{role}-retry",
+                            stream_channel="package", stream_label="镜像封装重试",
+                        )
                 if code:
                     raise RuntimeError(f"{service_name} 即时镜像封装失败：" + output[-2000:])
                 with eager_package_guard:
@@ -6599,6 +6611,9 @@ def central_build_and_distribute(
                     # Dockerfile install dependencies and start normally.
                     if not isinstance(scripts, dict) or not scripts.get("build"):
                         continue
+                    node_image = compatible_node_image(context, node_match.group(1))
+                    if node_image != node_match.group(1):
+                        log(deployment.id, f"[平台兼容] 项目依赖要求较新 Node，构建镜像已从 {node_match.group(1)} 调整为 {node_image}。\n")
                     package_manager = str(package_meta.get("packageManager") or "").lower()
                     has_package_lock = (context / "package-lock.json").is_file()
                     has_pnpm_lock = (context / "pnpm-lock.yaml").is_file()
@@ -6645,10 +6660,10 @@ def central_build_and_distribute(
                             f"-v {shlex.quote(cache_root + '/yarn' + ':' + yarn_cache_dir)} "
                             f"{node_cache_env}"
                             f"{node_modules_mount}"
-                            f"-w /workspace {shlex.quote(node_match.group(1))} sh -lc "
+                            f"-w /workspace {shlex.quote(node_image)} sh -lc "
                             + shlex.quote("set -e; trap 'rm -rf .pnpm-store' EXIT; " + install)
                         )
-                        log(deployment.id, f"[平台构建] Node 正式构建：{node_match.group(1)} + {manager}。\n")
+                        log(deployment.id, f"[平台构建] Node 正式构建：{node_image} + {manager}。\n")
                         code, output = tracked_run(build_ssh, deployment.id, command, stream=stream, timeout=1800,
                                                    pid_prefix="yunzhou-node-build", stream_channel="web", stream_label="前端 Web")
                         if code:

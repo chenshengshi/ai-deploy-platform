@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from .deployment_build_profiles import BuildProfile
+from .deployment_build_profiles import BuildProfile, compatible_node_image
 
 
 @dataclass(frozen=True)
@@ -34,15 +34,16 @@ class NodeBuildGenerator:
             meta = {}
         dependencies = {**meta.get("dependencies", {}), **meta.get("devDependencies", {})}
         scripts = meta.get("scripts", {})
+        node_image = compatible_node_image(root, "node:22-alpine")
         if "vite" in dependencies or "build" in scripts:
             return GeneratedBuild(
-                "FROM node:22-alpine AS build\nWORKDIR /app\nCOPY package*.json ./\n"
+                f"FROM {node_image} AS build\nWORKDIR /app\nCOPY package*.json ./\n"
                 "RUN npm config set registry https://registry.npmmirror.com && npm install\nCOPY . .\nRUN npm run build\n"
                 f"FROM {nginx_image}\nCOPY --from=build /app/dist /usr/share/nginx/html\nEXPOSE 80\n",
                 80,
             )
         return GeneratedBuild(
-            "FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\n"
+            f"FROM {node_image}\nWORKDIR /app\nCOPY package*.json ./\n"
             "RUN npm config set registry https://registry.npmmirror.com && npm install --omit=dev\n"
             "COPY . .\nENV NODE_ENV=production\nEXPOSE 3000\nCMD [\"npm\",\"start\"]\n",
             3000,

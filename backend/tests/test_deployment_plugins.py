@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from app.deployment_build_generators import generate_profile_build, generate_static_build
-from app.deployment_build_profiles import detect_build_profiles
+from app.deployment_build_profiles import compatible_node_image, detect_build_profiles
 from app.deployment_runtime_policy import data_compose_project, release_directories, validate_release
 from app.deployment_runtime_ports import compose_port_number, compose_published_port, replace_compose_published_port
 
@@ -29,6 +29,13 @@ class DeploymentPluginTests(unittest.TestCase):
             generated = generate_profile_build(root, profiles, nginx_image="nginx:alpine", java_version=lambda _: 17)
             self.assertIn("gradle:8-jdk17", generated.dockerfile)
             self.assertNotIn("maven:", generated.dockerfile)
+
+    def test_node_image_is_raised_to_dependency_minimum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text('{"engines":{"node":">=20"}}', encoding="utf-8")
+            (root / "package-lock.json").write_text('{"packages":{"node_modules/native":{"engines":{"node":">=24.0.0"}}}}', encoding="utf-8")
+            self.assertEqual(compatible_node_image(root, "node:18-alpine"), "node:24-alpine")
 
     def test_static_generator_ignores_build_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
