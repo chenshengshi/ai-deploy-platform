@@ -25,13 +25,20 @@ from app.deployer import (
     restore_release_images,
     start_deployment,
     stop_deployment,
+    prepare_build,
+    prepare_compose_image_override,
+    split_compose_runtime,
 )
+from app.deployment.build_preparation import prepare_build as modular_prepare_build
+from app.deployment.compose_plan import prepare_compose_image_override as modular_prepare_compose_image_override
+from app.deployment.compose_split import split_compose_runtime as modular_split_compose_runtime
 from app.deployment.image_restore import restore_release_images as modular_restore_release_images
 from app.deployment.release_cleanup import delete_deployment_resources as modular_delete_deployment_resources
 from app.deployment.release_runtime import (
     start_deployment as modular_start_deployment,
     stop_deployment as modular_stop_deployment,
 )
+from app.deployment.source_repair import apply_safe_build_repairs as modular_apply_safe_build_repairs
 from app.deployment_architecture import (
     analyze_repository_topology as architecture_analyze_repository_topology,
     analyze_runtime_dependencies,
@@ -53,6 +60,10 @@ class DeploymentSourceContractTests(unittest.TestCase):
         self.assertIs(stop_deployment, modular_stop_deployment)
         self.assertIs(delete_deployment_resources, modular_delete_deployment_resources)
         self.assertIs(restore_release_images, modular_restore_release_images)
+        self.assertIs(apply_safe_build_repairs, modular_apply_safe_build_repairs)
+        self.assertIs(prepare_build, modular_prepare_build)
+        self.assertIs(prepare_compose_image_override, modular_prepare_compose_image_override)
+        self.assertIs(split_compose_runtime, modular_split_compose_runtime)
 
     def test_frontend_base_repair_changes_only_isolated_vite_config(self):
         with tempfile.TemporaryDirectory() as directory:
