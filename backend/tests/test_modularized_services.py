@@ -40,6 +40,7 @@ from app.deployment.release_runtime import (
 )
 from app.deployment.source_repair import apply_safe_build_repairs as modular_apply_safe_build_repairs
 from app.deployment.integration_reconcile import reconcile_managed_integrations as modular_reconcile_managed_integrations
+from app.deployment.launch_config import _redact
 from app.deployment.architecture import (
     analyze_repository_topology as architecture_analyze_repository_topology,
     analyze_runtime_dependencies,
@@ -56,6 +57,37 @@ from app.source_inspection import (
 
 
 class DeploymentSourceContractTests(unittest.TestCase):
+    def test_launch_config_route_is_registered_once(self):
+        routes = [
+            (route.path, method)
+            for route in app.routes
+            for method in (getattr(route, "methods", None) or set())
+        ]
+        self.assertEqual(routes.count(("/api/deployments/{item_id}/launch-config", "GET")), 1)
+
+    def test_api_method_and_path_pairs_are_unique(self):
+        routes = [
+            (route.path, method)
+            for route in app.routes
+            for method in (getattr(route, "methods", None) or set())
+            if route.path.startswith("/api/")
+        ]
+        duplicates = sorted(route for route in set(routes) if routes.count(route) > 1)
+        self.assertEqual(duplicates, [])
+
+    def test_launch_config_redacts_env_yaml_and_docker_secrets(self):
+        self.assertEqual(
+            _redact(".env.runtime", "VISIBLE=1\nDB_PASSWORD=unsafe\nIP_HASH_SALT=unsafe"),
+            "VISIBLE=1\nDB_PASSWORD=******\nIP_HASH_SALT=******",
+        )
+        rendered = _redact(
+            "compose.yml",
+            "environment:\n  SESSION_SECRET: unsafe\n  PUBLIC_VALUE: visible",
+        )
+        self.assertIn("SESSION_SECRET: ******", rendered)
+        self.assertIn("PUBLIC_VALUE: visible", rendered)
+        self.assertEqual(_redact("Dockerfile", "ARG API_TOKEN=unsafe"), "ARG API_TOKEN=******")
+
     def test_release_lifecycle_uses_modular_implementations(self):
         self.assertIs(start_deployment, modular_start_deployment)
         self.assertIs(stop_deployment, modular_stop_deployment)
