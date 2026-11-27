@@ -41,6 +41,7 @@ from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, tok
 from .backup import router as backup_router, start_backup_scheduler
 from .chat.diagnostics import deployment_from_message_url, diagnose_blank_frontend
 from .chat.external_services import extract_external_mysql_config
+from .chat.intents import explicit_project_match, fallback_action_from_message, fuzzy_project_match, is_confirmation, normalize_message
 from .chat.responses import format_failure_diagnosis
 from .chat.session_state import session_task_state
 from .config import decrypt, encrypt, settings
@@ -8620,26 +8621,7 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         # unavailable.  Fuzzy matching is deliberately limited to known,
         # confirmation-gated platform actions; project/node selection and the
         # current chat context are still resolved below in the normal flow.
-        from difflib import SequenceMatcher
-
-        compact_message = re.sub(r"[\s，。！!？?、]", "", body.message.lower())
-        intent_examples = {
-            "stop": ("停止部署", "暂停部署", "中止部署", "取消部署", "停掉部署"),
-            "rollback": ("回滚上个版本", "回滚上一版本", "恢复历史版本"),
-            "restart": ("重启服务", "重启容器", "重启项目"),
-            "migrate": ("执行表结构", "更新表结构", "应用迁移文件", "同步数据库结构"),
-            "deploy": ("开始部署", "重新部署", "发布项目", "上线项目"),
-        }
-        ranked = [
-            (SequenceMatcher(None, compact_message, example).ratio(), action)
-            for action, examples in intent_examples.items()
-            for example in examples
-        ]
-        score, fallback_action = max(ranked, default=(0.0, "none"))
-        # A deployment word plus a close action phrase is strong enough for a
-        # confirmation prompt, but never for immediate destructive execution.
-        if score < 0.56 or (fallback_action == "stop" and "部署" not in compact_message):
-            fallback_action = "none"
+        fallback_action = fallback_action_from_message(body.message)
         if fallback_action == "none":
             return respond(
                 f"AI 服务调用失败：{exc}\n本次错误已保存到对话历史，请稍后重试。",
@@ -8669,11 +8651,11 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
         project_id = None
     if not db.get(Node, node_id) if node_id else False:
         node_id = None
-    project_match = next((x for x in projects if x.name in body.message or x.slug in body.message), None)
+    project_match = explicit_project_match(projects, body.message)
     node_match = next((x for x in nodes if x.name in body.message), None)
     project_id = project_match.id if project_match else project_id
     node_id = node_match.id if node_match else node_id
-    normalized = re.sub(r"[\s，。！!？?]", "", body.message)
+    normalized = normalize_message(body.message)
     external_mysql_changes = extract_external_mysql_config(body.message)
     cleanup_managed_mysql = bool(
         external_mysql_changes
@@ -8694,27 +8676,9 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
     # selects the target for a confirmation prompt; it never executes an
     # operation without the existing second confirmation.
     if not project_id and projects:
-        from difflib import SequenceMatcher
-
-        project_words = re.sub(
-            r"(帮我|一下|现在|当前|这个|那个|项目|系统|平台|服务|应用|重启|重新启动|部署|发布|停止|回滚)",
-            "",
-            normalized,
-        )
-        ranked_projects = []
-        for candidate in projects:
-            candidate_name = re.sub(r"(项目|系统|平台|服务|应用|中心)$", "", candidate.name)
-            score = max(
-                SequenceMatcher(None, project_words, candidate.name).ratio(),
-                SequenceMatcher(None, project_words, candidate_name).ratio(),
-            ) if project_words else 0
-            ranked_projects.append((score, candidate))
-        ranked_projects.sort(key=lambda row: row[0], reverse=True)
-        best_score, best_project = ranked_projects[0]
-        runner_up = ranked_projects[1][0] if len(ranked_projects) > 1 else 0
-        if best_score >= 0.48 and best_score - runner_up >= 0.12:
-            project_id = best_project.id
-    confirmed = normalized in {"是", "是的", "确认", "确认部署", "确认停止", "确认取消", "确认回滚", "确认重启", "确认修复", "修复", "修复并重新发布", "确认修复并重新发布", "确认执行表结构", "确认执行高风险表结构", "确认执行数据变更", "确认执行高风险数据变更", "开始", "开始部署", "可以", "执行", "上线", "停止", "取消", "回滚", "重启"}
+        fuzzy_project = fuzzy_project_match(projects, body.message)
+        project_id = fuzzy_project.id if fuzzy_project else None
+    confirmed = is_confirmation(body.message)
     repair_frontend_deployment_id = (
         body.intent.split(":", 1)[1]
         if body.intent and body.intent.startswith("repair_frontend_path:")
