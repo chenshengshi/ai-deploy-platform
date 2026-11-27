@@ -56,6 +56,16 @@ from .deployment.image_cleanup import (
     verify_registry_tag,
 )
 from .deployment.execution_log import ANSI_RE, log, log_stage, tracked_run
+from .deployment.execution_control import DeploymentCancelled, ensure_active
+from .deployment.login_info import normalize_login_info
+from .deployment.plan_fingerprint import actionable_plan_fingerprint
+from .deployment.managed_configuration import (
+    apply_ai_inferred_config,
+    compose_pull_images,
+    ensure_managed_build_variables,
+    ensure_managed_secrets,
+    required_compose_variables,
+)
 from .deployment.release_runtime import start_deployment, stop_deployment
 from .deployment.release_cleanup import delete_deployment_resources
 from .deployment.source_repair import apply_safe_build_repairs
@@ -98,11 +108,11 @@ from .deployment.runtime_environment import application_environment
 from .deployment.data_services import remove_project_managed_data_service, start_project_data_services, stop_project_data_services
 from .deployment.gateway import configure_platform_gateway, platform_gateway_node, reconcile_runtime_frontend_routes, restore_platform_gateway, snapshot_platform_gateway
 from .deployment.integrations import (
-    effective_project_environment as _effective_project_environment,
-    environment_values as _environment_values,
-    external_integration_preflight as _external_integration_preflight,
-    store_managed_values as _store_managed_values,
-    managed_mysql_image_for_source as _managed_mysql_image_for_source,
+    effective_project_environment,
+    environment_values,
+    external_integration_preflight,
+    store_managed_values,
+    managed_mysql_image_for_source,
     data_service_names,
     integration_consumers,
     is_backend_service,
@@ -112,9 +122,9 @@ from .deployment.integrations import (
     managed_mysql_values,
     remove_empty_command_arguments,
 )
-from .deployment.source_optimization import optimize_staged_sources as _optimize_staged_sources
+from .deployment.source_optimization import optimize_staged_sources
 from .deployment.build_repairs import apply_dockerfile_text_repairs
-from .deployment.build_handlers import detect_build as _detect_build, detect_container_port as _detect_container_port
+from .deployment.build_handlers import detect_build, detect_container_port
 from .deployment.build_profiles import compatible_node_image, detect_build_profiles
 from .deployment.build_generators import generate_profile_build, generate_static_build
 from .deployment.topology import add_unambiguous_nginx_aliases, repair_generated_node_dependency_copy
@@ -151,239 +161,33 @@ from .source_inspection import (
 from .ssh import SSHNode
 
 
-PLATFORM_MYSQL_IMAGE = "mysql:8.4"
 
 
 
 
 
 
-_NON_OPERATIONAL_PLAN_KEYS = {
-    "provider", "requested_model", "model", "summary", "mode_decision",
-    "reasoning", "analysis", "analysis_notes", "confidence",
-}
 
 
-def actionable_plan_fingerprint(plan: dict | None) -> str:
-    """Fingerprint only plan fields that can change the deployed result.
 
-    AI explanations often vary between calls even when the effective build,
-    runtime and routing plan is identical. Those prose-only differences must
-    never authorize another expensive build.
-    """
-    if not isinstance(plan, dict):
-        return ""
 
-    def normalize(value):
-        if isinstance(value, dict):
-            return {
-                key: normalize(item)
-                for key, item in sorted(value.items())
-                if key not in _NON_OPERATIONAL_PLAN_KEYS
-            }
-        if isinstance(value, list):
-            return [normalize(item) for item in value]
-        return value
 
-    payload = json.dumps(normalize(plan), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 
 
-class DeploymentCancelled(RuntimeError):
-    pass
 
 
-def normalize_login_info(work: Path | str, ai_plan: dict) -> dict:
-    """Correct conservative AI auth results when the repository clearly exposes self-registration."""
-    work = Path(work)
-    info = {
-        "auth_mode": str(ai_plan.get("auth_mode") or "unknown")[:40],
-        "login_url_path": str(ai_plan.get("login_url_path") or "/")[:300],
-        "username": str(ai_plan.get("login_username") or "")[:300],
-        "password": str(ai_plan.get("login_password") or "")[:300],
-        "note": str(ai_plan.get("login_note") or "未发现可确认的默认登录账号，请查看项目首次使用说明。")[:1000],
-    }
-    if info["username"] or info["password"] or info["auth_mode"] in {"default_credentials", "external_auth", "none"}:
-        return info
-    registration_evidence = False
-    inspected = 0
-    for path in work.rglob("*"):
-        if inspected >= 300 or not path.is_file() or path.suffix.lower() not in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".html", ".md"}:
-            continue
-        try:
-            if path.stat().st_size > 1_000_000:
-                continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            inspected += 1
-            if "/api/auth/register" in text and ("/register" in text or "注册" in text):
-                registration_evidence = True
-                break
-        except OSError:
-            continue
-    if registration_evidence:
-        info.update({
-            "auth_mode": "first_register",
-            "login_url_path": "/register",
-            "username": "",
-            "password": "",
-            "note": "项目没有默认账号密码，请打开注册页面创建首个账号；密码规则以注册页面提示为准。",
-        })
-    return info
 
 
-def ensure_active(deployment_id: str) -> None:
-    with SessionLocal() as check_db:
-        current = check_db.get(Deployment, deployment_id)
-        if not current or current.status == DeployStatus.stopped:
-            raise DeploymentCancelled("部署已由用户停止")
 
 
 
 
 
 
-def detect_build(path: str, requested: str) -> tuple[str, str | None]:
-    return _detect_build(path, requested)
 
 
-def detect_container_port(path: str, dockerfile_name: str = "Dockerfile") -> int | None:
-    return _detect_container_port(path, dockerfile_name)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def optimize_staged_sources(path: str) -> list[str]:
-    """Rewrite only the isolated release copy so nested build files use reachable mirrors."""
-    return _optimize_staged_sources(path)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def compose_pull_images(path: str, compose_file: str) -> list[str]:
-    """Return image-only Compose services; locally-built services are excluded."""
-    try:
-        document = yaml.safe_load((Path(path) / compose_file).read_text(encoding="utf-8", errors="ignore")) or {}
-    except (OSError, yaml.YAMLError):
-        return []
-    images = []
-    for service in (document.get("services") or {}).values():
-        if isinstance(service, dict) and service.get("image") and not service.get("build"):
-            image = str(service["image"]).strip()
-            if image and "${" not in image and image not in images:
-                images.append(image)
-    return images
-
-
-def required_compose_variables(path: str, compose_file: str, env_text: str | None = None) -> list[dict]:
-    """Find Compose variables that explicitly require a value before Docker runs."""
-    source = (Path(path) / compose_file).read_text(encoding="utf-8", errors="ignore")
-    supplied = {
-        line.split("=", 1)[0].strip()
-        for line in (env_text or "").splitlines()
-        if "=" in line and not line.lstrip().startswith("#") and line.split("=", 1)[1].strip()
-    }
-    supplied.update({"COMPOSE_PROJECT_NAME", "YUNZHOU_HOST_PORT", "CRM_DB_PASSWORD", "CRM_DB_ROOT_PASSWORD", "CRM_JWT_SECRET"})
-    found = []
-    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?\?)([^}]*)\}")
-    for match in pattern.finditer(source):
-        name, hint = match.group(1), match.group(2).strip()
-        if name not in supplied and not any(item["name"] == name for item in found):
-            found.append({"name": name, "hint": hint or "Compose 声明为必填项"})
-    return found
-
-
-def ensure_managed_build_variables(project: Project, source_path: str, compose_file: str) -> list[str]:
-    """Fill variables emitted by the platform's own generated build files.
-
-    These values are build implementation details, not deployment credentials.
-    They must therefore never be presented to the user as missing configuration.
-    Prefer the exact package-manager version declared by the repository and use
-    the same conservative version as the generated Dockerfile fallback.
-    """
-    compose_source = (Path(source_path) / compose_file).read_text(encoding="utf-8", errors="ignore")
-    referenced = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}", compose_source))
-    current_lines = (project.managed_env_text or "").splitlines()
-    current_values = environment_values(project.managed_env_text)
-    generated = []
-
-    if "YUNZHOU_PNPM_VERSION" in referenced and not current_values.get("YUNZHOU_PNPM_VERSION"):
-        version = "8.15.9"
-        candidates = sorted(Path(source_path).rglob("package.json"), key=lambda item: len(item.parts))
-        for package_file in candidates:
-            try:
-                package_meta = json.loads(package_file.read_text(encoding="utf-8", errors="ignore"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            manager = str(package_meta.get("packageManager") or "").strip()
-            match = re.fullmatch(r"pnpm@([0-9]+(?:\.[0-9]+){1,2})(?:\+.*)?", manager, re.I)
-            if match:
-                version = match.group(1)
-                break
-        current_lines.append(f"YUNZHOU_PNPM_VERSION={version}")
-        generated.append(f"YUNZHOU_PNPM_VERSION={version}")
-
-    if generated:
-        project.managed_env_text = "\n".join(current_lines).strip() + "\n"
-    return generated
-
-
-def effective_project_environment(project: Project) -> str:
-    """Render one deterministic Compose environment with dependencies first.
-
-    Compose expands values in an env file while reading it.  A derived value
-    such as ``SPRING_DATASOURCE_URL=${YUNZHOU_MYSQL_HOST}...`` must therefore
-    appear after the YUNZHOU connection fields.  Concatenating the managed and
-    user files used to put derived values first and silently expanded a valid
-    external database configuration to empty strings.
-    """
-    return _effective_project_environment(project)
-
-
-def external_integration_preflight(project: Project, env_text: str) -> list[str]:
-    """Validate saved external integrations before build or container startup."""
-    return _external_integration_preflight(project, env_text)
-
-
-def environment_values(text: str | None) -> dict[str, str]:
-    return _environment_values(text)
 
 
 def adapt_plan_to_current_integrations(plan: dict, project: Project) -> tuple[dict, list[str]]:
@@ -492,98 +296,6 @@ def adapt_plan_to_current_integrations(plan: dict, project: Project) -> tuple[di
     ]
     changes.append("已按当前表单绑定外部 MySQL 到应用实际读取的运行参数，并移除平台托管 MySQL 服务")
     return adapted, changes
-
-
-def store_managed_values(project: Project, values: dict[str, str]) -> list[str]:
-    """Store platform-owned connection values in readable project configuration."""
-    return _store_managed_values(project, values)
-
-
-def apply_ai_inferred_config(project: Project, plan: dict) -> list[dict]:
-    """Persist only high-confidence, non-secret AI findings without overwriting user values."""
-    current_lines = (project.managed_env_text or "").splitlines()
-    user_keys = {
-        line.split("=", 1)[0].strip() for line in (decrypt(project.env_text_encrypted) or "").splitlines()
-        if "=" in line and not line.lstrip().startswith("#")
-    }
-    positions = {line.split("=", 1)[0].strip(): index for index, line in enumerate(current_lines) if "=" in line and not line.lstrip().startswith("#")}
-    applied = []
-    secret_words = ("password", "secret", "token", "private", "access_key", "credential")
-    allowed_suffixes = ("_URL", "_URI", "_ENDPOINT", "_HOST", "_PORT", "_BUCKET", "_REGION", "_PREFIX", "_ISSUER")
-    for item in plan.get("inferred_config") or []:
-        if not isinstance(item, dict) or str(item.get("confidence", "")).lower() != "high":
-            continue
-        key, value = str(item.get("key") or "").strip(), str(item.get("value") or "").strip()
-        lower = key.lower()
-        if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", key) or key in positions or key in user_keys or
-                any(word in lower for word in secret_words) or not key.endswith(allowed_suffixes) or
-                not value or len(value) > 2048 or any(marker in value.lower() for marker in ("...", "<", ">", "your_", "example.com"))):
-            continue
-        current_lines.append(f"{key}={value}")
-        positions[key] = len(current_lines) - 1
-        applied.append({"key": key, "value": value, "source": str(item.get("source") or "AI 源码分析")})
-    if applied:
-        project.managed_env_text = "\n".join(current_lines).strip() + "\n"
-    return applied
-
-
-def ensure_managed_secrets(project: Project, compose_path: str, compose_file: str) -> list[str]:
-    """Generate credentials owned by a fresh managed stack, never third-party credentials."""
-    effective_env = "\n".join(filter(None, (project.managed_env_text or "", decrypt(project.env_text_encrypted) or "")))
-    missing = required_compose_variables(compose_path, compose_file, effective_env)
-    external_prefixes = ("OIDC_", "OAUTH_", "PAYMENT_", "SMS_", "SMTP_", "S3_EXTERNAL_")
-    secret_markers = (
-        "PASSWORD", "SECRET", "TOKEN", "ACCESS_KEY",
-        # ASP.NET commonly maps nested configuration keys with ``__`` and
-        # names its JWT secret ``Jwt__SigningKey``.  It is just as much a
-        # platform-owned credential as JWT_SECRET and must never require the
-        # user to invent a value during a managed-fresh deployment.
-        "SIGNINGKEY", "SIGNING_KEY", "PRIVATE_KEY", "ENCRYPTION_KEY",
-        "ENC_KEY", "HASH_SALT",
-    )
-    # Compose permits `${JWT_SECRET:-}` and similar optional-empty defaults.
-    # They are syntactically valid but almost never operationally valid for a
-    # managed application.  Treat every referenced platform-owned secret as a
-    # value that needs generation, even when Compose itself would accept an
-    # empty default.  External integrations remain user-owned below.
-    supplied_values = environment_values(effective_env)
-    compose_source = (Path(compose_path) / compose_file).read_text(encoding="utf-8", errors="ignore")
-    referenced_names = re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}", compose_source)
-    known_missing = {item["name"] for item in missing}
-    for name in referenced_names:
-        upper_name = name.upper()
-        if (name not in known_missing and not supplied_values.get(name)
-                and any(marker in upper_name for marker in secret_markers)):
-            missing.append({"name": name, "hint": "Compose 引用了可为空的敏感配置，平台将生成非空安全值"})
-            known_missing.add(name)
-    current_lines = (project.managed_env_text or "").splitlines()
-    generated = []
-    for item in missing:
-        key = item["name"]
-        upper_key = key.upper()
-        is_username = upper_key in {"USER", "USERNAME"} or upper_key.endswith(("_USER", "_USERNAME"))
-        is_secret = any(marker in upper_key for marker in secret_markers)
-        if key.startswith(external_prefixes) or not (is_username or is_secret):
-            continue
-        digest = hashlib.sha256(f"{settings.app_secret}:{project.id}:{key}".encode()).hexdigest()
-        if is_username:
-            safe_slug = re.sub(r"[^a-z0-9]+", "_", project.slug.lower()).strip("_")[:20] or "app"
-            value = f"yz_{safe_slug}_{digest[:6]}"
-        elif upper_key.endswith("ACCESS_KEY"):
-            value = "yz" + digest[:18]
-        else:
-            value = digest[:48]
-        current_lines.append(f"{key}={value}")
-        generated.append(key)
-    if generated:
-        project.managed_env_text = "\n".join(current_lines).strip() + "\n"
-    return generated
-
-
-def managed_mysql_image_for_source(source_path: str, project: Project | None = None) -> tuple[str, str]:
-    """Choose a managed MySQL line that matches the application's framework era."""
-    return _managed_mysql_image_for_source(source_path, project, PLATFORM_MYSQL_IMAGE)
-
 
 
 
