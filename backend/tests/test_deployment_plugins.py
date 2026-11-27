@@ -49,6 +49,10 @@ class DeploymentPluginTests(unittest.TestCase):
             release_directories("/data/projects", "project-one", "legacy", "v1"),
             ["/data/projects/project-one/v1", "/data/projects/legacy/v1"],
         )
+        self.assertEqual(
+            release_directories("/data/projects", "pod", "pod", "v1"),
+            ["/data/projects/pod/v1", "/data/projects/pod/v1"],
+        )
         self.assertEqual(data_compose_project("Yunzhou Main", "crm"), "yunzhou-main-crm-data")
 
     def test_compose_port_forms_round_trip(self):

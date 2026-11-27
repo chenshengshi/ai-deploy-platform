@@ -23,7 +23,10 @@ def release_directories(work_dir: str, project_directory_name: str, project_slug
     if not value:
         return []
     base = work_dir.rstrip("/")
-    return list(dict.fromkeys((
+    # Keep both slots even when the current and legacy names are identical.
+    # Callers that resolve a release unpack these as (current, legacy), while
+    # cleanup callers already deduplicate commands at the execution boundary.
+    return [
         f"{base}/{project_directory_name}/{value}",
         f"{base}/{project_slug}/{value}",
-    )))
+    ]
