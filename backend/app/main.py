@@ -9073,10 +9073,13 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
                 )
             failed_node = db.get(Node, failed.node_id)
             try:
-                diagnosis = deployment_followup(
-                    db, failed, target_project, failed_node,
-                    "失败诊断", (failed.log_text or "")[-16_000:],
-                )
+                # Keep chat answers identical to the deployment detail page.
+                # The public follow-up path applies deterministic, high-confidence
+                # rules (missing secrets, platform errors, SQL failures, etc.)
+                # before asking the model.  Calling the model directly here used
+                # to turn an exact ``AUTH_TOKEN_SECRET`` diagnosis into a generic
+                # "runtime issue" and could encourage a pointless retry.
+                diagnosis = deployment_ai_followup(failed.id, db, user)
             except Exception:
                 diagnosis = {
                     "summary": (failed.error or "平台没有记录明确错误").strip().splitlines()[0][:500],
