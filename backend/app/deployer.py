@@ -42,6 +42,12 @@ from .build_planning import (
 )
 from .database import SessionLocal
 from .deployment_logs import append_deployment_log
+from .deployment_integrations import (
+    effective_project_environment as _effective_project_environment,
+    environment_values as _environment_values,
+    external_integration_preflight as _external_integration_preflight,
+    store_managed_values as _store_managed_values,
+)
 from .deployment_build_repairs import apply_dockerfile_text_repairs
 from .deployment_architecture import (
     COMPOSE_NAMES,
@@ -2618,57 +2624,16 @@ def effective_project_environment(project: Project) -> str:
     user files used to put derived values first and silently expanded a valid
     external database configuration to empty strings.
     """
-    managed = (project.managed_env_text or "").strip()
-    user = (decrypt(project.env_text_encrypted) or "").strip()
-    user_values = environment_values(user)
-    managed_values = environment_values(managed)
-    values = {**managed_values, **user_values}
-    for service in ("MYSQL", "REDIS"):
-        if user_values.get(f"YUNZHOU_{service}_MODE", "managed").lower() != "external":
-            for key, value in managed_values.items():
-                if key.startswith(f"YUNZHOU_{service}_") and key != f"YUNZHOU_{service}_MODE":
-                    values[key] = value
-    priority = []
-    for service in ("MYSQL", "POSTGRES", "REDIS"):
-        priority.extend(
-            f"YUNZHOU_{service}_{suffix}"
-            for suffix in ("MODE", "HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD")
-        )
-    ordered = [key for key in priority if key in values]
-    ordered.extend(key for key in values if key not in ordered)
-    return "\n".join(f"{key}={values[key]}" for key in ordered)
+    return _effective_project_environment(project)
 
 
 def external_integration_preflight(project: Project, env_text: str) -> list[str]:
     """Validate saved external integrations before build or container startup."""
-    user_values = environment_values(decrypt(project.env_text_encrypted) or "")
-    effective = environment_values(env_text)
-    errors: list[str] = []
-    requirements = {
-        "MYSQL": ("HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD"),
-        "POSTGRES": ("HOST", "PORT", "DATABASE", "USERNAME", "PASSWORD"),
-        "REDIS": ("HOST", "PORT"),
-    }
-    for service, suffixes in requirements.items():
-        if user_values.get(f"YUNZHOU_{service}_MODE", "managed").lower() != "external":
-            continue
-        missing = [
-            f"YUNZHOU_{service}_{suffix}"
-            for suffix in suffixes
-            if not effective.get(f"YUNZHOU_{service}_{suffix}", "").strip()
-        ]
-        if missing:
-            errors.append(f"外接 {service} 已启用，但保存配置缺少：{'、'.join(missing)}")
-    return errors
+    return _external_integration_preflight(project, env_text)
 
 
 def environment_values(text: str | None) -> dict[str, str]:
-    values = {}
-    for line in (text or "").splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip()
-    return values
+    return _environment_values(text)
 
 
 def adapt_plan_to_current_integrations(plan: dict, project: Project) -> tuple[dict, list[str]]:
@@ -2781,25 +2746,7 @@ def adapt_plan_to_current_integrations(plan: dict, project: Project) -> tuple[di
 
 def store_managed_values(project: Project, values: dict[str, str]) -> list[str]:
     """Store platform-owned connection values in readable project configuration."""
-    lines = (project.managed_env_text or "").splitlines()
-    positions = {
-        line.split("=", 1)[0].strip(): index for index, line in enumerate(lines)
-        if "=" in line and not line.lstrip().startswith("#")
-    }
-    added = []
-    for key, value in values.items():
-        rendered = f"{key}={value}"
-        if key in positions:
-            if lines[positions[key]] != rendered:
-                lines[positions[key]] = rendered
-                added.append(key)
-        else:
-            lines.append(rendered)
-            positions[key] = len(lines) - 1
-            added.append(key)
-    if added:
-        project.managed_env_text = "\n".join(lines).strip() + "\n"
-    return added
+    return _store_managed_values(project, values)
 
 
 def apply_ai_inferred_config(project: Project, plan: dict) -> list[dict]:
