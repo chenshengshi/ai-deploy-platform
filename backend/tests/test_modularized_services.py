@@ -12,7 +12,6 @@ from app.build_planning import (
 from app.config import settings
 from app.deployer import (
     _compose_service_mapping,
-    _legacy_analyze_repository_topology,
     _public_path_from_value as deployer_public_path_from_value,
     analyze_repository_topology,
 )
@@ -138,26 +137,6 @@ class BuildPlanningModuleTests(unittest.TestCase):
             )
             topology = analyze_repository_topology(directory, "dockerfile", "Dockerfile")
             self.assertTrue(topology["errors"])
-
-    def test_extracted_analyzer_matches_previous_result(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "frontend").mkdir()
-            (root / "backend").mkdir()
-            (root / "frontend" / "package.json").write_text(
-                '{"dependencies":{"react":"19"}}', encoding="utf-8"
-            )
-            (root / "backend" / "requirements.txt").write_text("fastapi", encoding="utf-8")
-            (root / "Dockerfile").write_text(
-                "FROM node:22 AS web\nCOPY frontend/package.json ./\nRUN npm run build\n"
-                "FROM python:3.12\nCOPY backend/ ./\n"
-                "COPY --from=web /app/dist /app/frontend/dist\n"
-                'CMD ["python", "-m", "server"]\n',
-                encoding="utf-8",
-            )
-            extracted = analyze_repository_topology(directory, "dockerfile", "Dockerfile")
-            previous = _legacy_analyze_repository_topology(directory, "dockerfile", "Dockerfile")
-            self.assertEqual(extracted, previous)
 
     def test_compose_service_mapping_accepts_compose_document(self):
         services = {"web": {"image": "nginx"}}

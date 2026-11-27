@@ -89,6 +89,20 @@ class DeploymentArchitectureTests(unittest.TestCase):
             self.assertIn("Redis", result["required"])
             self.assertIn("MySQL", result["candidates"])
 
+    def test_compose_service_promotes_declared_library_to_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text(
+                '{"dependencies":{"redis":"5"}}', encoding="utf-8"
+            )
+            (root / "compose.yaml").write_text(
+                "services:\n  redis:\n    image: redis:7-alpine\n",
+                encoding="utf-8",
+            )
+            result = analyze_runtime_dependencies(directory)
+            self.assertIn("Redis", result["required"])
+            self.assertNotIn("Redis", result["candidates"])
+
     def test_compose_discovery_prefers_repository_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

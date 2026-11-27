@@ -9,6 +9,7 @@ testable and prevents a project-specific build repair from changing discovery.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from .deployment_topology_handlers import TopologyContext, handler_for
@@ -27,6 +28,25 @@ COMPOSE_NAMES = (
 IGNORED_SOURCE_PARTS = {
     ".git", "node_modules", "target", "dist", "build", "vendor", ".venv"
 }
+
+
+@dataclass(frozen=True)
+class DependencyRule:
+    name: str
+    active_markers: tuple[str, ...]
+    library_markers: tuple[str, ...]
+
+
+DEPENDENCY_RULES = (
+    DependencyRule("MySQL", ("jdbc:mysql", "mysql://"), ("mysql-connector", "pymysql", "mysql2")),
+    DependencyRule("PostgreSQL", ("jdbc:postgresql", "postgresql://", "postgres://"), ("postgresql", "psycopg", "pg")),
+    DependencyRule("Redis", ("spring.redis", "spring:\n  redis", "redis://", "redis_host", "redis.host"), ("starter-data-redis", "sa-token-dao-redis", "ioredis", '"redis"')),
+    DependencyRule("RabbitMQ", ("spring.rabbitmq", "amqp://", "rabbitmq_host"), ("starter-amqp", "rabbitmq")),
+    DependencyRule("Elasticsearch", ("spring.elasticsearch", "elasticsearch.uris", "elasticsearch_host"), ("elasticsearch",)),
+    DependencyRule("MinIO", ("minio.endpoint", "minio:\n", "minio_endpoint"), ("<artifactid>minio", '"minio"')),
+    DependencyRule("MongoDB", ("spring.data.mongodb", "mongodb://"), ("starter-data-mongodb", "mongodb")),
+    DependencyRule("Kafka", ("spring.kafka", "kafka.bootstrap", "kafka_brokers"), ("spring-kafka", "kafkajs")),
+)
 
 
 def has_project_marker(path: Path) -> bool:
@@ -114,27 +134,17 @@ def analyze_runtime_dependencies(path: str) -> dict:
                 manifest_text += "\n" + file.read_text(errors="ignore").lower()
         except OSError:
             continue
-    checks = {
-        "MySQL": (("jdbc:mysql", "mysql://"), ("mysql-connector", "pymysql", "mysql2")),
-        "PostgreSQL": (("jdbc:postgresql", "postgresql://", "postgres://"), ("postgresql", "psycopg", "pg")),
-        "Redis": (("spring.redis", "spring:\n  redis", "redis://", "redis_host", "redis.host"), ("starter-data-redis", "sa-token-dao-redis", "ioredis", '"redis"')),
-        "RabbitMQ": (("spring.rabbitmq", "amqp://", "rabbitmq_host"), ("starter-amqp", "rabbitmq")),
-        "Elasticsearch": (("spring.elasticsearch", "elasticsearch.uris", "elasticsearch_host"), ("elasticsearch",)),
-        "MinIO": (("minio.endpoint", "minio:\n", "minio_endpoint"), ("<artifactid>minio", '"minio"')),
-        "MongoDB": (("spring.data.mongodb", "mongodb://"), ("starter-data-mongodb", "mongodb")),
-        "Kafka": (("spring.kafka", "kafka.bootstrap", "kafka_brokers"), ("spring-kafka", "kafkajs")),
-    }
     required: list[str] = []
     candidates: list[str] = []
-    for name, (active_markers, library_markers) in checks.items():
-        if any(marker in config_text for marker in active_markers):
-            required.append(name)
-        elif any(marker in manifest_text for marker in library_markers):
-            candidates.append(name)
+    for rule in DEPENDENCY_RULES:
+        if any(marker in config_text for marker in rule.active_markers):
+            required.append(rule.name)
+        elif any(marker in manifest_text for marker in rule.library_markers):
+            candidates.append(rule.name)
     compose = find_compose(root)
     if compose:
         text = compose.read_text(errors="ignore").lower()
-        compose_services = [name for name in checks if name.lower() in text]
+        compose_services = [rule.name for rule in DEPENDENCY_RULES if rule.name.lower() in text]
         required = sorted(set(required + compose_services))
         candidates = [name for name in candidates if name not in required]
     return {
