@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from git import Repo
@@ -45,6 +46,7 @@ from .deployment_logs import append_deployment_log, read_deployment_log
 from .deployment.verification import frontend_code_warning, has_fatal_startup_error, http_status_accepted, required_route_accepted
 from .deployment.source_paths import discover_source_root, git_source_location
 from .deployment.source_cache import source_cache_guard, source_cache_lock
+from .deployment.naming import compose_project_name, deployment_compose_project_name, service_container_name as _service_container_name
 from .deployment_integrations import (
     effective_project_environment as _effective_project_environment,
     environment_values as _environment_values,
@@ -418,7 +420,7 @@ def _write_deployment_log(deployment_id: str, text: str) -> None:
 def log_stage(deployment_id: str, action: str, stage: str, detail: str = "") -> None:
     """Persist a readable boundary and a machine-readable UTC timestamp."""
     suffix = f" | {detail}" if detail else ""
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
     log(
         deployment_id,
         f"[阶段{action}] {stage}{suffix}\n"
@@ -4063,43 +4065,6 @@ def node_platform(node: Node) -> str:
         raise RuntimeError("无法识别目标服务器 CPU 架构：" + output)
     machine = output.strip().lower()
     return "linux/arm64" if machine in {"aarch64", "arm64"} else "linux/amd64"
-
-
-def compose_project_name(
-    project_slug: str, release: str | None = None, namespace: str = "yunzhou",
-) -> str:
-    """Return a release-isolated Compose project name.
-
-    Historical releases used ``yz-<slug>``. The fallback keeps those records
-    startable while every new release receives a separate ownership boundary.
-    """
-    safe_slug = re.sub(r"[^a-z0-9-]", "-", str(project_slug).lower()).strip("-") or "project"
-    safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
-    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(namespace).lower()).strip("-") or "yunzhou"
-    return f"{safe_namespace}-{safe_slug}-{safe_release}" if safe_release else f"{safe_namespace}-{safe_slug}"
-
-
-def deployment_compose_project_name(deployment: Deployment, project: Project, namespace: str = "yunzhou") -> str:
-    """Recover the immutable Compose project even if the global namespace later changes."""
-    release = str(deployment.release or "")
-    marker = f"-{project.slug}-{release}"
-    recorded = str(deployment.container_name or "")
-    if release and marker in recorded:
-        prefix = recorded.split(marker, 1)[0]
-        if prefix:
-            return compose_project_name(project.slug, release, prefix)
-    return compose_project_name(project.slug, release, namespace)
-
-
-def _service_container_name(
-    project_slug: str, service_name: str, sequence: int = 1,
-    release: str | None = None, namespace: str = "yunzhou",
-) -> str:
-    safe_service = re.sub(r"[^a-z0-9-]", "-", str(service_name).lower()).strip("-") or "app"
-    safe_namespace = re.sub(r"[^a-z0-9-]", "-", str(namespace).lower()).strip("-") or "yunzhou"
-    safe_release = re.sub(r"[^a-z0-9-]", "-", str(release or "").lower()).strip("-")
-    version = f"-{safe_release}" if safe_release else ""
-    return f"{safe_namespace}-{project_slug}{version}-{safe_service}-{max(1, int(sequence))}"
 
 
 def _reserve_reactivation_port(db, deployment: Deployment, node: Node, service: str, port: int) -> None:
