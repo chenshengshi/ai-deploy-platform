@@ -41,6 +41,14 @@ from .build_planning import (
     valid_generated_dockerfile,
 )
 from .database import SessionLocal
+from .deployment_architecture import (
+    COMPOSE_NAMES,
+    analyze_repository_topology,
+    analyze_runtime_dependencies,
+    find_compose as _find_compose,
+    fullstack_roots as _fullstack_roots,
+    has_project_marker as _has_project_marker,
+)
 from .models import AiConfig, DeployStatus, Deployment, DeploymentPortReservation, DeploymentSettings, GitCredential, Node, Project, ProjectDomainConfig, ProjectReplica, SourceType
 from .proxy import get_proxy_config, proxy_with_auth
 from .source_inspection import (
@@ -56,10 +64,6 @@ from .source_inspection import (
 from .ssh import SSHNode
 
 
-COMPOSE_NAMES = (
-    "compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml",
-    ".yunzhou.compose.yml", ".yunzhou.ai.compose.yml",
-)
 ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 DOCKER_HUB_MIRROR_HOSTS = {
     "docker.m.daocloud.io", "docker.anyhub.us.kg", "dockerhub.jobcher.com",
@@ -440,55 +444,6 @@ def git_source_location(raw_url: str, configured_branch: str | None = None) -> t
     clone_query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key not in {"path", "version", "_a"}]
     clone_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clone_query), ""))
     return clone_url, branch, source_path
-
-
-def _has_project_marker(path: Path) -> bool:
-    names = {"package.json", "pom.xml", "pyproject.toml", "requirements.txt", "index.html", "Dockerfile", *COMPOSE_NAMES}
-    return any((path / name).is_file() for name in names)
-
-
-def _fullstack_roots(root: Path) -> tuple[list[Path], list[Path]]:
-    ignored = {".git", "node_modules", "target", "dist", "build", "vendor"}
-    frontends, backends = [], []
-    for manifest in root.rglob("package.json"):
-        if any(part in ignored for part in manifest.relative_to(root).parts):
-            continue
-        folder = manifest.parent
-        text = manifest.read_text(errors="ignore").lower()
-        frontend_markers = (
-            '"vite"', '"react"', '"vue"', '"@vue/cli-service"',
-            '"@angular/core"', '"svelte"', '"next"', '"nuxt"',
-        )
-        config_markers = (
-            "vite.config.ts", "vite.config.js", "vue.config.js",
-            "angular.json", "svelte.config.js", "next.config.js", "nuxt.config.ts",
-        )
-        if any(marker in text for marker in frontend_markers) or any((folder / name).exists() for name in config_markers):
-            frontends.append(folder)
-    for manifest in root.rglob("pom.xml"):
-        if not any(part in ignored for part in manifest.relative_to(root).parts):
-            backends.append(manifest.parent)
-    return frontends, backends
-
-
-def _find_compose(root: Path) -> Path | None:
-    """Find a topology file without requiring it to live at repository root."""
-    direct = [root / name for name in COMPOSE_NAMES if (root / name).is_file()]
-    if direct:
-        return direct[0]
-    ignored = {".git", "node_modules", "target", "dist", "build", "vendor"}
-    candidates = []
-    for name in COMPOSE_NAMES:
-        for path in root.rglob(name):
-            relative = path.relative_to(root)
-            if len(relative.parts) <= 4 and not any(part in ignored for part in relative.parts):
-                candidates.append(path)
-    if not candidates:
-        return None
-    def rank(path: Path):
-        relative = path.relative_to(root).as_posix().lower()
-        return (0 if relative.startswith("deploy/") else 1, 1 if "prod" in relative else 0, len(path.parts), relative)
-    return sorted(set(candidates), key=rank)[0]
 
 
 def discover_source_root(repo_root: Path, requested_path: str = "") -> tuple[Path, str]:
@@ -3328,7 +3283,7 @@ def reconcile_managed_integrations(project: Project, compose_path: str, compose_
     return list(dict.fromkeys(changes))
 
 
-def analyze_runtime_dependencies(path: str) -> dict:
+def _legacy_analyze_runtime_dependencies(path: str) -> dict:
     """Classify active configuration separately from libraries merely present in source."""
     root = Path(path)
     config_text = ""
@@ -3374,7 +3329,7 @@ def analyze_runtime_dependencies(path: str) -> dict:
     }
 
 
-def analyze_repository_topology(path: str, build_type: str, build_file: str) -> dict:
+def _legacy_analyze_repository_topology(path: str, build_type: str, build_file: str) -> dict:
     """Build and validate a whole-repository plan before any remote mutation."""
     root = Path(path).resolve()
     ignored = {".git", "node_modules", "target", "dist", "build", "vendor", ".venv"}
