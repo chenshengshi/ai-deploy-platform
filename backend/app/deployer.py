@@ -49,6 +49,7 @@ from .deployment.naming import compose_project_name, deployment_compose_project_
 from .deployment.process_control import stop_tracked_process_groups
 from .deployment.compose_runtime import compose_file_args, remote_compose_files
 from .deployment.image_restore import restore_release_images
+from .deployment.image_cleanup import cleanup_incomplete_release_images, cleanup_old_project_images
 from .deployment.release_runtime import start_deployment, stop_deployment
 from .deployment.release_cleanup import delete_deployment_resources
 from .deployment.source_repair import apply_safe_build_repairs
@@ -61,6 +62,15 @@ from .deployment.compose_plan import (
     prepare_compose_image_override,
 )
 from .deployment.integration_reconcile import reconcile_managed_integrations
+from .deployment.source_staging import stage_source
+from .deployment.build_context import (
+    ensure_context_ignore,
+    ensure_generated_copy_inputs,
+    prepare_runtime_bundle,
+    snapshot_deployment_files,
+    source_manifests,
+    validate_runtime_only_dockerfiles,
+)
 from .deployment.ai_plan import (
     _complete_source_compose,
     canonical_docker_image,
@@ -388,208 +398,6 @@ def log_stage(deployment_id: str, action: str, stage: str, detail: str = "") -> 
     )
 
 
-def stage_source(project: Project, db, workspace_key: str | None = None) -> tuple[str, str, str | None, str]:
-    builder_root = Path(settings.build_data_root) / "builder"
-    workspace_root = builder_root / "projects" / project.slug
-    workspace_root.mkdir(parents=True, exist_ok=True)
-    run_root = workspace_root / "runs"
-    run_root.mkdir(parents=True, exist_ok=True)
-    safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", workspace_key or "analysis")[:64]
-    temp = tempfile.mkdtemp(prefix=f"{safe_key}-", dir=run_root)
-    if project.source_type == SourceType.upload:
-        if not project.source_path or not Path(project.source_path).exists():
-            raise RuntimeError("项目还没有上传源码")
-        shutil.copytree(project.source_path, temp, dirs_exist_ok=True)
-        return temp, "upload", temp, ""
-
-    repositories = list(getattr(project, "git_repositories", None) or [])
-    if repositories:
-        revisions: list[str] = []
-        used_targets: set[str] = set()
-        staged_repositories: dict[tuple[str, str, str], tuple[str, str, str | None]] = {}
-        cleanup_roots: set[str] = set()
-        try:
-            for index, row in enumerate(repositories, start=1):
-                raw_url = str(row.get("git_url") or "").strip()
-                if not raw_url:
-                    raise RuntimeError(f"第 {index} 个 Git 仓库地址为空")
-                role = str(row.get("role") or "other").strip().lower()
-                requested_target = str(row.get("target_dir") or role or f"source-{index}").strip()
-                target_dir = re.sub(r"[^a-zA-Z0-9_.-]+", "-", requested_target).strip(".-")
-                if not target_dir:
-                    target_dir = f"source-{index}"
-                if target_dir in used_targets:
-                    target_dir = f"{target_dir}-{index}"
-                used_targets.add(target_dir)
-
-                base_url, branch, requested_path = git_source_location(
-                    raw_url, str(row.get("git_branch") or "main").strip() or "main",
-                )
-                credential_id = str(row.get("credential_id") or project.git_credential_id or "")
-                cache_key = (base_url, branch, credential_id)
-                staged = staged_repositories.get(cache_key)
-                if staged is None:
-                    repository_key = hashlib.sha1("\0".join(cache_key).encode()).hexdigest()[:12]
-                    child = SimpleNamespace(
-                        id=f"{project.id}-{repository_key}",
-                        slug=f"{project.slug}-repo-{repository_key}",
-                        source_type=SourceType.git,
-                        source_path=None,
-                        git_url=base_url,
-                        git_branch=branch,
-                        git_credential_id=credential_id or None,
-                        strict_source_path=False,
-                    )
-                    source_root, revision, child_root, _ = stage_source(
-                        child, db, workspace_key=f"{safe_key}-repo-{repository_key}",
-                    )
-                    staged = (source_root, revision, child_root)
-                    staged_repositories[cache_key] = staged
-                    if child_root:
-                        cleanup_roots.add(child_root)
-
-                source_root, revision, child_root = staged
-                selected_root = Path(source_root)
-                if requested_path:
-                    selected_root = (Path(child_root or source_root) / requested_path).resolve()
-                    try:
-                        selected_root.relative_to(Path(child_root or source_root).resolve())
-                    except ValueError as exc:
-                        raise RuntimeError(f"第 {index} 个 Git 项目子目录不安全") from exc
-                    if not selected_root.is_dir() or not _has_project_marker(selected_root):
-                        raise RuntimeError(f"第 {index} 个 Git 仓库中不存在可构建目录 /{requested_path}")
-                shutil.copytree(selected_root, Path(temp) / target_dir, dirs_exist_ok=True)
-                revisions.append(f"{target_dir}:{revision}")
-        finally:
-            for child_root in cleanup_roots:
-                shutil.rmtree(child_root, ignore_errors=True)
-        (Path(temp) / ".yunzhou-sources.json").write_text(
-            json.dumps(repositories, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
-        return temp, ",".join(revisions), temp, ""
-
-    if not project.git_url:
-        raise RuntimeError("Git 地址为空")
-    url, branch, requested_path = git_source_location(project.git_url, project.git_branch)
-    safe_url = url
-    env = None
-    credential = db.get(GitCredential, project.git_credential_id) if project.git_credential_id else None
-    if credential:
-        secret = decrypt(credential.secret_encrypted) or ""
-        if credential.auth_type in ("token", "password") and url.startswith(("http://", "https://")):
-            parts = urlsplit(url)
-            username = quote(credential.username or "oauth2", safe="")
-            auth = f"{username}:{quote(secret, safe='')}@{parts.netloc}"
-            url = urlunsplit((parts.scheme, auth, parts.path, parts.query, parts.fragment))
-        elif credential.auth_type == "ssh_key":
-            key_path = Path(temp).parent / f"key-{project.id}"
-            key_path.write_text(secret)
-            key_path.chmod(0o600)
-            env = {"GIT_SSH_COMMAND": f"ssh -i {key_path} -o StrictHostKeyChecking=no"}
-    proxy_config = get_proxy_config(db)
-    proxy_env = {}
-    if proxy_config and proxy_config.enabled:
-        proxy_password = decrypt(proxy_config.proxy_password_encrypted) if proxy_config.proxy_password_encrypted else ""
-        http_proxy = proxy_with_auth(
-            proxy_config.http_proxy or proxy_config.https_proxy,
-            proxy_config.proxy_username or "",
-            proxy_password or "",
-        )
-        https_proxy = proxy_with_auth(
-            proxy_config.https_proxy or proxy_config.http_proxy,
-            proxy_config.proxy_username or "",
-            proxy_password or "",
-        )
-        proxy_env = {
-            "HTTP_PROXY": http_proxy,
-            "HTTPS_PROXY": https_proxy,
-            "NO_PROXY": proxy_config.no_proxy,
-            "http_proxy": http_proxy,
-            "https_proxy": https_proxy,
-            "no_proxy": proxy_config.no_proxy,
-        }
-    old_env = {}
-    import os
-    for key, value in proxy_env.items():
-        old_env[key] = os.environ.get(key)
-        if value:
-            os.environ[key] = value
-    if env:
-        old_env["GIT_SSH_COMMAND"] = os.environ.get("GIT_SSH_COMMAND")
-        os.environ.update(env)
-    key_path = locals().get("key_path")
-    try:
-        with source_cache_guard(project.id, workspace_root):
-            # Keep one shallow persistent project workspace. Verified AI
-            # repairs are committed to WORKSPACE_BRANCH; fresh remote changes
-            # are rebased underneath those commits before each build.
-            checkout = workspace_root / "source-cache"
-            shallow_marker = checkout / ".git" / "shallow"
-            if checkout.exists() and not shallow_marker.exists():
-                shutil.rmtree(checkout, ignore_errors=True)
-            if not (checkout / ".git").exists():
-                shutil.rmtree(checkout, ignore_errors=True)
-                repo = Repo.clone_from(
-                    url, str(checkout), branch=branch or None, depth=1, single_branch=True,
-                )
-                fetch_branch = branch or repo.active_branch.name
-                repo.git.config("yunzhou.remoteBranch", fetch_branch)
-                repo.git.checkout("-B", WORKSPACE_BRANCH)
-                repo.remote("origin").set_url(safe_url)
-            else:
-                repo = Repo(str(checkout))
-                origin = repo.remote("origin")
-                origin.set_url(url)
-                try:
-                    try:
-                        saved_branch = repo.git.config("--get", "yunzhou.remoteBranch").strip()
-                    except Exception:
-                        saved_branch = ""
-                    current_branch = repo.active_branch.name
-                    fetch_branch = branch or saved_branch or (current_branch if current_branch != WORKSPACE_BRANCH else "main")
-                    repo.git.config("yunzhou.remoteBranch", fetch_branch)
-                    origin.fetch(
-                        refspec=f"+refs/heads/{fetch_branch}:refs/remotes/origin/{fetch_branch}",
-                        depth=50,
-                        prune=True,
-                    )
-                    if WORKSPACE_BRANCH in {head.name for head in repo.heads}:
-                        repo.git.checkout(WORKSPACE_BRANCH)
-                        try:
-                            repo.git.rebase(f"origin/{fetch_branch}")
-                        except Exception as exc:
-                            repo.git.rebase("--abort")
-                            raise RuntimeError(
-                                "远端新代码与平台 AI 修复提交发生冲突；工作区已保持原状，等待 AI 合并冲突"
-                            ) from exc
-                    else:
-                        repo.git.checkout("-B", WORKSPACE_BRANCH, f"origin/{fetch_branch}")
-                    repo.git.clean("-fdx")
-                finally:
-                    origin.set_url(safe_url)
-            revision = repo.head.commit.hexsha[:12]
-            run_repo = Repo.clone_from(str(checkout), temp, shared=True, no_hardlinks=True)
-            run_repo.git.checkout("--detach", revision)
-    finally:
-        for key, value in old_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        if key_path:
-            Path(key_path).unlink(missing_ok=True)
-    if requested_path and getattr(project, "strict_source_path", False):
-        source_root = (Path(temp) / requested_path).resolve()
-        try:
-            source_root.relative_to(Path(temp).resolve())
-        except ValueError as exc:
-            raise RuntimeError("Git 项目子目录不安全") from exc
-        if not source_root.is_dir() or not _has_project_marker(source_root):
-            raise RuntimeError(f"Git 仓库中不存在可构建的项目目录 /{requested_path}")
-        source_path = requested_path
-    else:
-        source_root, source_path = discover_source_root(Path(temp), requested_path)
-    return str(source_root), revision, temp, source_path
 
 
 def detect_build(path: str, requested: str) -> tuple[str, str | None]:
@@ -1447,162 +1255,6 @@ def node_platform(node: Node) -> str:
 
 
 
-def prepare_runtime_bundle(
-    work: str, build_type: str, build_file: str, compose_override: str | None,
-    extra_files: list[str] | None = None,
-) -> str:
-    bundle = Path(tempfile.mkdtemp(prefix="yunzhou-runtime-"))
-    if build_type != "compose":
-        return str(bundle)
-    root = Path(work).resolve()
-    compose_path = (root / build_file).resolve()
-    compose_base = compose_path.parent
-
-    def copy_runtime_path(value: str, base: Path = compose_base) -> None:
-        raw = str(value or "").strip()
-        if not raw or raw.startswith("/"):
-            return
-        source = (base / raw).resolve()
-        try:
-            relative = source.relative_to(root)
-        except ValueError:
-            return
-        if not source.exists():
-            return
-        target = bundle / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, target, dirs_exist_ok=True)
-        else:
-            shutil.copy2(source, target)
-
-    copy_runtime_path(build_file, root)
-    if compose_override:
-        copy_runtime_path(compose_override, root)
-    for extra_file in extra_files or []:
-        copy_runtime_path(extra_file, root)
-    document = yaml.safe_load(compose_path.read_text(encoding="utf-8", errors="ignore")) or {}
-    for service in (document.get("services") or {}).values():
-        if not isinstance(service, dict):
-            continue
-        env_files = service.get("env_file") or []
-        if isinstance(env_files, (str, dict)):
-            env_files = [env_files]
-        for entry in env_files:
-            copy_runtime_path(entry.get("path") if isinstance(entry, dict) else entry)
-        for volume in service.get("volumes") or []:
-            source = volume.get("source") if isinstance(volume, dict) else str(volume).split(":", 1)[0]
-            if source and (str(source).startswith(".") or "/" in str(source)):
-                copy_runtime_path(str(source))
-    for section in ("configs", "secrets"):
-        for config in (document.get(section) or {}).values():
-            if isinstance(config, dict) and config.get("file"):
-                copy_runtime_path(str(config["file"]))
-    return str(bundle)
-
-
-def validate_runtime_only_dockerfiles(work: str, build_file: str, compose_override: str | None = None) -> None:
-    """Ensure image packaging cannot compile source a second time.
-
-    Runtime-labelled Dockerfiles must never compile source. Complete generated
-    compatibility builds remain valid for applications whose frontend and
-    backend cannot be separated into independent runtime images safely.
-    """
-    root = Path(work)
-    services: dict[str, dict] = {}
-    for compose_name in (build_file, compose_override):
-        if not compose_name:
-            continue
-        compose_path = root / compose_name
-        if not compose_path.is_file():
-            continue
-        try:
-            document = yaml.safe_load(compose_path.read_text(encoding="utf-8", errors="ignore")) or {}
-        except Exception:
-            continue
-        for name, service in (document.get("services") or {}).items():
-            if isinstance(service, dict) and service.get("build"):
-                services[str(name)] = service
-
-    compile_pattern = re.compile(
-        r"(?im)^\s*RUN\s+.*(?:"
-        r"\bmvn\b.*\b(?:package|install)\b|\bgradle\w*\b.*\b(?:build|bootJar)\b|"
-        r"\b(?:npm|pnpm|yarn)\b.*\b(?:run\s+)?build\b|\bgo\s+build\b|\bdotnet\s+publish\b"
-        r")"
-    )
-    problems: list[str] = []
-    for service_name, service in services.items():
-        build = service.get("build")
-        build = {"context": build} if isinstance(build, str) else dict(build or {})
-        context = (root / str(build.get("context") or ".")).resolve()
-        dockerfile = context / str(build.get("dockerfile") or "Dockerfile")
-        if not dockerfile.is_file():
-            problems.append(f"{service_name}：找不到 {dockerfile.name}")
-            continue
-        content = dockerfile.read_text(encoding="utf-8", errors="ignore")
-        # A generated ``*.runtime.Dockerfile`` is a hard runtime-only
-        # contract.  ``.yunzhou.ai.Dockerfile`` can still be a complete
-        # compatibility build for a single-container application (for
-        # example Python API + compiled React UI).  Rejecting that fallback
-        # leaves otherwise valid projects undeployable when their artifacts
-        # cannot be split safely; allow it to build once instead of failing
-        # before Docker starts.
-        runtime_contract = dockerfile.name.endswith(".runtime.Dockerfile")
-        if runtime_contract and compile_pattern.search(content):
-            problems.append(f"{service_name}：{dockerfile.name} 仍包含源码编译命令")
-    if problems:
-        raise RuntimeError(
-            "平台生成的运行镜像配置校验失败；镜像封装不得重复构建源码：" + "；".join(problems)
-        )
-
-
-def snapshot_deployment_files(deployment_id: str, work: str, build_file: str) -> None:
-    """Persist a small, redacted copy of the files that define one release."""
-    root = Path(work)
-    destination = Path(settings.upload_root) / "deployment-files" / deployment_id
-    shutil.rmtree(destination, ignore_errors=True)
-    destination.mkdir(parents=True, exist_ok=True)
-    candidates = []
-    for path in root.rglob("*"):
-        if not path.is_file() or ".git" in path.parts or "node_modules" in path.parts:
-            continue
-        relative = path.relative_to(root)
-        name = path.name
-        if not (
-            name.startswith("Dockerfile") or name.endswith(".Dockerfile")
-            or name in {"compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml", ".env", "nginx.conf", "default.conf"}
-            or (name.startswith(".yunzhou") and path.suffix in {".yml", ".yaml"})
-        ):
-            continue
-        try:
-            if path.stat().st_size > 300_000:
-                continue
-        except OSError:
-            continue
-        candidates.append((relative, path))
-        if len(candidates) >= 40:
-            break
-    secret_pattern = re.compile(r"(password|secret|token|credential|private[_-]?key)", re.I)
-    manifest = []
-    for relative, source in candidates:
-        raw = source.read_bytes()
-        text_value = raw.decode("utf-8", "replace")
-        safe_lines = []
-        for line in text_value.splitlines():
-            env_match = re.match(r"^(\s*(?:[-]\s*)?(?:ENV\s+|ARG\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)(.*)$", line, re.I)
-            if env_match and secret_pattern.search(env_match.group(2)):
-                safe_lines.append(env_match.group(1) + "******")
-            else:
-                safe_lines.append(line)
-        output = destination / relative
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text("\n".join(safe_lines), encoding="utf-8")
-        manifest.append({
-            "path": relative.as_posix(),
-            "used": relative.as_posix() == build_file,
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        })
-    (destination / "manifest.json").write_text(json.dumps({"build_file": build_file, "files": manifest}, ensure_ascii=False), encoding="utf-8")
 
 
 def _compose_service_mapping(document) -> dict:
@@ -1802,109 +1454,15 @@ def central_build_and_distribute(
         source_root = Path(work)
         ignored_parts = {".git", "node_modules", "target", "dist", "build", ".gradle", ".venv"}
 
-        def ensure_context_ignore(context: Path) -> None:
-            """Keep dependency/cache trees out of classic Docker contexts."""
-            ignore_file = context / ".dockerignore"
-            existing = ignore_file.read_text(encoding="utf-8", errors="ignore") if ignore_file.is_file() else ""
-            required = (
-                ".git", "**/.git", "node_modules", "**/node_modules",
-                ".pnpm-store", "**/.pnpm-store", ".agents", "**/.agents",
-                "dist", "**/dist", "build", "**/build",
-            )
-            lines = existing.splitlines()
-            changed = False
-            for pattern in required:
-                if pattern not in lines:
-                    lines.append(pattern)
-                    changed = True
-            if changed or not ignore_file.is_file():
-                ignore_file.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
-        def ensure_generated_copy_inputs(context: Path, dockerfile: Path) -> list[str]:
-            """Make generated COPY inputs authoritative over repo ignores.
-
-            Source repositories legitimately exclude generated assets such as
-            ``/web/`` from their own production Docker context.  When source
-            analysis creates a new multi-stage Dockerfile that explicitly
-            builds that directory, retaining the old ignore rule makes Docker
-            report the files as missing.  Append narrow negations only for
-            real top-level inputs referenced by the generated file.
-            """
-            if not dockerfile.is_file():
-                return []
-            docker_text = dockerfile.read_text(encoding="utf-8", errors="ignore")
-            collapsed = re.sub(r"\\\s*\r?\n\s*", " ", docker_text)
-            required_roots: set[str] = set()
-            explicit_generated_inputs: set[str] = set()
-            for match in re.finditer(r"(?im)^\s*(?:COPY|ADD)\s+(.+)$", collapsed):
-                instruction = match.group(1).strip()
-                try:
-                    values = json.loads(instruction) if instruction.startswith("[") else shlex.split(instruction)
-                except (ValueError, json.JSONDecodeError):
-                    continue
-                if not isinstance(values, list):
-                    continue
-                values = [str(value) for value in values]
-                if any(value == "--from" or value.startswith("--from=") for value in values):
-                    continue
-                while values and values[0].startswith("--"):
-                    values.pop(0)
-                for source in values[:-1]:
-                    normalized = source.strip("/.")
-                    if not normalized or any(token in normalized for token in ("$", "*", "?", "[")):
-                        continue
-                    top = normalized.replace("\\", "/").split("/", 1)[0]
-                    if top and (context / top).exists():
-                        required_roots.add(top)
-                        normalized_path = normalized.replace("\\", "/").rstrip("/")
-                        if any(part in {"dist", "build", "out"} for part in normalized_path.split("/")):
-                            explicit_generated_inputs.add(normalized_path)
-            if not required_roots:
-                return []
-            ignore_file = context / ".dockerignore"
-            existing = ignore_file.read_text(encoding="utf-8", errors="ignore") if ignore_file.is_file() else ""
-            lines = existing.splitlines()
-            added: list[str] = []
-            for top in sorted(required_roots):
-                for pattern in (f"!{top}", f"!{top}/", f"!{top}/**"):
-                    if pattern not in lines:
-                        lines.append(pattern)
-                        added.append(pattern)
-                # A broad source-root negation must not re-include generated
-                # dependencies or previous build output.  Those directories
-                # can make atomic build scripts fail on OverlayFS (EXDEV) and
-                # also bloat or contaminate the Docker context.
-                for generated in ("node_modules", ".pnpm-store", "dist", "build"):
-                    pattern = f"{top}/{generated}"
-                    # Docker ignore rules are order-sensitive.  Append even
-                    # when the repository already contains the same pattern:
-                    # the preceding ``!top/**`` would otherwise re-include it.
-                    lines.append(pattern)
-                    added.append(pattern)
-            # Runtime-only Dockerfiles explicitly COPY a completed dist/build
-            # directory. Re-include that exact artifact after the broad
-            # dependency/output exclusions above. Multi-stage Dockerfiles
-            # that merely COPY the source root still keep stale artifacts out.
-            for artifact in sorted(explicit_generated_inputs):
-                for pattern in (f"!{artifact}", f"!{artifact}/", f"!{artifact}/**"):
-                    lines.append(pattern)
-                    added.append(pattern)
-            if added:
-                ignore_file.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-            return added
 
         ensure_context_ignore(source_root)
         node_built_contexts: set[str] = set()
         maven_built_contexts: set[str] = set()
         persistent_dependency_root = Path(builder_root) / "projects" / project.slug / "dependencies"
 
-        def source_manifests(name: str) -> list[Path]:
-            return sorted(
-                path for path in source_root.rglob(name)
-                if path.is_file() and not any(part in ignored_parts for part in path.relative_to(source_root).parts)
-            )
 
-        node_manifests = source_manifests("package.json")
+        node_manifests = source_manifests(source_root, "package.json", ignored_parts)
         generated_dockerfiles = [
             path for path in source_root.rglob(".yunzhou*.Dockerfile") if path.is_file()
         ]
@@ -1962,7 +1520,7 @@ def central_build_and_distribute(
             len(re.findall(r"(?im)^\s*FROM\s+", path.read_text(encoding="utf-8", errors="ignore"))) > 1
             for path in generated_dockerfiles
         )
-        pom_files = source_manifests("pom.xml")
+        pom_files = source_manifests(source_root, "pom.xml", ignored_parts)
         reactor_poms = [
             pom for pom in pom_files
             if not any(parent / "pom.xml" in pom_files for parent in pom.parents if parent != pom.parent)
@@ -2477,7 +2035,11 @@ def central_build_and_distribute(
                 maven_executor.shutdown(wait=True)
             log(deployment.id, "[并发构建] 前端 Web 与后端 API 已全部完成，继续处理尚未封装的服务。\n")
 
-        gradle_roots = sorted({path.parent for name in ("settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts") for path in source_manifests(name)})
+        gradle_roots = sorted({
+            path.parent
+            for name in ("settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts")
+            for path in source_manifests(source_root, name, ignored_parts)
+        })
         gradle_roots = [root_path for root_path in gradle_roots if not any(parent in gradle_roots for parent in root_path.parents)]
         for gradle_root in gradle_roots:
             relative = gradle_root.relative_to(source_root).as_posix() or "."
@@ -4273,120 +3835,6 @@ def central_build_and_distribute(
     return builder
 
 
-def cleanup_old_project_images(db, deployment: Deployment, project: Project, target: Node) -> str:
-    """Keep one builder copy and two target copies for rollback."""
-    history = db.scalars(
-        select(Deployment).where(
-            Deployment.project_id == project.id,
-            Deployment.release.is_not(None),
-            Deployment.status.in_([DeployStatus.success, DeployStatus.stopped]),
-        ).order_by(Deployment.created_at.desc())
-    ).all()
-    keep_releases = []
-    for item in history:
-        release = (item.release or "").strip()
-        if release and release not in keep_releases:
-            keep_releases.append(release)
-        if len(keep_releases) == 2:
-            break
-    if deployment.release and deployment.release not in keep_releases:
-        keep_releases.insert(0, deployment.release)
-        keep_releases = keep_releases[:2]
-
-    builder = platform_gateway_node(db)
-    nodes = [target] + ([builder] if builder else [])
-    unique_nodes = {}
-    for node in nodes:
-        key = (node.host, node.port, node.username)
-        unique_nodes[key] = node
-
-    repository = f"yunzhou/{project.slug}"
-    reports = []
-    target_key = (target.host, target.port, target.username)
-    builder_key = (builder.host, builder.port, builder.username) if builder else None
-    for key, node in unique_nodes.items():
-        # A dedicated build server only needs the latest successful image. If
-        # it is also the runtime target, retain the previous release as well.
-        node_keep_releases = keep_releases[:1] if key == builder_key and key != target_key else keep_releases[:2]
-        keep_words = " " + " ".join(node_keep_releases) + " "
-        script = (
-            "removed=0; skipped=0; "
-            "docker images --format '{{.Repository}}|{{.Tag}}|{{.ID}}' | "
-            "while IFS='|' read -r repo tag iid; do "
-            f"case \"$repo\" in {shlex.quote(repository)}|{shlex.quote(repository + '-')}*) ;; *) continue ;; esac; "
-            "[ \"$tag\" != '<none>' ] || continue; "
-            f"case {shlex.quote(keep_words)} in *\" $tag \"*) skipped=$((skipped+1)); continue ;; esac; "
-            "if docker ps -aq --filter ancestor=\"$iid\" | grep -q .; then skipped=$((skipped+1)); continue; fi; "
-            "docker image rm \"$repo:$tag\" >/dev/null 2>&1 && removed=$((removed+1)) || true; "
-            "done; "
-            # Only old dangling images are pruned. Fresh layers may belong to a
-            # concurrent build and BuildKit's reusable cache is not touched.
-            "dangling=$(docker image prune -f --filter dangling=true --filter until=24h 2>/dev/null | "
-            "awk '/Total reclaimed space:/ {print $4 \" \" $5}'); "
-            "printf 'retained=%s dangling_reclaimed=%s' " + shlex.quote(",".join(node_keep_releases)) + " \"${dangling:-0B}\""
-        )
-        with SSHNode(node) as ssh:
-            code, output = ssh.run(script, timeout=180)
-        if code:
-            raise RuntimeError(f"{node.name} 镜像清理失败：{output[-500:]}")
-        reports.append(f"{node.name}：{output.strip()}")
-    return "；".join(reports)
-
-
-def cleanup_incomplete_release_images(
-    db, deployment: Deployment, project: Project, target: Node, release: str | None,
-) -> str:
-    """Delete and verify images created by a failed or cancelled release."""
-    release = (release or deployment.release or "").strip()
-    if not release:
-        return "本次任务尚未生成版本镜像"
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", release):
-        raise RuntimeError("发布版本号不安全，已拒绝镜像清理")
-    builder = platform_gateway_node(db)
-    nodes = [target] + ([builder] if builder else [])
-    unique_nodes = {(node.host, node.port, node.username): node for node in nodes if node}
-    repository = f"yunzhou/{project.slug}"
-    reports = []
-    for node in unique_nodes.values():
-        script = (
-            # Compose can leave stopped containers whose images have already
-            # lost their repository tag. Match the exact release through the
-            # config-files label, remove those containers, then remove only
-            # their platform-built images. Never touch another release that
-            # shares the same Compose project label.
-            f"project_label={shlex.quote('com.docker.compose.project=' + deployment_compose_project_name(deployment, project))}; "
-            "owned_images=''; owned_containers=0; "
-            "for cid in $(docker ps -aq --filter label=\"$project_label\"); do "
-            "cfg=$(docker inspect -f '{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' \"$cid\" 2>/dev/null); "
-            f"case \"$cfg\" in */{release}/*) ;; *) continue ;; esac; "
-            "iid=$(docker inspect -f '{{.Image}}' \"$cid\" 2>/dev/null); "
-            "builder=$(docker image inspect -f '{{index .Config.Labels \"com.docker.compose.image.builder\"}}' \"$iid\" 2>/dev/null); "
-            "[ \"$builder\" = classic ] && owned_images=\"$owned_images $iid\"; "
-            "docker rm -f \"$cid\" >/dev/null 2>&1 || true; owned_containers=$((owned_containers+1)); done; "
-            "for iid in $(printf '%s\n' $owned_images | sort -u); do "
-            "docker ps -aq --filter ancestor=\"$iid\" | grep -q . || docker image rm -f \"$iid\" >/dev/null 2>&1 || true; done; "
-            "refs=$(docker images --format '{{.Repository}}|{{.Tag}}' | "
-            f"awk -F'|' -v r={shlex.quote(repository)} -v t={shlex.quote(release)} "
-            "'$2==t && ($1==r || index($1,r\"-\")==1) {print $1\":\"$2}'); "
-            "count=$(printf '%s\\n' \"$refs\" | sed '/^$/d' | wc -l); "
-            "if [ -n \"$refs\" ]; then printf '%s\\n' \"$refs\" | xargs -r docker image rm -f >/dev/null; fi; "
-            "docker image prune -f >/dev/null 2>&1 || true; "
-            "left=$(docker images --format '{{.Repository}}|{{.Tag}}' | "
-            f"awk -F'|' -v r={shlex.quote(repository)} -v t={shlex.quote(release)} "
-            "'$2==t && ($1==r || index($1,r\"-\")==1) {print}'); "
-            "[ -z \"$left\" ] || { printf 'remaining=%s' \"$left\"; exit 31; }; "
-            "printf 'removed=%s stopped_containers=%s verified=clean' \"$count\" \"$owned_containers\""
-        )
-        locked_script = (
-            "flock -w 1200 /tmp/yunzhou-image-commit.lock sh -lc "
-            + shlex.quote(script)
-        )
-        with SSHNode(node) as ssh:
-            code, output = ssh.run(locked_script, timeout=3660)
-        if code:
-            raise RuntimeError(f"{node.name} 本次版本镜像清理后仍有残留：{output[-800:]}")
-        reports.append(f"{node.name}：{output.strip()}")
-    return "；".join(reports)
 
 
 def execute(deployment_id: str) -> None:
