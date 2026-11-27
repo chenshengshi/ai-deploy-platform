@@ -39,7 +39,8 @@ from .archive_utils import safe_extract_zip
 from .audit import audit, cleanup_audit_logs as _cleanup_audit_logs
 from .auth import SESSION_COOKIE_NAME, current_user, hash_password, require, token_for, user_from_token, verify_password
 from .backup import router as backup_router, start_backup_scheduler
-from .chat_support import diagnose_blank_frontend, extract_external_mysql_config, format_failure_diagnosis, session_task_state
+from .chat.diagnostics import deployment_from_message_url, diagnose_blank_frontend
+from .chat_support import extract_external_mysql_config, format_failure_diagnosis, session_task_state
 from .config import decrypt, encrypt, settings
 from .database import Base, SessionLocal, engine, get_db
 from .deployment_logs import deployment_log_path, read_deployment_log
@@ -8653,29 +8654,15 @@ def chat(body: ChatIn, db: Session = Depends(get_db), user: User = Depends(requi
     nodes = db.scalars(select(Node).where(Node.enabled.is_(True))).all()
     project_id = decision.get("project_id") or body.project_id
     node_id = decision.get("node_id") or body.node_id
-    referenced_deployment = None
-    # A public platform URL is a durable deployment identifier. Resolve it
-    # before fuzzy project-name matching so users can paste a broken address
-    # without already knowing which project owns the port.
-    message_urls = re.findall(r"https?://[^\s，。；;<>]+", body.message, re.I)
-    for raw_url in message_urls:
-        requested = urlsplit(raw_url.rstrip("/）)]}"))
-        candidates = db.scalars(select(Deployment).where(
-            Deployment.access_url.is_not(None),
-        ).order_by(Deployment.created_at.desc())).all()
-        referenced_deployment = next((item for item in candidates if (
-            (lambda stored: (
-                stored.scheme.lower() == requested.scheme.lower()
-                and stored.hostname == requested.hostname
-                and (stored.port or (443 if stored.scheme == "https" else 80))
-                    == (requested.port or (443 if requested.scheme == "https" else 80))
-            ))(urlsplit(item.access_url or ""))
-        )), None)
-        if referenced_deployment and _user_can_access_project(db, user, referenced_deployment.project_id):
-            project_id = referenced_deployment.project_id
-            node_id = referenced_deployment.node_id
-            break
-        referenced_deployment = None
+    # Resolve a pasted public URL before fuzzy project-name matching.
+    referenced_deployment = deployment_from_message_url(
+        db,
+        body.message,
+        lambda candidate_project_id: _user_can_access_project(db, user, candidate_project_id),
+    )
+    if referenced_deployment:
+        project_id = referenced_deployment.project_id
+        node_id = referenced_deployment.node_id
     if not db.get(Project, project_id) if project_id else False:
         project_id = None
     if not db.get(Node, node_id) if node_id else False:

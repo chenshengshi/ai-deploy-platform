@@ -40,7 +40,7 @@ from .build_planning import (
     strip_generated_code_fence,
     valid_generated_dockerfile,
 )
-from .chat_support import diagnose_blank_frontend
+from .chat.diagnostics import diagnose_blank_frontend
 from .database import SessionLocal
 from .deployment_logs import append_deployment_log, read_deployment_log
 from .deployment_integrations import (

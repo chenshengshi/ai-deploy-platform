@@ -1,12 +1,30 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import httpx
 
-from app.chat_support import diagnose_blank_frontend, extract_external_mysql_config, format_failure_diagnosis
+from app.chat.diagnostics import deployment_from_message_url, diagnose_blank_frontend
+from app.chat_support import extract_external_mysql_config, format_failure_diagnosis
 
 
 class ChatSupportTests(unittest.TestCase):
+    def test_public_url_resolves_accessible_deployment(self):
+        allowed = SimpleNamespace(
+            access_url="http://36.250.234.182:30005/",
+            project_id="project-1",
+        )
+        db = MagicMock()
+        db.scalars.return_value.all.return_value = [allowed]
+
+        result = deployment_from_message_url(
+            db,
+            "请检查 http://36.250.234.182:30005/ 为什么空白",
+            lambda project_id: project_id == "project-1",
+        )
+
+        self.assertIs(result, allowed)
+
     def test_blank_frontend_detects_html_returned_for_javascript(self):
         def response(url, content_type, text=""):
             return httpx.Response(200, headers={"content-type": content_type}, text=text, request=httpx.Request("GET", url))
