@@ -8435,6 +8435,8 @@ def restore_chat_session(session_id: str, db: Session = Depends(get_db), user: U
 @app.delete("/api/chat/sessions/{session_id}")
 def delete_chat_session(session_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
     session = chat_session_for_user(db, session_id, user)
+    if chat_session_dict(db, session)["has_active_task"]:
+        raise HTTPException(409, "该对话仍有任务正在执行，任务结束后才能删除")
     title = session.title
     db.delete(session)
     audit(db, user, "delete_chat_session", "chat_session", session_id, title)

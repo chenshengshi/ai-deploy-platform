@@ -1046,7 +1046,6 @@ function Chat() {
     [sessionsExpanded, setSessionsExpanded] = useState(false),
     [sessionBusy, setSessionBusy] = useState(false),
     [cleanupOpen, setCleanupOpen] = useState(false),
-    [cleanupConfirm, setCleanupConfirm] = useState(""),
     [deleteTarget, setDeleteTarget] = useState(null),
     [deleteProject, setDeleteProject] = useState(null),
     [selectedDeployment, setSelectedDeployment] = useState(null),
@@ -1347,11 +1346,11 @@ function Chat() {
       setSessionBusy(false);
     }
   };
-  const archiveCurrent = async () => {
-    if (!sessionId) return;
-    await api(`/chat/sessions/${sessionId}/archive`, { method: "POST" });
-    newConversation();
-    loadSessions();
+  const archiveSession = async (id) => {
+    if (!id) return;
+    await api(`/chat/sessions/${id}/archive`, { method: "POST" });
+    if (sessionId === id) newConversation();
+    await loadSessions(false);
   };
   const restoreSession = async (id) => {
     await api(`/chat/sessions/${id}/restore`, { method: "POST" });
@@ -1377,15 +1376,13 @@ function Chat() {
     api(`/chat/sessions?archived=${value}`).then(setSessions).finally(() => setSessionBusy(false));
   };
   const purgeArchived = async () => {
-    if (cleanupConfirm !== "永久清理对话") return;
     setSessionBusy(true);
     try {
       await api("/chat/sessions/purge", {
         method: "POST",
-        body: JSON.stringify({ scope: "mine", archived_only: true, confirm: cleanupConfirm }),
+        body: JSON.stringify({ scope: "mine", archived_only: true, confirm: "永久清理对话" }),
       });
       setCleanupOpen(false);
-      setCleanupConfirm("");
       await loadSessions(true);
     } finally {
       setSessionBusy(false);
@@ -1591,14 +1588,16 @@ function Chat() {
                 </button>
                 {item.has_active_task
                   && <span className="chat-session-running" title={item.active_task_label || "正在处理"}><LoaderCircle className="spin" /></span>}
-                {showArchived ? (
-                  <div className="chat-session-actions">
-                    <button title="恢复" onClick={() => restoreSession(item.id)}><RefreshCw /></button>
-                    <button title="永久删除" onClick={() => setDeleteTarget(item)}><Trash2 /></button>
-                  </div>
-                ) : sessionId === item.id ? (
-                  <button className="chat-session-archive" title="归档当前对话" onClick={archiveCurrent}><FileArchive /></button>
-                ) : null}
+                <div className="chat-session-actions">
+                  {showArchived
+                    ? <button title="恢复到最近" onClick={() => restoreSession(item.id)}><RefreshCw /></button>
+                    : <button title="归档" onClick={() => archiveSession(item.id)}><FileArchive /></button>}
+                  <button
+                    title={item.has_active_task ? "任务执行中，暂时不能删除" : "永久删除"}
+                    disabled={item.has_active_task}
+                    onClick={() => setDeleteTarget(item)}
+                  ><Trash2 /></button>
+                </div>
               </div>
             ))}
           </div>
@@ -1705,14 +1704,11 @@ function Chat() {
       {cleanupOpen && (
         <Modal title="永久清理已归档对话" onClose={() => setCleanupOpen(false)}>
           <div className="chat-cleanup-copy">
-            <p>这会永久删除你账号下全部已归档对话，无法恢复。正常对话和项目不会受影响。</p>
-            <label>输入“永久清理对话”确认
-              <input value={cleanupConfirm} onChange={(e) => setCleanupConfirm(e.target.value)} autoFocus />
-            </label>
+            <p>确定清空你账号下的全部已归档对话吗？删除后无法恢复，最近对话、项目和发布记录不会受影响。</p>
           </div>
           <div className="modal-actions">
             <button className="ghost" onClick={() => setCleanupOpen(false)}>取消</button>
-            <button className="danger-button" disabled={cleanupConfirm !== "永久清理对话" || sessionBusy} onClick={purgeArchived}>
+            <button className="danger-button" disabled={sessionBusy} onClick={purgeArchived}>
               {sessionBusy ? <LoaderCircle className="spin" /> : <Trash2 />}永久清理
             </button>
           </div>

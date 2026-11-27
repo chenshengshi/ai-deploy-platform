@@ -1550,6 +1550,11 @@ tbody tr:last-child td {
 .chat-session-actions svg,
 .chat-session-archive svg { width: 14px; height: 14px; }
 .chat-session-actions button:last-child:hover { color: #d94b53; }
+.chat-session-actions button:disabled {
+  color: #c9ced8;
+  cursor: not-allowed;
+}
+.chat-session-actions button:disabled:hover { color: #c9ced8; }
 .chat-session-empty {
   display: flex;
   align-items: center;
